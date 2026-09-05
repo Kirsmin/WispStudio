@@ -12,6 +12,7 @@ web/dist/
 
 # 配置文件（含密钥）
 config.toml
+config.toml.local
 
 # IDE
 .idea/
