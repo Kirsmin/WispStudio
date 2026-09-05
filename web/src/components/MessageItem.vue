@@ -1,168 +1,151 @@
-<template>
-  <div class="message-item" :class="message.type">
-    <div class="message-content">
-      <div v-if="message.reasoning || message.isThinking" class="reasoning-block">
-        <div class="reasoning-toggle" @click="showReasoning = !showReasoning">
-          <template v-if="message.isThinking">
-            思考中 <span class="thinking-spinner"></span>
-          </template>
-          <template v-else>
-            思考 {{ showReasoning ? '▼' : '▶' }}
-            <span v-if="message.thinkingDuration" class="thinking-duration">
-              {{ (message.thinkingDuration / 1000).toFixed(1) }}s
-            </span>
-          </template>
-        </div>
-        <div v-show="showReasoning || message.isThinking" class="reasoning-text">
-          {{ message.reasoning || '思考中...' }}
-        </div>
-      </div>
-      
-      <div v-if="message.content || !message.isThinking" class="message-body">
-        <MarkdownView :content="message.content" />
-      </div>
-      <div v-else-if="message.isThinking && !message.reasoning" class="thinking-placeholder">
-        <span class="thinking-spinner"></span> 思考中...
-      </div>
-      
-      <div v-if="message.type === 'assistant' && message.usage" class="meta">
-        {{ message.model || 'unknown' }} · in {{ message.usage.prompt_tokens }} · think {{ message.usage.reasoning_tokens ?? 0 }} · out {{ message.usage.completion_tokens }} · cache {{ message.usage.cached_tokens }} · {{ ((message.duration_ms ?? 0) / 1000).toFixed(1) }}s
-      </div>
-    </div>
-  </div>
-</template>
-
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref } from 'vue'
+import { NButton, NCollapseTransition, NTag } from 'naive-ui'
 import MarkdownView from './MarkdownView.vue'
+import type { ChatMessage } from '../stores/chat'
 
-const props = defineProps<{
-  message: {
-    id: string
-    type: 'user' | 'assistant'
-    content: string
-    reasoning?: string
-    model?: string
-    usage?: {
-      prompt_tokens: number
-      completion_tokens: number
-      cached_tokens: number
-      reasoning_tokens: number
-    }
-    duration_ms?: number
-    finish?: string
-    isThinking?: boolean
-    thinkingDuration?: number
+const props = defineProps<{ message: ChatMessage }>()
+const reasoningOpen = ref(false)
+
+const isAssistant = computed(() => props.message.type === 'assistant')
+const hasReasoning = computed(() => Boolean(props.message.reasoning))
+const reasoningLabel = computed(() => {
+  if (props.message.status === 'streaming' && !props.message.content) return '思考中'
+  return '思考过程'
+})
+const metaText = computed(() => {
+  const chunks: string[] = []
+  if (props.message.ttft_ms) chunks.push(`首字 ${props.message.ttft_ms}ms`)
+  if (props.message.duration_ms) chunks.push(`总耗时 ${(props.message.duration_ms / 1000).toFixed(1)}s`)
+  if (props.message.usage?.completion_tokens) chunks.push(`${props.message.usage.completion_tokens} tokens`)
+  return chunks.join(' · ')
+})
+const emptyFinalHint = computed(() => {
+  if (!isAssistant.value || props.message.content || props.message.status === 'streaming') return ''
+  if (props.message.status === 'aborted') return '生成已停止。'
+  if (props.message.status === 'background') return '浏览器连接已断开，服务端仍在继续生成。'
+  if (props.message.error) return props.message.error
+  if (props.message.finish === 'length' || props.message.finish === 'max_tokens') {
+    return '上游在生成最终答案前触发了输出长度限制；推理内容可能存在，但最终正文没有完整返回。'
   }
-}>()
-
-const showReasoning = ref(props.message.isThinking ?? false)
-
-watch(() => props.message.isThinking, (isThinking) => {
-  if (isThinking) {
-    showReasoning.value = true
-  }
+  if (props.message.reasoning) return '模型返回了推理内容，但没有返回最终正文。'
+  return '模型没有返回可展示的正文。'
 })
 </script>
 
+<template>
+  <article class="message" :class="message.type">
+    <div class="avatar" aria-hidden="true">{{ message.type === 'user' ? '你' : 'W' }}</div>
+    <div class="message-main">
+      <div v-if="message.type === 'user'" class="user-text">{{ message.content }}</div>
+      <template v-else>
+        <div v-if="hasReasoning || message.status === 'streaming'" class="reasoning-shell">
+          <NButton text size="small" class="reasoning-toggle" @click="reasoningOpen = !reasoningOpen">
+            <span class="chevron">{{ reasoningOpen ? '▾' : '▸' }}</span>
+            {{ reasoningLabel }}
+            <span v-if="hasReasoning" class="reasoning-size">{{ message.reasoning?.length.toLocaleString() }} 字符</span>
+          </NButton>
+          <NCollapseTransition :show="reasoningOpen">
+            <div class="reasoning-content">{{ message.reasoning || '正在等待模型返回推理内容…' }}</div>
+          </NCollapseTransition>
+        </div>
+
+        <MarkdownView v-if="message.content" :content="message.content" />
+        <div v-else-if="emptyFinalHint" class="empty-final" :class="{ error: message.status === 'error' }">
+          {{ emptyFinalHint }}
+        </div>
+
+        <div v-if="message.status === 'streaming'" class="streaming-indicator" aria-label="正在生成">
+          <i></i><i></i><i></i>
+        </div>
+      </template>
+
+      <div v-if="isAssistant && (metaText || message.status === 'aborted' || message.status === 'error')" class="message-meta">
+        <span v-if="metaText">{{ metaText }}</span>
+        <NTag v-if="message.status === 'aborted'" size="small" :bordered="false">已停止</NTag>
+        <NTag v-if="message.status === 'error'" size="small" type="error" :bordered="false">异常结束</NTag>
+      </div>
+    </div>
+  </article>
+</template>
+
 <style scoped>
-.message-item {
-  display: flex;
-  margin-bottom: 18px;
+.message {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 12px;
+  width: min(860px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 16px 0;
 }
 
-.message-item.user {
-  justify-content: flex-end;
-}
-
-.message-item.assistant {
-  justify-content: flex-start;
-}
-
-.message-content {
-  max-width: 760px;
-  padding: 12px 16px;
-  border-radius: 16px;
-  word-break: break-word;
-}
-
-.message-item.user .message-content {
-  background: var(--accent-soft);
-  color: var(--text);
-}
-
-.message-item.assistant .message-content {
-  background: transparent;
-  padding-left: 2px;
-  padding-right: 2px;
-}
-
-.reasoning-block {
-  margin-bottom: 8px;
-}
-
-.reasoning-toggle {
-  font-size: 12px;
-  color: var(--accent-text);
-  cursor: pointer;
-  user-select: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 0;
-}
-
-.thinking-duration {
-  color: var(--text-2);
-  font-size: 11px;
-}
-
-.reasoning-text {
-  font-size: 13px;
-  color: var(--text-2);
-  margin-top: 4px;
-  padding: 10px 12px;
-  background: var(--bg-soft);
-  border: 1px solid var(--border);
+.avatar {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
   border-radius: 10px;
-  white-space: pre-wrap;
-  max-height: 320px;
-  overflow-y: auto;
-}
-
-.thinking-placeholder {
-  font-size: 13px;
-  color: var(--text-2);
-  padding: 8px 0;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.thinking-spinner {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  border: 2px solid var(--border-strong);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.message-body {
-  min-height: 1em;
-}
-
-.meta {
   font-size: 12px;
-  color: var(--text-2);
+  font-weight: 700;
+  background: #f3e8ed;
+  color: #8c536a;
+}
+
+.assistant .avatar {
+  background: #d95f8d;
+  color: white;
+}
+
+.message-main { min-width: 0; }
+.user-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.72;
+  padding-top: 5px;
+}
+
+.reasoning-shell {
+  margin: 1px 0 10px;
+  border-left: 2px solid #e4c8d3;
+  padding-left: 10px;
+}
+
+.reasoning-toggle { color: #7c6d73; }
+.reasoning-size { margin-left: 7px; color: #aaa0a4; font-size: 11px; }
+.reasoning-content {
+  max-height: min(45vh, 520px);
+  overflow: auto;
   margin-top: 8px;
-  font-variant-numeric: tabular-nums;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #faf7f8;
+  color: #71676b;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.62;
+  font-size: 13px;
+}
+
+.empty-final {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: #faf7f8;
+  color: #756a6f;
+}
+.empty-final.error { background: #fff1f1; color: #a53f45; }
+
+.streaming-indicator { display: flex; gap: 4px; padding-top: 10px; }
+.streaming-indicator i {
+  width: 5px; height: 5px; border-radius: 50%; background: #d95f8d;
+  animation: pulse 1.1s infinite ease-in-out;
+}
+.streaming-indicator i:nth-child(2) { animation-delay: .14s; }
+.streaming-indicator i:nth-child(3) { animation-delay: .28s; }
+@keyframes pulse { 0%, 70%, 100% { opacity: .25; transform: translateY(0); } 35% { opacity: 1; transform: translateY(-2px); } }
+
+.message-meta {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 10px; color: #a0979b; font-size: 11px;
 }
 </style>

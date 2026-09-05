@@ -1,10 +1,10 @@
-// 全局类型声明
-import type { MessageProviderInst } from 'naive-ui'
+/// <reference types="vite/client" />
+
+import type { MessageApi } from 'naive-ui'
 
 declare global {
   interface Window {
-    // 全局消息实例（由 NMessageProvider 挂载）
-    $message?: MessageProviderInst
+    $message?: MessageApi
   }
 }
 

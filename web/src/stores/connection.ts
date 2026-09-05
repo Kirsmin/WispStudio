@@ -1,133 +1,117 @@
+import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
 import { useSessionsStore } from './sessions'
 
-export interface ModelConfig {
+export interface ModelInfo {
   id: string
   name: string
   default: boolean
   thinking_levels: string[]
   thinking_style: string
-  provider_name?: string
 }
 
+const savedURL = localStorage.getItem('wisp_server_url') || 'http://127.0.0.1:7860'
+
 export const useConnectionStore = defineStore('connection', () => {
+  const serverUrl = ref(savedURL)
   const isConnected = ref(false)
-  const serverUrl = ref(localStorage.getItem('serverUrl') || 'http://127.0.0.1:7860')
-  const latency = ref(0)
-  const lastOkTime = ref(Date.now())
-  // 最近一次心跳是否成功（响应式），后端宕机时 UI 能立即切到"无响应"
-  const pingOk = ref(false)
-  // 最近一次聊天的首字延迟（TTFT），有值时优先显示这个
-  const ttft = ref(0)
-  const models = ref<ModelConfig[]>([])
-  const showConnectDialog = ref(false)
-  let pingTimer: ReturnType<typeof setInterval> | null = null
+  const isConnecting = ref(false)
+  const models = ref<ModelInfo[]>([])
+  const latencyMs = ref<number | null>(null)
+  const lastError = ref('')
+  const ttftMs = ref<number | null>(null)
+  const displayURL = computed(() => serverUrl.value.replace(/^https?:\/\//, ''))
 
-  const defaultModel = computed(() => {
-    const m = models.value.find(x => x.default)
-    return m?.id || models.value[0]?.id || ''
-  })
+  function normalizeURL(value: string): string {
+    let result = value.trim()
+    if (!/^https?:\/\//i.test(result)) result = `http://${result}`
+    return result.replace(/\/$/, '')
+  }
 
-  // UI 显示的延迟：有 TTFT 时显示首字延迟，否则显示心跳 RTT
-  const displayLatency = computed(() => {
-    if (ttft.value > 0) return ttft.value
-    return latency.value
-  })
-
-  // 延迟标签：TTFT 时显示 "首字"，否则显示空（保持原有样式）
-  const latencyLabel = computed(() => {
-    if (ttft.value > 0) return '首字'
-    return ''
-  })
-
-  async function connect(url: string): Promise<boolean> {
+  async function fetchWithTimeout(url: string, timeoutMs = 4500): Promise<Response> {
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs)
     try {
-      const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 3000)
-      const start = performance.now()
-      const res = await fetch(`${url}/api/health`, { signal: controller.signal })
-      clearTimeout(timeout)
-      if (!res.ok) return false
-      latency.value = Math.round(performance.now() - start)
-      lastOkTime.value = Date.now()
-      pingOk.value = true
-      serverUrl.value = url
+      return await fetch(url, { signal: controller.signal, cache: 'no-store' })
+    } finally {
+      window.clearTimeout(timer)
+    }
+  }
+
+  async function connect(value = serverUrl.value): Promise<boolean> {
+    const normalized = normalizeURL(value)
+    isConnecting.value = true
+    lastError.value = ''
+    const started = performance.now()
+    try {
+      const health = await fetchWithTimeout(`${normalized}/api/health`)
+      if (!health.ok) throw new Error(`健康检查失败 (${health.status})`)
+      latencyMs.value = Math.max(0, Math.round(performance.now() - started))
+
+      serverUrl.value = normalized
+      localStorage.setItem('wisp_server_url', normalized)
+      const modelsResponse = await fetchWithTimeout(`${normalized}/api/models`, 8000)
+      if (!modelsResponse.ok) throw new Error(`读取模型失败 (${modelsResponse.status})`)
+      models.value = (await modelsResponse.json()) as ModelInfo[]
+      if (models.value.length === 0) throw new Error('服务端没有可用模型，请检查 config.toml')
+
       isConnected.value = true
-      // 获取模型列表（映射 Go 大写驼峰到前端小写蛇形）
-      const modelsRes = await fetch(`${url}/api/models`)
-      if (modelsRes.ok) {
-        const raw = await modelsRes.json()
-        models.value = raw.map((m: any) => ({
-          id: m.ID || m.id || '',
-          name: m.Name || m.name || '',
-          default: m.Default ?? m.default ?? false,
-          thinking_levels: m.ThinkingLevels || m.thinking_levels || [],
-          thinking_style: m.ThinkingStyle || m.thinking_style || '',
-          provider_name: m.ProviderName || m.provider_name || '',
-        }))
-      }
-      // 连接成功后自动加载会话列表
-      const sessionsStore = useSessionsStore()
-      await sessionsStore.loadSessions()
-      startPing()
+      await useSessionsStore().loadSessions()
+      return true
+    } catch (error) {
+      isConnected.value = false
+      models.value = []
+      latencyMs.value = null
+      lastError.value = error instanceof Error ? error.message : String(error)
+      return false
+    } finally {
+      isConnecting.value = false
+    }
+  }
+
+  async function ping(): Promise<boolean> {
+    if (!serverUrl.value) return false
+    const started = performance.now()
+    try {
+      const response = await fetchWithTimeout(`${serverUrl.value}/api/health`, 3000)
+      if (!response.ok) throw new Error('offline')
+      latencyMs.value = Math.max(0, Math.round(performance.now() - started))
+      isConnected.value = true
       return true
     } catch {
+      isConnected.value = false
+      latencyMs.value = null
       return false
     }
   }
 
-  function disconnect() {
+  async function refreshModels(): Promise<void> {
+    if (!isConnected.value) return
+    const response = await fetch(`${serverUrl.value}/api/models`, { cache: 'no-store' })
+    if (!response.ok) throw new Error(`刷新模型失败 (${response.status})`)
+    models.value = (await response.json()) as ModelInfo[]
+  }
+
+  function disconnect(): void {
     isConnected.value = false
-    latency.value = 0
-    ttft.value = 0
-    pingOk.value = false
     models.value = []
-    stopPing()
-  }
-
-  function startPing() {
-    stopPing()
-    pingTimer = setInterval(async () => {
-      try {
-        const controller = new AbortController()
-        const timeout = setTimeout(() => controller.abort(), 3000)
-        const start = performance.now()
-        const res = await fetch(`${serverUrl.value}/api/health`, { signal: controller.signal })
-        clearTimeout(timeout)
-        const ok = res.ok
-        if (ok) {
-          latency.value = Math.round(performance.now() - start)
-          lastOkTime.value = Date.now()
-        }
-        // 每次心跳都刷新响应式状态：成功置 true，失败置 false（UI 据此显示"无响应"）
-        pingOk.value = ok
-      } catch {
-        pingOk.value = false
-      }
-    }, 3000)
-  }
-
-  function stopPing() {
-    if (pingTimer) {
-      clearInterval(pingTimer)
-      pingTimer = null
-    }
+    latencyMs.value = null
+    ttftMs.value = null
+    useSessionsStore().clear()
   }
 
   return {
-    isConnected,
     serverUrl,
-    latency,
-    displayLatency,
-    latencyLabel,
-    ttft,
-    lastOkTime,
-    pingOk,
+    displayURL,
+    isConnected,
+    isConnecting,
     models,
-    showConnectDialog,
-    defaultModel,
+    latencyMs,
+    lastError,
+    ttftMs,
     connect,
+    ping,
+    refreshModels,
     disconnect,
   }
 })

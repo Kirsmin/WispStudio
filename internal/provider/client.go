@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,143 +28,127 @@ type Client struct {
 }
 
 func NewClient() *Client {
-	return &Client{
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-	}
+	return &Client{httpClient: &http.Client{Timeout: 10 * time.Second}}
 }
 
-func (c *Client) FetchModels(providers []config.ProviderConfig, globalOpenAI config.OpenAIConfig) []ModelInfo {
+func (c *Client) FetchModels(providers []config.ProviderConfig, global config.OpenAIConfig) []ModelInfo {
 	if len(providers) == 0 {
 		return nil
 	}
-
 	var wg sync.WaitGroup
 	resultCh := make(chan []ModelInfo, len(providers))
-
 	for _, p := range providers {
+		p := p
 		wg.Add(1)
-		go func(provider config.ProviderConfig) {
+		go func() {
 			defer wg.Done()
-			models := c.fetchFromProvider(provider, globalOpenAI)
-			resultCh <- models
-		}(p)
+			resultCh <- c.fetchFromProvider(p, global)
+		}()
 	}
+	wg.Wait()
+	close(resultCh)
 
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
-
-	var allModels []ModelInfo
+	var all []ModelInfo
 	for models := range resultCh {
-		allModels = append(allModels, models...)
+		all = append(all, models...)
 	}
-
-	if len(allModels) == 0 {
-		return nil
-	}
-
-	hasDefault := false
-	for i := range allModels {
-		if allModels[i].Default {
-			if hasDefault {
-				allModels[i].Default = false
-			} else {
-				hasDefault = true
-			}
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].Default != all[j].Default {
+			return all[i].Default
 		}
-	}
-	if !hasDefault && len(allModels) > 0 {
-		allModels[0].Default = true
-	}
-
-	return allModels
+		return all[i].Name < all[j].Name
+	})
+	ensureSingleDefault(all)
+	return all
 }
 
-func (c *Client) fetchFromProvider(provider config.ProviderConfig, globalOpenAI config.OpenAIConfig) []ModelInfo {
-	baseURL := provider.BaseURL
+func (c *Client) fetchFromProvider(p config.ProviderConfig, global config.OpenAIConfig) []ModelInfo {
+	baseURL := firstNonEmpty(p.BaseURL, global.BaseURL)
+	apiKey := firstNonEmpty(p.APIKey, global.APIKey)
 	if baseURL == "" {
-		baseURL = globalOpenAI.BaseURL
+		return nil
 	}
-	apiKey := provider.APIKey
-	if apiKey == "" {
-		apiKey = globalOpenAI.APIKey
-	}
-
-	url := strings.TrimRight(baseURL, "/") + "/models"
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(baseURL, "/")+"/models", nil)
 	if err != nil {
 		return nil
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return nil
 	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil
-	}
-
 	var result struct {
 		Data []struct {
 			ID     string `json:"id"`
 			Object string `json:"object"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&result); err != nil {
 		return nil
 	}
-
-	var models []ModelInfo
+	models := make([]ModelInfo, 0, len(result.Data))
 	for _, m := range result.Data {
-		if m.Object != "model" {
+		if m.ID == "" || (m.Object != "" && m.Object != "model") {
 			continue
 		}
-		info := ModelInfo{
-			ID:           m.ID,
-			Name:         inferModelName(m.ID),
-			ProviderName: provider.Name,
-			BaseURL:      baseURL,
-			APIKey:       apiKey,
-		}
-		info.ThinkingLevels, info.ThinkingStyle = inferThinkingCapability(m.ID)
-		models = append(models, info)
+		levels, style := inferThinkingCapability(m.ID)
+		models = append(models, ModelInfo{
+			ID:             m.ID,
+			Name:           inferModelName(m.ID),
+			ThinkingLevels: levels,
+			ThinkingStyle:  style,
+			ProviderName:   p.Name,
+			BaseURL:        baseURL,
+			APIKey:         apiKey,
+		})
 	}
-
-	if provider.Default && len(models) > 0 {
+	if p.Default && len(models) > 0 {
 		models[0].Default = true
 	}
-
 	return models
 }
 
-func inferModelName(id string) string {
-	nameMap := map[string]string{
-		"deepseek-chat":     "DeepSeek-V3",
-		"deepseek-reasoner": "DeepSeek-R1",
-		"deepseek-coder":    "DeepSeek-Coder",
-		"gpt-4o":            "GPT-4o",
-		"gpt-4o-mini":       "GPT-4o Mini",
-		"gpt-4-turbo":       "GPT-4 Turbo",
-		"gpt-4":             "GPT-4",
-		"claude-3-5-sonnet": "Claude 3.5 Sonnet",
-		"claude-3-opus":     "Claude 3 Opus",
-		"qwen3-max":         "Qwen3-Max",
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
 	}
-	if name, ok := nameMap[id]; ok {
+	return ""
+}
+
+func ensureSingleDefault(models []ModelInfo) {
+	found := false
+	for i := range models {
+		if models[i].Default && !found {
+			found = true
+			continue
+		}
+		models[i].Default = false
+	}
+	if !found && len(models) > 0 {
+		models[0].Default = true
+	}
+}
+
+func inferModelName(id string) string {
+	known := map[string]string{
+		"deepseek-chat": "DeepSeek-V3", "deepseek-reasoner": "DeepSeek-R1",
+		"gpt-4o": "GPT-4o", "gpt-4o-mini": "GPT-4o Mini",
+	}
+	if name, ok := known[id]; ok {
 		return name
 	}
-	parts := strings.Split(id, "-")
+	parts := strings.FieldsFunc(id, func(r rune) bool { return r == '-' || r == '_' })
 	for i := range parts {
-		if len(parts[i]) > 0 {
+		if parts[i] != "" {
 			parts[i] = strings.ToUpper(parts[i][:1]) + parts[i][1:]
 		}
 	}
@@ -171,12 +156,16 @@ func inferModelName(id string) string {
 }
 
 func inferThinkingCapability(id string) ([]string, string) {
-	idLower := strings.ToLower(id)
-	reasoningKeywords := []string{"reasoner", "r1", "thinking", "o1", "o3"}
-	for _, kw := range reasoningKeywords {
-		if strings.Contains(idLower, kw) {
-			return []string{"off", "low", "high"}, "reasoning_effort"
-		}
+	low := strings.ToLower(id)
+	// DeepSeek reasoner 本身就是推理模型，不额外发送 OpenAI reasoning_effort，避免兼容网关拒绝未知字段。
+	if strings.Contains(low, "deepseek-reasoner") || strings.Contains(low, "deepseek-r1") {
+		return []string{"auto"}, "none"
+	}
+	if strings.Contains(low, "o1") || strings.Contains(low, "o3") || strings.Contains(low, "o4") {
+		return []string{"low", "medium", "high"}, "reasoning_effort"
+	}
+	if strings.Contains(low, "qwen3") && strings.Contains(low, "thinking") {
+		return []string{"off", "on"}, "enable_thinking"
 	}
 	return []string{"off"}, "none"
 }
@@ -184,7 +173,8 @@ func inferThinkingCapability(id string) ([]string, string) {
 func FindModel(models []ModelInfo, id string) *ModelInfo {
 	for i := range models {
 		if models[i].ID == id {
-			return &models[i]
+			copy := models[i]
+			return &copy
 		}
 	}
 	return nil

@@ -1,126 +1,69 @@
-<template>
-  <div class="connect-entry">
-    <div v-if="isConnected" class="status-pill" @click="handleDisconnectClick">
-      <span class="dot"></span>
-      <span class="status-text" :style="{ color: statusColor }">{{ statusText }}</span>
-    </div>
-    <button v-else class="link-btn" @click="showConnectDialog = true">连接服务器</button>
-
-    <n-modal v-model:show="showConnectDialog" title="连接服务器" preset="card" style="width: 380px">
-      <n-input
-        v-model:value="serverUrl"
-        placeholder="http://127.0.0.1:7860"
-        @keydown.enter="connect"
-      />
-      <template #footer>
-        <div class="modal-footer">
-          <n-button @click="showConnectDialog = false">取消</n-button>
-          <n-button type="primary" @click="connect">连接</n-button>
-        </div>
-      </template>
-    </n-modal>
-  </div>
-</template>
-
 <script setup lang="ts">
-import { NButton, NModal, NInput, useMessage } from 'naive-ui'
-import { computed, ref } from 'vue'
+import { ref, watch } from 'vue'
+import { NButton, NInput, NModal } from 'naive-ui'
 import { useConnectionStore } from '../stores/connection'
-import { storeToRefs } from 'pinia'
+import { useChatStore } from '../stores/chat'
+import { useSessionsStore } from '../stores/sessions'
 
-const connectionStore = useConnectionStore()
-const { isConnected, pingOk, showConnectDialog } = storeToRefs(connectionStore)
-const { connect: doConnect, disconnect } = connectionStore
+const props = defineProps<{ show: boolean }>()
+const emit = defineEmits<{ 'update:show': [value: boolean] }>()
+const connection = useConnectionStore()
+const chat = useChatStore()
+const sessions = useSessionsStore()
+const value = ref(connection.serverUrl)
 
-const message = useMessage()
-const serverUrl = ref(localStorage.getItem('serverUrl') || 'http://127.0.0.1:7860')
-const armed = ref(false)
-
-const statusText = computed(() => {
-  if (!pingOk.value) {
-    return '无响应'
-  }
-  return '已连接'
+watch(() => props.show, (show) => {
+  if (show) value.value = connection.serverUrl
 })
 
-const statusColor = computed(() => {
-  if (!pingOk.value) return 'var(--error)'
-  return 'var(--text-2)'
-})
-
-async function connect() {
-  localStorage.setItem('serverUrl', serverUrl.value)
-  const ok = await doConnect(serverUrl.value)
+async function connect(): Promise<void> {
+  const ok = await connection.connect(value.value)
   if (ok) {
-    showConnectDialog.value = false
-  } else {
-    message.error('连接失败')
+    if (sessions.currentSessionId) await chat.openSession(sessions.currentSessionId)
+    emit('update:show', false)
+    window.$message?.success('已连接后端')
   }
 }
 
-function handleDisconnectClick() {
-  if (!armed.value) {
-    armed.value = true
-    message.info('再次点击以断开连接')
-    setTimeout(() => (armed.value = false), 3000)
-  } else {
-    armed.value = false
-    disconnect()
-  }
+function disconnect(): void {
+  chat.newConversation()
+  connection.disconnect()
+  emit('update:show', false)
 }
 </script>
 
+<template>
+  <NModal
+    :show="show"
+    preset="card"
+    title="后端连接"
+    class="connect-modal"
+    :mask-closable="!connection.isConnecting"
+    @update:show="v => emit('update:show', Boolean(v))"
+  >
+    <div class="field-label">服务地址</div>
+    <NInput v-model:value="value" placeholder="http://127.0.0.1:7860" :disabled="connection.isConnecting" @keyup.enter="connect" />
+    <p class="help">可以填写本机或远程 WispStudio 后端地址。地址会保存在当前浏览器。</p>
+    <div v-if="connection.lastError" class="error-text">{{ connection.lastError }}</div>
+    <div v-if="connection.isConnected" class="connection-info">
+      当前已连接 · {{ connection.models.length }} 个模型
+      <span v-if="connection.latencyMs != null"> · {{ connection.latencyMs }}ms</span>
+    </div>
+    <div class="actions">
+      <NButton v-if="connection.isConnected" tertiary @click="disconnect">断开</NButton>
+      <span class="spacer"></span>
+      <NButton @click="emit('update:show', false)">取消</NButton>
+      <NButton type="primary" :loading="connection.isConnecting" @click="connect">连接</NButton>
+    </div>
+  </NModal>
+</template>
+
 <style scoped>
-.connect-entry {
-  display: flex;
-  align-items: center;
-}
-
-.status-pill {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  padding: 5px 12px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--bg-soft);
-}
-
-.status-pill:hover {
-  border-color: var(--accent-soft);
-  background: var(--accent-tint);
-}
-
-.dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--dot);
-}
-
-.status-text {
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-}
-
-.link-btn {
-  border: none;
-  background: none;
-  padding: 5px 12px;
-  border-radius: 999px;
-  font-size: 13px;
-  color: var(--accent-text);
-  cursor: pointer;
-}
-
-.link-btn:hover {
-  background: var(--accent-tint);
-}
-
-.modal-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-}
+.connect-modal { width: min(470px, calc(100vw - 30px)); }
+.field-label { font-size: 12px; color: #766b70; margin-bottom: 7px; }
+.help { margin: 9px 2px 0; color: #9d9297; font-size: 12px; line-height: 1.55; }
+.error-text { margin-top: 12px; padding: 9px 10px; border-radius: 8px; background: #fff0f0; color: #a33e45; font-size: 12px; }
+.connection-info { margin-top: 12px; color: #6e8f73; font-size: 12px; }
+.actions { display: flex; gap: 8px; margin-top: 20px; }
+.spacer { flex: 1; }
 </style>

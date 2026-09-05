@@ -1,49 +1,52 @@
-<template>
-  <n-config-provider :theme-overrides="themeOverrides">
-    <n-dialog-provider>
-      <n-message-provider>
-        <!-- 挂载全局消息实例到 window.$message -->
-        <MessageRegister />
-        <div class="app">
-          <TopBar />
-          <div class="main">
-            <SessionList />
-            <ChatArea />
-          </div>
-        </div>
-      </n-message-provider>
-    </n-dialog-provider>
-  </n-config-provider>
-</template>
-
 <script setup lang="ts">
-import { defineComponent } from 'vue'
-import { NConfigProvider, NDialogProvider, NMessageProvider, useMessage } from 'naive-ui'
-import { themeOverrides } from './theme'
-import TopBar from './components/TopBar.vue'
-import SessionList from './components/SessionList.vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { NConfigProvider, NDrawer, NDrawerContent, NMessageProvider } from 'naive-ui'
 import ChatArea from './components/ChatArea.vue'
+import ConnectDialog from './components/ConnectDialog.vue'
+import MessageRegister from './components/MessageRegister.vue'
+import SessionList from './components/SessionList.vue'
+import TopBar from './components/TopBar.vue'
+import { themeOverrides } from './theme'
+import { useConnectionStore } from './stores/connection'
+import { useChatStore } from './stores/chat'
+import { useSessionsStore } from './stores/sessions'
 
-// 在 NMessageProvider 内部注册 window.$message，供 store 等场景使用
-const MessageRegister = defineComponent({
-  setup() {
-    window.$message = useMessage()
-    return () => null
-  },
+const connection = useConnectionStore()
+const chat = useChatStore()
+const sessions = useSessionsStore()
+const connectDialog = ref(false)
+const mobileDrawer = ref(false)
+let pingTimer: number | null = null
+
+onMounted(async () => {
+  const ok = await connection.connect(connection.serverUrl)
+  if (!ok) connectDialog.value = true
+  else if (sessions.currentSessionId) await chat.openSession(sessions.currentSessionId)
+  pingTimer = window.setInterval(() => void connection.ping(), 15000)
+})
+
+onBeforeUnmount(() => {
+  if (pingTimer != null) window.clearInterval(pingTimer)
 })
 </script>
 
-<style scoped>
-.app {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  overflow: hidden;
-}
-
-.main {
-  display: flex;
-  flex: 1;
-  overflow: hidden;
-}
-</style>
+<template>
+  <NConfigProvider :theme-overrides="themeOverrides">
+    <NMessageProvider>
+      <MessageRegister />
+      <div class="app-shell">
+        <div class="desktop-sidebar"><SessionList /></div>
+        <section class="workspace">
+          <TopBar @menu="mobileDrawer = true" @connect="connectDialog = true" />
+          <ChatArea />
+        </section>
+      </div>
+      <NDrawer v-model:show="mobileDrawer" placement="left" :width="280">
+        <NDrawerContent body-content-style="padding:0">
+          <SessionList />
+        </NDrawerContent>
+      </NDrawer>
+      <ConnectDialog v-model:show="connectDialog" />
+    </NMessageProvider>
+  </NConfigProvider>
+</template>

@@ -8,16 +8,14 @@ import (
 	"strings"
 )
 
-// StreamEvent 流式事件
 type StreamEvent struct {
-	Type      string // delta | reasoning | usage | done | error
-	Text      string
-	Usage     *Usage
-	Finish    string
-	Error     string
+	Type   string
+	Text   string
+	Usage  *Usage
+	Finish string
+	Error  string
 }
 
-// Usage token 用量
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
@@ -25,7 +23,6 @@ type Usage struct {
 	ReasoningTokens  int `json:"reasoning_tokens"`
 }
 
-// StreamReader 解析上游 SSE
 type StreamReader struct {
 	reader io.ReadCloser
 	scan   *bufio.Scanner
@@ -33,103 +30,182 @@ type StreamReader struct {
 
 func NewStreamReader(r io.ReadCloser) *StreamReader {
 	scan := bufio.NewScanner(r)
-	// buffer 提到 1MB
-	const maxCapacity = 1024 * 1024
-	buf := make([]byte, maxCapacity)
-	scan.Buffer(buf, maxCapacity)
+	scan.Buffer(make([]byte, 64<<10), 8<<20)
 	return &StreamReader{reader: r, scan: scan}
 }
 
-func (sr *StreamReader) Close() error {
-	return sr.reader.Close()
-}
+func (sr *StreamReader) Close() error { return sr.reader.Close() }
 
-// ReadEvents 读取所有事件，通过 channel 发送
 func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 	defer close(ch)
+	var dataLines []string
+	finish := ""
+	failed := false
+	doneMarker := false
 
-	finish := "" // 累计的 finish_reason，流结束时统一发一次 done
+	flush := func() bool {
+		if len(dataLines) == 0 {
+			return false
+		}
+		data := strings.TrimSpace(strings.Join(dataLines, "\n"))
+		dataLines = dataLines[:0]
+		if data == "" {
+			return false
+		}
+		if data == "[DONE]" {
+			doneMarker = true
+			return true
+		}
+		if data == "ping" || data == ": ping" {
+			return false
+		}
+		fr, err := parseChunk(data, ch)
+		if err != nil {
+			failed = true
+			ch <- StreamEvent{Type: "error", Error: err.Error()}
+			return true
+		}
+		if finish == "" && fr != "" {
+			finish = fr
+		}
+		return false
+	}
 
 	for sr.scan.Scan() {
-		line := sr.scan.Text()
+		line := strings.TrimSuffix(sr.scan.Text(), "\r")
 		if line == "" {
+			if flush() {
+				break
+			}
 			continue
 		}
-		if !strings.HasPrefix(line, "data: ") {
+		// SSE 注释/keep-alive。
+		if strings.HasPrefix(line, ":") {
 			continue
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
-		if data == "[DONE]" {
-			break
-		}
-
-		var chunk struct {
-			Choices []struct {
-				Delta struct {
-					Content          string `json:"content"`
-					ReasoningContent string `json:"reasoning_content"`
-				} `json:"delta"`
-				FinishReason *string `json:"finish_reason"`
-			} `json:"choices"`
-			Usage *struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-				ReasoningTokens  int `json:"reasoning_tokens"`
-				CompletionTokensDetails *struct {
-					ReasoningTokens int `json:"reasoning_tokens"`
-				} `json:"completion_tokens_details"`
-				PromptTokensDetails *struct {
-					CachedTokens int `json:"cached_tokens"`
-				} `json:"prompt_tokens_details"`
-			} `json:"usage"`
-		}
-
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
-		}
-
-		// 处理 delta content
-		if len(chunk.Choices) > 0 {
-			delta := chunk.Choices[0].Delta
-			if delta.Content != "" {
-				ch <- StreamEvent{Type: "delta", Text: delta.Content}
-			}
-			if delta.ReasoningContent != "" {
-				ch <- StreamEvent{Type: "reasoning", Text: delta.ReasoningContent}
-			}
-			// 只记录 finish_reason，不能在这里 return：
-			// 有些兼容服务商把 finish_reason 和 usage 放在同一个 chunk，
-			// 直接跳出会导致 usage 永远收不到
-			if fr := chunk.Choices[0].FinishReason; fr != nil && finish == "" {
-				finish = *fr
-			}
-		}
-
-		// 处理 usage（可能出现在流末尾的独立 chunk，也可能与 finish_reason 同 chunk）
-		if chunk.Usage != nil {
-			u := &Usage{
-				PromptTokens:     chunk.Usage.PromptTokens,
-				CompletionTokens: chunk.Usage.CompletionTokens,
-			}
-			if chunk.Usage.PromptTokensDetails != nil {
-				u.CachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
-			}
-			// reasoning_tokens 各家放置位置不同：优先 completion_tokens_details，兼容顶层
-			if d := chunk.Usage.CompletionTokensDetails; d != nil && d.ReasoningTokens > 0 {
-				u.ReasoningTokens = d.ReasoningTokens
-			} else if chunk.Usage.ReasoningTokens > 0 {
-				u.ReasoningTokens = chunk.Usage.ReasoningTokens
-			}
-			ch <- StreamEvent{Type: "usage", Usage: u}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 		}
 	}
-
-	if err := sr.scan.Err(); err != nil {
-		ch <- StreamEvent{Type: "error", Error: fmt.Sprintf("读取流失败: %v", err)}
-		return
+	if !doneMarker && !failed {
+		_ = flush()
 	}
-	if finish == "" {
+	if err := sr.scan.Err(); err != nil && !failed {
+		failed = true
+		ch <- StreamEvent{Type: "error", Error: fmt.Sprintf("读取上游流失败: %v", err)}
+	}
+	if failed {
+		finish = "error"
+	} else if finish == "" {
 		finish = "stop"
 	}
 	ch <- StreamEvent{Type: "done", Finish: finish}
+}
+
+type upstreamChunk struct {
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    any    `json:"code"`
+	} `json:"error"`
+	Choices []struct {
+		Delta struct {
+			Content          json.RawMessage `json:"content"`
+			ReasoningContent json.RawMessage `json:"reasoning_content"`
+			Reasoning        json.RawMessage `json:"reasoning"`
+			ReasoningText    json.RawMessage `json:"reasoning_text"`
+			ReasoningDetails json.RawMessage `json:"reasoning_details"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *struct {
+		PromptTokens            int `json:"prompt_tokens"`
+		CompletionTokens        int `json:"completion_tokens"`
+		ReasoningTokens         int `json:"reasoning_tokens"`
+		CompletionTokensDetails *struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
+		PromptTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+	} `json:"usage"`
+}
+
+func parseChunk(data string, ch chan<- StreamEvent) (string, error) {
+	var chunk upstreamChunk
+	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		return "", fmt.Errorf("解析上游 SSE JSON 失败: %w", err)
+	}
+	if chunk.Error != nil {
+		msg := strings.TrimSpace(chunk.Error.Message)
+		if msg == "" {
+			msg = "上游返回未知错误"
+		}
+		return "error", fmt.Errorf("%s", msg)
+	}
+	finish := ""
+	for _, choice := range chunk.Choices {
+		delta := choice.Delta
+		// 兼容网关可能同时镜像多个 reasoning 字段：按优先级只取第一个非空值，避免重复展示。
+		for _, raw := range []json.RawMessage{delta.ReasoningContent, delta.Reasoning, delta.ReasoningText, delta.ReasoningDetails} {
+			if text := extractText(raw); text != "" {
+				ch <- StreamEvent{Type: "reasoning", Text: text}
+				break
+			}
+		}
+		if text := extractText(delta.Content); text != "" {
+			ch <- StreamEvent{Type: "delta", Text: text}
+		}
+		if choice.FinishReason != nil && finish == "" {
+			finish = *choice.FinishReason
+		}
+	}
+	if chunk.Usage != nil {
+		u := &Usage{PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens}
+		if chunk.Usage.PromptTokensDetails != nil {
+			u.CachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+		}
+		if chunk.Usage.CompletionTokensDetails != nil && chunk.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
+			u.ReasoningTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
+		} else {
+			u.ReasoningTokens = chunk.Usage.ReasoningTokens
+		}
+		ch <- StreamEvent{Type: "usage", Usage: u}
+	}
+	return finish, nil
+}
+
+func extractText(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	var b strings.Builder
+	collectText(value, &b)
+	return b.String()
+}
+
+func collectText(v any, b *strings.Builder) {
+	switch x := v.(type) {
+	case string:
+		b.WriteString(x)
+	case []any:
+		for _, item := range x {
+			collectText(item, b)
+		}
+	case map[string]any:
+		for _, key := range []string{"text", "content", "value"} {
+			if val, ok := x[key]; ok {
+				collectText(val, b)
+				return
+			}
+		}
+	}
 }

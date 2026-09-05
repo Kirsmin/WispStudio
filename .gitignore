@@ -1,25 +1,24 @@
-# 运行时数据
-Data/
-
-# Go 缓存
-.gocache/
-.gopath/
-
-# Node.js
-web/node_modules/
-web/dist/
-.npm-cache/
-
-# 配置文件（含密钥）
+# local secrets / runtime data
 config.toml
 config.toml.local
+Data/
 
-# IDE
+# frontend
+web/node_modules/
+web/dist/
+
+# editor / os
+.DS_Store
 .idea/
 .vscode/
-*.swp
-*.swo
+*.log
 
-# OS
-.DS_Store
-Thumbs.db
+# build
+bin/
+WispStudio
+server
+
+# cache
+.gocache/
+.gopath/
+.npm-cache/
