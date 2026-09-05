@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref, watch } from 'vue'
+import { reactive, ref, watch } from 'vue'
 import { useConnectionStore } from './connection'
 import { useSessionsStore } from './sessions'
 
@@ -10,6 +10,7 @@ export interface ChatMessage {
   type: 'user' | 'assistant'
   content: string
   reasoning?: string
+  provider?: string
   model?: string
   thinking?: string
   usage?: {
@@ -70,6 +71,141 @@ export function modelThinkingLevels(model?: { id?: string; thinking_levels?: str
 }
 
 type SSEMessage = { event: string; data: string }
+type VisualPartKind = 'reasoning' | 'answer'
+
+interface VisualPart {
+  kind: VisualPartKind
+  chars: string[]
+  offset: number
+}
+
+// 这是“视觉流”的节奏，而不是网络节流。
+// 即使浏览器一次 reader.read() 收到几十个 SSE delta，或者代理/TCP 把小包合并，
+// 也会在多个 animation frame 中逐步写入 Vue 的响应式 message，从而保证中间态可见。
+const TYPEWRITER_MIN_CHARS_PER_FRAME = 2
+const TYPEWRITER_MAX_CHARS_PER_FRAME = 24
+const TYPEWRITER_TARGET_DRAIN_FRAMES = 24
+const MIN_REASONING_VISIBLE_MS = 180
+
+class VisualStreamPump {
+  private queue: VisualPart[] = []
+  private queuedChars = 0
+  private rafId: number | null = null
+  private stopped = false
+  private reasoningVisibleAt = 0
+  private drainResolvers: Array<() => void> = []
+
+  constructor(
+    private readonly target: ChatMessage,
+    private readonly isActive: () => boolean,
+  ) {}
+
+  enqueue(kind: VisualPartKind, text: string): void {
+    if (this.stopped || !text) return
+    const chars = Array.from(text)
+    if (chars.length === 0) return
+
+    const last = this.queue[this.queue.length - 1]
+    if (last && last.kind === kind && last.offset === 0) {
+      last.chars.push(...chars)
+    } else {
+      this.queue.push({ kind, chars, offset: 0 })
+    }
+    this.queuedChars += chars.length
+    this.ensureFrame()
+  }
+
+  drain(): Promise<void> {
+    if (this.stopped || this.queuedChars === 0) return Promise.resolve()
+    this.ensureFrame()
+    return new Promise(resolve => this.drainResolvers.push(resolve))
+  }
+
+  cancel(): void {
+    if (this.stopped) return
+    this.stopped = true
+    this.queue = []
+    this.queuedChars = 0
+    if (this.rafId !== null) {
+      window.cancelAnimationFrame(this.rafId)
+      this.rafId = null
+    }
+    this.resolveDrainWaiters()
+  }
+
+  private ensureFrame(): void {
+    if (this.stopped || this.rafId !== null || this.queuedChars === 0) return
+    this.rafId = window.requestAnimationFrame(timestamp => this.renderFrame(timestamp))
+  }
+
+  private renderFrame(timestamp: number): void {
+    this.rafId = null
+    if (this.stopped || !this.isActive()) {
+      this.cancel()
+      return
+    }
+
+    const first = this.queue[0]
+    if (!first) {
+      this.resolveDrainWaiters()
+      return
+    }
+
+    // 如果 reasoning 和 answer 在同一个网络批次里到达，不能同一帧“展开又折叠”。
+    // 至少让 reasoning 区域真实绘制一小段时间，用户能看到思考中间态。
+    if (
+      first.kind === 'answer' &&
+      this.target.phase === 'reasoning' &&
+      this.reasoningVisibleAt > 0 &&
+      timestamp - this.reasoningVisibleAt < MIN_REASONING_VISIBLE_MS
+    ) {
+      this.ensureFrame()
+      return
+    }
+
+    const frameKind = first.kind
+    const adaptive = Math.ceil(this.queuedChars / TYPEWRITER_TARGET_DRAIN_FRAMES)
+    let budget = Math.min(
+      TYPEWRITER_MAX_CHARS_PER_FRAME,
+      Math.max(TYPEWRITER_MIN_CHARS_PER_FRAME, adaptive),
+    )
+
+    // 一个 frame 只渲染一种阶段。这样 reasoning -> answer 的阶段切换一定跨越浏览器绘制边界。
+    while (budget > 0 && this.queue.length > 0 && this.queue[0].kind === frameKind) {
+      const part = this.queue[0]
+      const remaining = part.chars.length - part.offset
+      const take = Math.min(budget, remaining)
+      const text = part.chars.slice(part.offset, part.offset + take).join('')
+
+      if (frameKind === 'reasoning') {
+        if (this.target.phase !== 'reasoning') {
+          this.target.phase = 'reasoning'
+          this.reasoningVisibleAt = timestamp
+        }
+        this.target.reasoning = (this.target.reasoning || '') + text
+      } else {
+        this.target.phase = 'answer'
+        this.target.content += text
+      }
+
+      part.offset += take
+      this.queuedChars -= take
+      budget -= take
+      if (part.offset >= part.chars.length) this.queue.shift()
+    }
+
+    if (this.queuedChars > 0) {
+      this.ensureFrame()
+    } else {
+      this.resolveDrainWaiters()
+    }
+  }
+
+  private resolveDrainWaiters(): void {
+    const waiters = this.drainResolvers.splice(0)
+    for (const resolve of waiters) resolve()
+  }
+}
 
 // 增量 SSE 解码器：兼容 \n\n 和 \r\n\r\n，支持多行 data。
 class SSEDecoder {
@@ -130,30 +266,30 @@ export const useChatStore = defineStore('chat', () => {
   const abortController = ref<AbortController | null>(null)
 
   let activeRun = 0
+  let cancelVisualStream: (() => void) | null = null
 
   const connectionStore = useConnectionStore()
   const sessionsStore = useSessionsStore()
 
+  function modelsForProvider(providerId: string) {
+    if (!providerId) return connectionStore.models
+    return connectionStore.models.filter(model => model.provider_id === providerId)
+  }
+
   function syncCatalogSelection(): void {
     const providers = connectionStore.providers
-    const models = connectionStore.models
-    if (models.length === 0) {
-      selectedProvider.value = ''
+    if (providers.length > 0 && !providers.some(provider => provider.id === selectedProvider.value)) {
+      selectedProvider.value = connectionStore.defaultProvider || providers[0].id
+    }
+
+    const candidates = modelsForProvider(selectedProvider.value)
+    if (candidates.length === 0) {
       selectedModel.value = ''
       return
     }
-
-    const providerHasModels = (providerId: string) => models.some(model => model.provider_id === providerId)
-    if (!selectedProvider.value || !providers.some(provider => provider.id === selectedProvider.value) || !providerHasModels(selectedProvider.value)) {
-      const preferred = providers.find(provider => provider.default && providerHasModels(provider.id))
-        || providers.find(provider => providerHasModels(provider.id))
-      selectedProvider.value = preferred?.id || models[0].provider_id
-    }
-
-    const providerModels = models.filter(model => model.provider_id === selectedProvider.value)
-    if (!providerModels.some(model => model.id === selectedModel.value)) {
-      const def = providerModels.find(model => model.default)
-      selectedModel.value = def?.id || providerModels[0]?.id || ''
+    if (!candidates.some(model => model.id === selectedModel.value)) {
+      const preferred = candidates.find(model => model.default)
+      selectedModel.value = preferred?.id || candidates[0].id
     }
   }
 
@@ -167,20 +303,40 @@ export const useChatStore = defineStore('chat', () => {
     syncCatalogSelection()
   })
 
-  watch([selectedProvider, selectedModel], ([providerId, modelId]) => {
-    const model = connectionStore.models.find(item => item.provider_id === providerId && item.id === modelId)
+  watch(selectedModel, (modelId) => {
+    const model = connectionStore.models.find(item =>
+      item.id === modelId && (!selectedProvider.value || item.provider_id === selectedProvider.value),
+    )
+    if (model && selectedProvider.value !== model.provider_id) {
+      selectedProvider.value = model.provider_id
+    }
     const levels = modelThinkingLevels(model)
     if (!levels.includes(selectedThinking.value)) {
       selectedThinking.value = levels.includes('default') ? 'default' : levels[0]
     }
   }, { immediate: true })
 
-  watch(() => sessionsStore.currentSessionId, () => {
+  watch(() => sessionsStore.currentSessionId, (sessionId) => {
     activeRun++
+    cancelVisualStream?.()
+    cancelVisualStream = null
     abortController.value?.abort()
     abortController.value = null
     isStreaming.value = false
     messages.value = []
+
+    const session = sessionsStore.sessions.find(item => item.id === sessionId)
+    if (!session) return
+    if (session.provider && connectionStore.providers.some(provider => provider.id === session.provider)) {
+      selectedProvider.value = session.provider
+    }
+    const sessionModel = connectionStore.models.find(model =>
+      model.id === session.model && (!session.provider || model.provider_id === session.provider),
+    )
+    if (sessionModel) {
+      selectedProvider.value = sessionModel.provider_id
+      selectedModel.value = sessionModel.id
+    }
   })
 
   async function loadMessages(sessionId: string) {
@@ -233,20 +389,26 @@ export const useChatStore = defineStore('chat', () => {
       id: `temp_user_${Date.now()}`,
       type: 'user',
       content: text,
+      provider: selectedProvider.value,
       model: selectedModel.value,
       thinking: selectedThinking.value,
       phase: 'done',
     }
-    const assistantMsg: ChatMessage = {
+
+    // 必须保留这个 reactive()：之前把普通对象 push 进 reactive 数组后，
+    // SSE 回调仍直接修改那个“原始对象”，绕过了 Vue Proxy，导致每个 delta 都没有触发视图更新；
+    // 最后 loadMessages() 替换整个数组时才突然一次性显示完整回复。
+    const assistantMsg = reactive<ChatMessage>({
       id: `stream_${Date.now()}`,
       type: 'assistant',
       content: '',
       reasoning: '',
+      provider: selectedProvider.value,
       model: selectedModel.value,
       thinking: selectedThinking.value,
       streaming: true,
       phase: 'waiting',
-    }
+    })
 
     // 先把 user + assistant 占位放进 UI，再发请求；用户点击发送后立即有反馈。
     messages.value.push(userMsg, assistantMsg)
@@ -255,11 +417,20 @@ export const useChatStore = defineStore('chat', () => {
     abortController.value = new AbortController()
     const localController = abortController.value
 
+    const visualStream = new VisualStreamPump(assistantMsg, () => run === activeRun)
+    cancelVisualStream = () => visualStream.cancel()
+
     const decoder = new SSEDecoder()
     const textDecoder = new TextDecoder()
     let gotSSE = false
+    let finalUsage: ChatMessage['usage'] | undefined
+    let finalError = ''
+    let finalFinish = ''
+    let finalDurationMs: number | undefined
+    let finalTTFTMs: number | undefined
 
     const handleEvent = (message: SSEMessage) => {
+      if (run !== activeRun) return
       gotSSE = true
       const payload = parseJSON(message.data)
       switch (message.event) {
@@ -268,40 +439,56 @@ export const useChatStore = defineStore('chat', () => {
           break
         case 'ttft': {
           const value = Number(payload.ms)
-          if (Number.isFinite(value)) assistantMsg.ttft_ms = value
+          if (Number.isFinite(value)) {
+            finalTTFTMs = value
+            assistantMsg.ttft_ms = value
+          }
           break
         }
         case 'reasoning': {
           const textPart = String(payload.text || '')
-          if (!textPart) break
-          assistantMsg.phase = 'reasoning'
-          assistantMsg.reasoning = (assistantMsg.reasoning || '') + textPart
+          if (textPart) visualStream.enqueue('reasoning', textPart)
           break
         }
         case 'delta': {
           const textPart = String(payload.text || '')
-          if (!textPart) break
-          // 第一段可见答案到达即代表“思考阶段结束”；MessageItem 会自动折叠思考块。
-          assistantMsg.phase = 'answer'
-          assistantMsg.content += textPart
+          if (textPart) visualStream.enqueue('answer', textPart)
           break
         }
         case 'usage':
-          assistantMsg.usage = payload as unknown as ChatMessage['usage']
+          finalUsage = payload as unknown as ChatMessage['usage']
           break
         case 'error':
-          assistantMsg.error = String(payload.message || '生成失败')
-          assistantMsg.phase = 'error'
+          finalError = String(payload.message || '生成失败')
           break
         case 'done': {
-          assistantMsg.streaming = false
-          assistantMsg.finish = String(payload.finish || 'stop')
-          if (payload.error) assistantMsg.error = String(payload.error)
-          if (Number.isFinite(Number(payload.duration_ms))) assistantMsg.duration_ms = Number(payload.duration_ms)
-          if (Number.isFinite(Number(payload.ttft_ms))) assistantMsg.ttft_ms = Number(payload.ttft_ms)
-          assistantMsg.phase = assistantMsg.error ? 'error' : 'done'
+          finalFinish = String(payload.finish || 'stop')
+          if (payload.error) finalError = String(payload.error)
+          if (Number.isFinite(Number(payload.duration_ms))) finalDurationMs = Number(payload.duration_ms)
+          if (Number.isFinite(Number(payload.ttft_ms))) finalTTFTMs = Number(payload.ttft_ms)
           break
         }
+      }
+    }
+
+    const finishVisualMessage = async (): Promise<void> => {
+      await visualStream.drain()
+      if (run !== activeRun) return
+
+      assistantMsg.streaming = false
+      assistantMsg.usage = finalUsage
+      assistantMsg.finish = finalFinish || (finalError ? 'error' : 'stop')
+      assistantMsg.duration_ms = finalDurationMs
+      if (finalTTFTMs !== undefined) assistantMsg.ttft_ms = finalTTFTMs
+      if (finalError) assistantMsg.error = finalError
+
+      if (assistantMsg.error) {
+        assistantMsg.phase = 'error'
+      } else if (assistantMsg.content || assistantMsg.reasoning) {
+        assistantMsg.phase = 'done'
+      } else {
+        assistantMsg.phase = 'error'
+        assistantMsg.error = '模型没有返回可显示的内容'
       }
     }
 
@@ -311,8 +498,6 @@ export const useChatStore = defineStore('chat', () => {
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         body: JSON.stringify({
           message: text,
-          // model ID 在不同 Provider 中可能重名，因此 provider 必须作为选择的一部分发送。
-          // 后端仍兼容旧客户端只传 model 的请求。
           provider: selectedProvider.value,
           model: selectedModel.value,
           thinking: selectedThinking.value,
@@ -349,35 +534,35 @@ export const useChatStore = defineStore('chat', () => {
       for (const event of decoder.feed(textDecoder.decode())) handleEvent(event)
       for (const event of decoder.flush()) handleEvent(event)
 
-      if (!assistantMsg.error && assistantMsg.phase !== 'done') {
-        assistantMsg.streaming = false
-        assistantMsg.phase = assistantMsg.content || assistantMsg.reasoning ? 'done' : 'error'
-        if (assistantMsg.phase === 'error') assistantMsg.error = '模型没有返回可显示的内容'
-      }
+      // 关键：不要在网络流结束时立刻 loadMessages()。
+      // 网络可能已经把全部 token 收完，但视觉流还在逐帧输出；如果此时重新读取数据库，
+      // 会用“完整文本”替换当前消息，再次造成一瞬间全出来。
+      await finishVisualMessage()
 
       if (run === activeRun && sessionsStore.currentSessionId === currentId) {
         await loadMessages(currentId)
         await sessionsStore.loadSessions().catch(() => undefined)
       }
     } catch (e: any) {
-      if (e?.name !== 'AbortError') {
-        const message = e instanceof Error ? e.message : String(e)
-        assistantMsg.streaming = false
-        assistantMsg.phase = 'error'
-        assistantMsg.error = message
-        if (!gotSSE) window.$message?.error(message)
+      if (e?.name !== 'AbortError' && run === activeRun) {
+        finalError = e instanceof Error ? e.message : String(e)
+        await finishVisualMessage()
+        if (!gotSSE) window.$message?.error(finalError)
         console.error('发送失败', e)
       }
     } finally {
       if (run === activeRun) {
         isStreaming.value = false
         if (abortController.value === localController) abortController.value = null
+        if (cancelVisualStream) cancelVisualStream = null
       }
     }
   }
 
   function stopStream() {
     activeRun++
+    cancelVisualStream?.()
+    cancelVisualStream = null
     abortController.value?.abort()
     abortController.value = null
     isStreaming.value = false
@@ -390,17 +575,6 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function openSession(id: string) {
-    const session = sessionsStore.sessions.find(item => item.id === id)
-    if (session?.provider && connectionStore.models.some(model => model.provider_id === session.provider && model.id === session.model)) {
-      selectedProvider.value = session.provider
-      selectedModel.value = session.model
-    } else if (session?.model) {
-      const candidate = connectionStore.models.find(model => model.id === session.model)
-      if (candidate) {
-        selectedProvider.value = candidate.provider_id
-        selectedModel.value = candidate.id
-      }
-    }
     sessionsStore.currentSessionId = id
     await loadMessages(id)
   }

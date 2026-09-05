@@ -12,7 +12,7 @@
       <div class="composer-bar">
         <div class="bar-left">
           <n-select
-            v-if="providerOptions.length > 1"
+            v-if="providers.length > 1"
             v-model:value="selectedProvider"
             :options="providerOptions"
             size="small"
@@ -38,7 +38,7 @@
           class="send-btn"
           :class="{ streaming: isStreaming }"
           :disabled="!isStreaming && (!inputText.trim() || !selectedModel)"
-          :title="isStreaming ? '停止生成' : '发送 (Enter)'"
+          :title="isStreaming ? '停止生成' : '发送 (Shift/Ctrl + Enter)'"
           @click="isStreaming ? stopStream() : sendMessage()"
         >
           <svg v-if="isStreaming" viewBox="0 0 16 16" width="14" height="14">
@@ -66,17 +66,13 @@ const { isStreaming, selectedProvider, selectedModel, selectedThinking, inputTex
 const { providers, models } = storeToRefs(connectionStore)
 
 const providerOptions = computed(() =>
-  providers.value.map(provider => ({
-    label: provider.name,
-    value: provider.id,
-    disabled: !provider.available && provider.models_count === 0,
-  }))
+  providers.value.map(provider => ({ label: provider.name, value: provider.id })),
 )
 
 const modelOptions = computed(() =>
   models.value
-    .filter(model => model.provider_id === selectedProvider.value)
-    .map(model => ({ label: model.name, value: model.id }))
+    .filter(model => !selectedProvider.value || model.provider_id === selectedProvider.value)
+    .map(model => ({ label: model.name, value: model.id })),
 )
 
 const thinkingLabels: Record<string, string> = {
@@ -93,7 +89,9 @@ const thinkingLabels: Record<string, string> = {
 }
 
 const thinkingOptions = computed(() => {
-  const model = models.value.find(item => item.provider_id === selectedProvider.value && item.id === selectedModel.value)
+  const model = models.value.find(item =>
+    item.id === selectedModel.value && (!selectedProvider.value || item.provider_id === selectedProvider.value),
+  )
   return modelThinkingLevels(model).map(level => ({
     label: thinkingLabels[level] || level,
     value: level,
@@ -101,7 +99,12 @@ const thinkingOptions = computed(() => {
 })
 
 function handleKeydown(event: KeyboardEvent) {
-  if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return
+  if (event.key !== 'Enter' || event.isComposing) return
+
+  // Enter：正常换行。
+  // Shift + Enter / Ctrl + Enter：发送。
+  if (!event.shiftKey && !event.ctrlKey) return
+
   event.preventDefault()
   if (!isStreaming.value) void chatStore.sendMessage()
 }
@@ -156,6 +159,7 @@ function stopStream() {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
 }
 
 .pill-select :deep(.n-base-selection) {
