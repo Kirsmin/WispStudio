@@ -3,11 +3,9 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,90 +15,61 @@ import (
 	"wisp/internal/store"
 )
 
-type activeRun struct {
-	cancel    context.CancelFunc
-	startedAt time.Time
-}
-
 type ChatHandler struct {
 	cfg          *config.Config
 	sessionStore *store.SessionStore
 	messageStore *store.MessageStore
 	requestStore *store.RequestStore
 	openaiClient *openai.Client
-
-	modelsMu sync.RWMutex
-	models   []provider.ModelInfo
-	runsMu   sync.Mutex
-	runs     map[string]activeRun
+	modelsMu     sync.RWMutex
+	models       []provider.ModelInfo
+	runsMu       sync.Mutex
+	runs         map[string]context.CancelFunc
 }
 
 func NewChatHandler(cfg *config.Config, ss *store.SessionStore, ms *store.MessageStore, rs *store.RequestStore, models []provider.ModelInfo) *ChatHandler {
-	return &ChatHandler{
-		cfg: cfg, sessionStore: ss, messageStore: ms, requestStore: rs,
-		openaiClient: openai.NewClient(&cfg.OpenAI), models: append([]provider.ModelInfo(nil), models...),
-		runs: make(map[string]activeRun),
-	}
+	return &ChatHandler{cfg: cfg, sessionStore: ss, messageStore: ms, requestStore: rs, openaiClient: openai.NewClient(&cfg.OpenAI), models: append([]provider.ModelInfo(nil), models...), runs: map[string]context.CancelFunc{}}
 }
 
 func (h *ChatHandler) SetModels(models []provider.ModelInfo) {
 	h.modelsMu.Lock()
+	defer h.modelsMu.Unlock()
 	h.models = append([]provider.ModelInfo(nil), models...)
-	h.modelsMu.Unlock()
 }
-
 func (h *ChatHandler) findModel(id string) *provider.ModelInfo {
 	h.modelsMu.RLock()
 	defer h.modelsMu.RUnlock()
 	return provider.FindModel(h.models, id)
 }
-
 func (h *ChatHandler) beginRun(sessionID string) (context.Context, bool) {
 	h.runsMu.Lock()
 	defer h.runsMu.Unlock()
 	if _, exists := h.runs[sessionID]; exists {
 		return nil, false
 	}
-	base := context.Background()
-	var ctx context.Context
-	var cancel context.CancelFunc
-	if h.cfg.OpenAI.MaxGenerationSec > 0 {
-		ctx, cancel = context.WithTimeout(base, time.Duration(h.cfg.OpenAI.MaxGenerationSec)*time.Second)
-	} else {
-		ctx, cancel = context.WithCancel(base)
-	}
-	h.runs[sessionID] = activeRun{cancel: cancel, startedAt: time.Now().UTC()}
+	ctx, cancel := context.WithCancel(context.Background())
+	h.runs[sessionID] = cancel
 	return ctx, true
 }
-
 func (h *ChatHandler) endRun(sessionID string) {
 	h.runsMu.Lock()
-	if run, ok := h.runs[sessionID]; ok {
-		run.cancel()
-		delete(h.runs, sessionID)
-	}
-	h.runsMu.Unlock()
+	defer h.runsMu.Unlock()
+	delete(h.runs, sessionID)
 }
-
-func (h *ChatHandler) CancelRun(sessionID string) bool {
+func (h *ChatHandler) IsRunning(sessionID string) bool {
 	h.runsMu.Lock()
 	defer h.runsMu.Unlock()
-	run, ok := h.runs[sessionID]
-	if !ok {
-		return false
-	}
-	run.cancel()
-	return true
+	_, ok := h.runs[sessionID]
+	return ok
 }
-
-func (h *ChatHandler) RunStatus(sessionID string) (bool, time.Time) {
+func (h *ChatHandler) Cancel(sessionID string) bool {
 	h.runsMu.Lock()
 	defer h.runsMu.Unlock()
-	run, ok := h.runs[sessionID]
-	if !ok {
-		return false, time.Time{}
+	cancel, ok := h.runs[sessionID]
+	if ok {
+		cancel()
 	}
-	return true, run.startedAt
+	return ok
 }
 
 type chatRequest struct {
@@ -119,32 +88,34 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "缺少会话ID", http.StatusBadRequest)
 		return
 	}
-	if _, err := h.sessionStore.Get(sessionID); err != nil {
-		http.Error(w, "会话不存在", http.StatusNotFound)
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req chatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&req); err != nil {
 		http.Error(w, "请求体解析失败", http.StatusBadRequest)
 		return
 	}
-	req.Message = strings.TrimSpace(req.Message)
-	req.Model = strings.TrimSpace(req.Model)
 	if req.Message == "" {
 		http.Error(w, "消息不能为空", http.StatusBadRequest)
 		return
 	}
-	if req.Model == "" {
-		http.Error(w, "未选择模型", http.StatusBadRequest)
+	model := h.findModel(req.Model)
+	if model == nil {
+		http.Error(w, "模型不存在或模型列表已变化，请刷新模型列表", http.StatusBadRequest)
 		return
 	}
-	modelInfo := h.findModel(req.Model)
-	if modelInfo == nil {
-		http.Error(w, "模型不存在或模型列表已变化，请刷新模型后重试", http.StatusBadRequest)
+	if err := provider.ValidateThinking(*model, req.Thinking); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if _, err := h.sessionStore.Get(sessionID); err != nil {
+		http.Error(w, "会话不存在", http.StatusNotFound)
+		return
+	}
+	ctx, ok := h.beginRun(sessionID)
+	if !ok {
+		writeJSONError(w, http.StatusConflict, "该会话有任务正在执行")
+		return
+	}
+	defer h.endRun(sessionID)
 
 	history, err := h.messageStore.List(sessionID)
 	if err != nil {
@@ -155,200 +126,148 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	for _, msg := range history {
 		role := "user"
 		if msg.Type == store.MessageTypeAssistant {
-			// 没有最终正文的半截 reasoning 不作为 assistant 正文回灌，避免污染下一轮上下文。
-			if strings.TrimSpace(msg.Content) == "" {
-				continue
-			}
 			role = "assistant"
 		}
 		messages = append(messages, openai.ChatMessage{Role: role, Content: msg.Content})
 	}
 	messages = append(messages, openai.ChatMessage{Role: "user", Content: req.Message})
 
-	baseURL, apiKey := h.cfg.OpenAI.BaseURL, h.cfg.OpenAI.APIKey
-	if modelInfo.BaseURL != "" {
-		baseURL = modelInfo.BaseURL
-	}
-	if modelInfo.APIKey != "" {
-		apiKey = modelInfo.APIKey
-	}
-	upReq, err := h.openaiClient.BuildRequest(baseURL, apiKey, req.Model, modelInfo.ThinkingStyle, req.Thinking, messages)
+	userMessage, err := h.messageStore.Append(sessionID, store.Message{Type: store.MessageTypeUser, Content: req.Message, Model: req.Model, Thinking: req.Thinking})
 	if err != nil {
-		http.Error(w, "构造上游请求失败: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "保存消息失败", http.StatusInternalServerError)
 		return
 	}
-
-	runCtx, ok := h.beginRun(sessionID)
-	if !ok {
-		writeJSONError(w, http.StatusConflict, "该会话有任务正在执行")
-		return
+	_ = h.sessionStore.UpdateModel(sessionID, req.Model)
+	if len(history) == 0 {
+		_ = h.sessionStore.UpdateAutoTitle(sessionID, store.GenerateTitle(req.Message))
 	}
-	defer h.endRun(sessionID)
 
 	sse, ok := NewSSEWriter(w)
 	if !ok {
-		http.Error(w, "SSE 不支持", http.StatusInternalServerError)
 		return
 	}
-	clientWritable := true
-	write := func(event string, value any) {
-		if !clientWritable {
-			return
-		}
-		if err := sse.WriteJSON(event, value); err != nil {
-			// 客户端刷新/切会话后仅停止推送，不取消上游生成。
-			clientWritable = false
-		}
-	}
-	write("start", map[string]any{"session_id": sessionID, "model": req.Model})
+	ack, _ := json.Marshal(map[string]any{"message": userMessage})
+	_ = sse.WriteEvent("ack", string(ack))
 
-	raw := ""
+	upReq, err := h.openaiClient.BuildRequest(model.BaseURL, model.APIKey, req.Model, model.ThinkingStyle, req.Thinking, messages)
+	if err != nil {
+		h.finishWithError(sessionID, req, sse, "构造上游请求失败: "+err.Error(), 0, 0)
+		return
+	}
 	if upReq.GetBody != nil {
 		if rc, getErr := upReq.GetBody(); getErr == nil {
-			if b, readErr := io.ReadAll(rc); readErr == nil {
-				raw = string(b)
+			if raw, readErr := io.ReadAll(rc); readErr == nil {
+				h.requestStore.WriteRequest(sessionID, http.MethodPost, upReq.URL.String(), string(raw))
 			}
 			_ = rc.Close()
 		}
 	}
-	_ = h.requestStore.WriteRequest(sessionID, http.MethodPost, upReq.URL.String(), raw)
 
-	// 上游先成功建立流，再落用户消息；这样 401/429/网关错误不会留下“已保存但实际没发出”的重复消息。
-	resp, err := h.openaiClient.DoStream(runCtx, upReq)
+	start := time.Now()
+	resp, err := h.openaiClient.DoStream(ctx, upReq)
 	if err != nil {
-		_ = h.requestStore.WriteError(sessionID, err.Error())
-		write("error", map[string]any{"message": err.Error(), "retryable": true, "persisted": false})
-		write("done", map[string]any{"finish": "error", "persisted": false})
+		h.requestStore.WriteError(sessionID, err.Error())
+		h.finishWithError(sessionID, req, sse, err.Error(), int(time.Since(start).Milliseconds()), 0)
 		return
 	}
 	defer resp.Body.Close()
 
-	userMsg, err := h.messageStore.Append(sessionID, store.Message{
-		Type: store.MessageTypeUser, Content: req.Message, Model: req.Model, Thinking: req.Thinking,
-	})
-	if err != nil {
-		_ = resp.Body.Close()
-		write("error", map[string]any{"message": "保存用户消息失败", "retryable": true, "persisted": false})
-		write("done", map[string]any{"finish": "error", "persisted": false})
-		return
-	}
-	write("ack", map[string]any{"message": userMsg})
-	_ = h.sessionStore.UpdateModel(sessionID, req.Model)
-	if len(history) == 0 {
-		if sess, getErr := h.sessionStore.Get(sessionID); getErr == nil && !sess.Renamed {
-			_ = h.sessionStore.SetAutoTitle(sessionID, store.GenerateTitle(req.Message))
-		}
-	}
-
 	reader := openai.NewStreamReader(resp.Body)
-	ch := make(chan openai.StreamEvent, 32)
-	go reader.ReadEvents(ch)
-	startTime := time.Now()
-	var firstToken time.Time
-	var fullContent, fullReasoning string
+	events := make(chan openai.StreamEvent, 32)
+	go reader.ReadEvents(events)
+	var fullContent, fullReasoning, finishReason, streamError string
 	var finalUsage *openai.Usage
-	finishReason := ""
-	streamError := ""
-	for evt := range ch {
-		switch evt.Type {
+	var firstToken time.Time
+	for event := range events {
+		switch event.Type {
 		case "delta":
 			if firstToken.IsZero() {
 				firstToken = time.Now()
-				write("ttft", map[string]any{"ms": firstToken.Sub(startTime).Milliseconds()})
+				_ = sse.WriteEvent("ttft", fmt.Sprintf(`{"ms":%d}`, firstToken.Sub(start).Milliseconds()))
 			}
-			fullContent += evt.Text
-			write("delta", map[string]any{"text": evt.Text})
+			fullContent += event.Text
+			_ = sse.WriteEvent("delta", mustJSON(map[string]any{"text": event.Text}))
 		case "reasoning":
 			if firstToken.IsZero() {
 				firstToken = time.Now()
-				write("ttft", map[string]any{"ms": firstToken.Sub(startTime).Milliseconds()})
+				_ = sse.WriteEvent("ttft", fmt.Sprintf(`{"ms":%d}`, firstToken.Sub(start).Milliseconds()))
 			}
-			fullReasoning += evt.Text
-			write("reasoning", map[string]any{"text": evt.Text})
+			fullReasoning += event.Text
+			_ = sse.WriteEvent("reasoning", mustJSON(map[string]any{"text": event.Text}))
 		case "usage":
-			finalUsage = evt.Usage
-			write("usage", evt.Usage)
+			finalUsage = event.Usage
+			_ = sse.WriteEvent("usage", mustJSON(event.Usage))
 		case "error":
-			streamError = evt.Error
-			write("error", map[string]any{"message": evt.Error, "retryable": false, "persisted": true})
+			streamError = event.Error
+			finishReason = "error"
+			_ = sse.WriteEvent("error", mustJSON(map[string]any{"message": event.Error}))
 		case "done":
-			finishReason = evt.Finish
+			if finishReason == "" {
+				finishReason = event.Finish
+			}
 		}
 	}
-
-	if errors.Is(runCtx.Err(), context.Canceled) {
+	if ctx.Err() != nil {
 		finishReason = "aborted"
-		streamError = "生成已停止"
-	} else if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-		finishReason = "timeout"
-		streamError = "生成超过服务端最长时限"
-	} else if finishReason == "" {
+		if streamError == "" {
+			streamError = "生成已停止"
+		}
+	}
+	if finishReason == "" {
 		finishReason = "stop"
 	}
-	if finishReason == "error" && streamError == "" {
-		streamError = "上游流式响应解析失败"
-	}
-	if strings.TrimSpace(fullContent) == "" && strings.TrimSpace(fullReasoning) == "" && streamError == "" {
-		finishReason = "error"
-		streamError = "上游结束了请求，但没有返回可展示的正文或推理内容"
-	}
-
-	duration := int(time.Since(startTime).Milliseconds())
+	duration := int(time.Since(start).Milliseconds())
 	ttft := 0
 	if !firstToken.IsZero() {
-		ttft = int(firstToken.Sub(startTime).Milliseconds())
+		ttft = int(firstToken.Sub(start).Milliseconds())
 	}
-	var usage *store.Usage
-	if finalUsage != nil {
-		usage = &store.Usage{
-			PromptTokens: finalUsage.PromptTokens, CompletionTokens: finalUsage.CompletionTokens,
-			CachedTokens: finalUsage.CachedTokens, ReasoningTokens: finalUsage.ReasoningTokens,
-		}
-	}
-	assistantMsg, saveErr := h.messageStore.Append(sessionID, store.Message{
-		Type: store.MessageTypeAssistant, Content: fullContent, Reasoning: fullReasoning,
-		Model: req.Model, Thinking: req.Thinking, Usage: usage, DurationMs: duration,
-		TTFTMs: ttft, Finish: finishReason, Error: streamError,
-	})
-	if saveErr != nil {
-		streamError = "保存助手消息失败: " + saveErr.Error()
-		finishReason = "error"
-		_ = h.requestStore.WriteError(sessionID, streamError)
+	usage := convertUsage(finalUsage)
+	assistant, appendErr := h.messageStore.Append(sessionID, store.Message{Type: store.MessageTypeAssistant, Content: fullContent, Reasoning: fullReasoning, Model: req.Model, Thinking: req.Thinking, Usage: usage, DurationMs: duration, TTFTMs: ttft, Finish: finishReason, Error: streamError})
+	persisted := appendErr == nil
+	_ = h.sessionStore.Touch(sessionID)
+	if finishReason == "aborted" {
+		h.requestStore.WriteAborted(sessionID)
+	} else if finishReason == "error" {
+		h.requestStore.WriteError(sessionID, streamError)
 	} else {
-		_ = h.sessionStore.Touch(sessionID)
+		h.requestStore.WriteDone(sessionID, usageMap(usage), finishReason)
 	}
-
-	usageLog := map[string]int{}
-	if usage != nil {
-		usageLog["prompt_tokens"] = usage.PromptTokens
-		usageLog["completion_tokens"] = usage.CompletionTokens
-		usageLog["cached_tokens"] = usage.CachedTokens
-		usageLog["reasoning_tokens"] = usage.ReasoningTokens
+	payload := map[string]any{"finish": finishReason, "duration_ms": duration, "ttft_ms": ttft, "persisted": persisted}
+	if assistant != nil {
+		payload["message_id"] = assistant.ID
 	}
-	switch finishReason {
-	case "aborted":
-		_ = h.requestStore.WriteAborted(sessionID)
-	case "error", "timeout":
-		_ = h.requestStore.WriteError(sessionID, streamError)
-	default:
-		_ = h.requestStore.WriteDone(sessionID, usageLog, finishReason)
+	if appendErr != nil {
+		payload["error"] = "回复落盘失败: " + appendErr.Error()
 	}
-	write("done", map[string]any{
-		"finish": finishReason, "duration_ms": duration, "ttft_ms": ttft,
-		"message_id": assistantMsg.ID, "error": streamError, "persisted": saveErr == nil,
-	})
+	_ = sse.WriteEvent("done", mustJSON(payload))
 }
 
+func (h *ChatHandler) finishWithError(sessionID string, req chatRequest, sse *SSEWriter, message string, duration, ttft int) {
+	assistant, err := h.messageStore.Append(sessionID, store.Message{Type: store.MessageTypeAssistant, Model: req.Model, Thinking: req.Thinking, DurationMs: duration, TTFTMs: ttft, Finish: "error", Error: message})
+	_ = h.sessionStore.Touch(sessionID)
+	_ = sse.WriteEvent("error", mustJSON(map[string]any{"message": message}))
+	payload := map[string]any{"finish": "error", "duration_ms": duration, "ttft_ms": ttft, "persisted": err == nil, "error": message}
+	if assistant != nil {
+		payload["message_id"] = assistant.ID
+	}
+	_ = sse.WriteEvent("done", mustJSON(payload))
+}
+
+func convertUsage(u *openai.Usage) *store.Usage {
+	if u == nil {
+		return nil
+	}
+	return &store.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, CachedTokens: u.CachedTokens, ReasoningTokens: u.ReasoningTokens}
+}
+func usageMap(u *store.Usage) map[string]int {
+	if u == nil {
+		return map[string]int{}
+	}
+	return map[string]int{"prompt_tokens": u.PromptTokens, "completion_tokens": u.CompletionTokens, "cached_tokens": u.CachedTokens, "reasoning_tokens": u.ReasoningTokens}
+}
+func mustJSON(value any) string { data, _ := json.Marshal(value); return string(data) }
 func writeJSONError(w http.ResponseWriter, status int, message string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
-}
-
-func upstreamMessage(err error) string {
-	var up *openai.UpstreamError
-	if errors.As(err, &up) {
-		return up.Message
-	}
-	return fmt.Sprint(err)
 }

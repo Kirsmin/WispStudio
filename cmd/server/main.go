@@ -5,7 +5,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"time"
 
 	"wisp/internal/api"
 	"wisp/internal/config"
@@ -47,16 +46,14 @@ func main() {
 	}
 	router := api.NewRouter(cfg)
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-	server := &http.Server{
-		Addr: addr, Handler: router,
-		ReadHeaderTimeout: 10 * time.Second,
-		// WriteTimeout 必须为 0，否则长 SSE 会被服务器自身截断。
-		WriteTimeout: 0,
-		IdleTimeout:  120 * time.Second,
-	}
 	log.Printf("已加载配置: %s", path)
 	log.Printf("服务器启动: http://%s", addr)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * 1e9,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("服务器错误: %v", err)
 	}
 }

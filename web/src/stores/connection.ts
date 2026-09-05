@@ -2,116 +2,82 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { useSessionsStore } from './sessions'
 
-export interface ModelInfo {
+export interface ModelConfig {
   id: string
   name: string
   default: boolean
   thinking_levels: string[]
   thinking_style: string
+  provider_name?: string
 }
 
-const savedURL = localStorage.getItem('wisp_server_url') || 'http://127.0.0.1:7860'
-
 export const useConnectionStore = defineStore('connection', () => {
-  const serverUrl = ref(savedURL)
   const isConnected = ref(false)
-  const isConnecting = ref(false)
-  const models = ref<ModelInfo[]>([])
-  const latencyMs = ref<number | null>(null)
-  const lastError = ref('')
-  const ttftMs = ref<number | null>(null)
-  const displayURL = computed(() => serverUrl.value.replace(/^https?:\/\//, ''))
+  const serverUrl = ref(localStorage.getItem('serverUrl') || 'http://127.0.0.1:7860')
+  const latency = ref(0)
+  const ttft = ref(0)
+  const pingOk = ref(false)
+  const models = ref<ModelConfig[]>([])
+  const showConnectDialog = ref(false)
+  let pingTimer: ReturnType<typeof setInterval> | null = null
 
-  function normalizeURL(value: string): string {
-    let result = value.trim()
-    if (!/^https?:\/\//i.test(result)) result = `http://${result}`
-    return result.replace(/\/$/, '')
+  const defaultModel = computed(() => models.value.find(model => model.default)?.id || models.value[0]?.id || '')
+  const displayLatency = computed(() => ttft.value > 0 ? ttft.value : latency.value)
+  const latencyLabel = computed(() => ttft.value > 0 ? '首字' : '')
+
+  function normalizeURL(url: string): string { return url.trim().replace(/\/+$/, '') }
+  async function refreshModels(): Promise<void> {
+    const response = await fetch(`${serverUrl.value}/api/models`, { cache: 'no-store' })
+    if (!response.ok) throw new Error(`获取模型失败 (${response.status})`)
+    const raw = await response.json() as Array<Record<string, unknown>>
+    models.value = raw.map(item => ({
+      id: String(item.id ?? item.ID ?? ''),
+      name: String(item.name ?? item.Name ?? item.id ?? item.ID ?? ''),
+      default: Boolean(item.default ?? item.Default ?? false),
+      thinking_levels: Array.isArray(item.thinking_levels ?? item.ThinkingLevels) ? (item.thinking_levels ?? item.ThinkingLevels) as string[] : ['off'],
+      thinking_style: String(item.thinking_style ?? item.ThinkingStyle ?? 'none'),
+      provider_name: String(item.provider_name ?? item.ProviderName ?? ''),
+    })).filter(model => model.id)
   }
-
-  async function fetchWithTimeout(url: string, timeoutMs = 4500): Promise<Response> {
-    const controller = new AbortController()
-    const timer = window.setTimeout(() => controller.abort(), timeoutMs)
+  async function connect(url: string): Promise<boolean> {
+    const normalized = normalizeURL(url)
     try {
-      return await fetch(url, { signal: controller.signal, cache: 'no-store' })
-    } finally {
+      const controller = new AbortController()
+      const timer = window.setTimeout(() => controller.abort(), 4000)
+      const start = performance.now()
+      const response = await fetch(`${normalized}/api/health`, { signal: controller.signal, cache: 'no-store' })
       window.clearTimeout(timer)
-    }
-  }
-
-  async function connect(value = serverUrl.value): Promise<boolean> {
-    const normalized = normalizeURL(value)
-    isConnecting.value = true
-    lastError.value = ''
-    const started = performance.now()
-    try {
-      const health = await fetchWithTimeout(`${normalized}/api/health`)
-      if (!health.ok) throw new Error(`健康检查失败 (${health.status})`)
-      latencyMs.value = Math.max(0, Math.round(performance.now() - started))
-
+      if (!response.ok) return false
+      latency.value = Math.round(performance.now() - start)
       serverUrl.value = normalized
-      localStorage.setItem('wisp_server_url', normalized)
-      const modelsResponse = await fetchWithTimeout(`${normalized}/api/models`, 8000)
-      if (!modelsResponse.ok) throw new Error(`读取模型失败 (${modelsResponse.status})`)
-      models.value = (await modelsResponse.json()) as ModelInfo[]
-      if (models.value.length === 0) throw new Error('服务端没有可用模型，请检查 config.toml')
-
+      localStorage.setItem('serverUrl', normalized)
       isConnected.value = true
+      pingOk.value = true
+      await refreshModels()
       await useSessionsStore().loadSessions()
+      startPing()
       return true
     } catch (error) {
+      console.error(error)
       isConnected.value = false
-      models.value = []
-      latencyMs.value = null
-      lastError.value = error instanceof Error ? error.message : String(error)
-      return false
-    } finally {
-      isConnecting.value = false
-    }
-  }
-
-  async function ping(): Promise<boolean> {
-    if (!serverUrl.value) return false
-    const started = performance.now()
-    try {
-      const response = await fetchWithTimeout(`${serverUrl.value}/api/health`, 3000)
-      if (!response.ok) throw new Error('offline')
-      latencyMs.value = Math.max(0, Math.round(performance.now() - started))
-      isConnected.value = true
-      return true
-    } catch {
-      isConnected.value = false
-      latencyMs.value = null
+      pingOk.value = false
       return false
     }
   }
-
-  async function refreshModels(): Promise<void> {
-    if (!isConnected.value) return
-    const response = await fetch(`${serverUrl.value}/api/models`, { cache: 'no-store' })
-    if (!response.ok) throw new Error(`刷新模型失败 (${response.status})`)
-    models.value = (await response.json()) as ModelInfo[]
-  }
-
   function disconnect(): void {
-    isConnected.value = false
-    models.value = []
-    latencyMs.value = null
-    ttftMs.value = null
-    useSessionsStore().clear()
+    isConnected.value = false; pingOk.value = false; latency.value = 0; ttft.value = 0; models.value = []; stopPing()
   }
-
-  return {
-    serverUrl,
-    displayURL,
-    isConnected,
-    isConnecting,
-    models,
-    latencyMs,
-    lastError,
-    ttftMs,
-    connect,
-    ping,
-    refreshModels,
-    disconnect,
+  function startPing(): void {
+    stopPing()
+    pingTimer = window.setInterval(async () => {
+      try {
+        const controller = new AbortController(); const timer = window.setTimeout(() => controller.abort(), 3000); const start = performance.now()
+        const response = await fetch(`${serverUrl.value}/api/health`, { signal: controller.signal, cache: 'no-store' }); window.clearTimeout(timer)
+        pingOk.value = response.ok
+        if (response.ok) latency.value = Math.round(performance.now() - start)
+      } catch { pingOk.value = false }
+    }, 3000)
   }
+  function stopPing(): void { if (pingTimer) { window.clearInterval(pingTimer); pingTimer = null } }
+  return { isConnected, serverUrl, latency, ttft, pingOk, models, showConnectDialog, defaultModel, displayLatency, latencyLabel, refreshModels, connect, disconnect }
 })

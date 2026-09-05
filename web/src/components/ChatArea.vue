@@ -1,86 +1,50 @@
-<script setup lang="ts">
-import { nextTick, onMounted, ref, watch } from 'vue'
-import { NAlert, NButton } from 'naive-ui'
-import Composer from './Composer.vue'
-import MessageItem from './MessageItem.vue'
-import { useChatStore } from '../stores/chat'
-import { useSessionsStore } from '../stores/sessions'
-
-const chat = useChatStore()
-const sessions = useSessionsStore()
-const scroller = ref<HTMLElement | null>(null)
-const stickToBottom = ref(true)
-
-function onScroll(): void {
-  const el = scroller.value
-  if (!el) return
-  stickToBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 110
-}
-
-async function scrollToBottom(force = false): Promise<void> {
-  if (!force && !stickToBottom.value) return
-  await nextTick()
-  const el = scroller.value
-  if (el) el.scrollTop = el.scrollHeight
-}
-
-watch(
-  () => chat.messages.map((item) => `${item.id}:${item.content.length}:${item.reasoning?.length || 0}:${item.status}`).join('|'),
-  () => void scrollToBottom(false),
-)
-
-watch(
-  () => sessions.currentSessionId,
-  () => {
-    stickToBottom.value = true
-    void scrollToBottom(true)
-  },
-)
-
-onMounted(() => void scrollToBottom(true))
-</script>
-
 <template>
-  <main class="chat-area">
-    <div ref="scroller" class="messages-scroller" @scroll.passive="onScroll">
-      <div v-if="chat.notice" class="notice-wrap">
-        <NAlert type="info" :bordered="false" closable @close="chat.notice = ''">{{ chat.notice }}</NAlert>
-      </div>
-
-      <div v-if="chat.backgroundGenerating" class="notice-wrap">
-        <NAlert type="info" :bordered="false">
-          这个会话仍在服务端生成。你可以离开或刷新页面，生成不会因此被取消。
-          <template #action><NButton size="tiny" @click="chat.stopGeneration">停止</NButton></template>
-        </NAlert>
-      </div>
-
-      <div v-if="chat.messages.length" class="messages">
-        <MessageItem v-for="message in chat.messages" :key="message.id" :message="message" />
-      </div>
-      <div v-else-if="!chat.backgroundGenerating" class="empty-state">
-        <div class="empty-mark">W</div>
-        <h2>{{ sessions.currentSessionId ? '这个会话还没有消息' : '开始一段对话' }}</h2>
-        <p>{{ sessions.currentSessionId ? '发送第一条消息，内容会实时显示在这里。' : '消息将发送给当前选中的模型' }}</p>
-      </div>
+  <div class="chat-area">
+    <div v-if="!isConnected" class="not-connected">
+      <div class="welcome-icon">✦</div><div class="welcome-title">Wisp</div>
+      <div class="not-connected-text">尚未连接服务器，连接后即可开始对话</div>
+      <n-button class="connect-btn" type="primary" size="large" @click="connection.showConnectDialog = true">连接服务器</n-button>
     </div>
-    <Composer />
-  </main>
+    <template v-else>
+      <div ref="messagesRef" class="messages">
+        <div class="messages-inner">
+          <div v-if="messages.length === 0" class="empty-chat"><div class="empty-title">开始一段对话</div><div class="empty-sub">消息将发送给当前选中的模型</div></div>
+          <div v-if="notice" class="notice">{{ notice }}</div>
+          <MessageItem v-for="message in messages" :key="message.id" :message="message" />
+        </div>
+      </div>
+      <Composer />
+    </template>
+  </div>
 </template>
+<script setup lang="ts">
+import { nextTick, ref, watch } from 'vue'
+import { NButton } from 'naive-ui'
+import { storeToRefs } from 'pinia'
+import { useConnectionStore } from '../stores/connection'
+import { useChatStore } from '../stores/chat'
+import MessageItem from './MessageItem.vue'
+import Composer from './Composer.vue'
 
+const connection = useConnectionStore()
+const chat = useChatStore()
+const { isConnected } = storeToRefs(connection)
+const { messages, notice } = storeToRefs(chat)
+const messagesRef = ref<HTMLDivElement | null>(null)
+watch(messages, async () => { await nextTick(); if (messagesRef.value) messagesRef.value.scrollTop = messagesRef.value.scrollHeight }, { deep: true })
+</script>
 <style scoped>
-.chat-area { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: #fdfcfc; }
-.messages-scroller { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
-.messages { padding: 16px 0 48px; }
-.notice-wrap { width: min(860px, calc(100% - 32px)); margin: 12px auto 0; }
-.empty-state {
-  min-height: 100%; display: grid; place-content: center; justify-items: center;
-  padding: 48px 24px; color: #6d6267; text-align: center;
-}
-.empty-mark {
-  width: 52px; height: 52px; display: grid; place-items: center;
-  border-radius: 16px; background: #d95f8d; color: #fff; font-weight: 800; font-size: 20px;
-  box-shadow: 0 9px 28px rgba(184, 74, 117, .2);
-}
-.empty-state h2 { margin: 18px 0 6px; color: #332c2f; font-size: 20px; }
-.empty-state p { margin: 0; color: #9b9095; font-size: 13px; }
+.chat-area { flex: 1; display: flex; flex-direction: column; background: var(--bg); overflow: hidden; min-width: 0; }
+.not-connected { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
+.welcome-icon { font-size: 32px; color: var(--accent); line-height: 1; }
+.welcome-title { font-size: 26px; font-weight: 600; color: var(--text); }
+.not-connected-text { font-size: 14px; color: var(--text-2); margin-bottom: 8px; }
+.connect-btn { min-width: 132px; font-weight: 500; }
+.empty-chat { padding: 72px 0 40px; text-align: center; }
+.empty-title { font-size: 18px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+.empty-sub { font-size: 13px; color: var(--text-2); }
+.messages { flex: 1; overflow-y: auto; padding: 24px 20px 8px; }
+.messages-inner { max-width: 760px; margin: 0 auto; }
+.notice { margin: 0 0 14px; padding: 8px 12px; border-radius: 10px; background: var(--accent-tint); color: var(--accent-text); font-size: 12px; }
+@media (max-width: 640px) { .messages { padding-left: 12px; padding-right: 12px; } }
 </style>

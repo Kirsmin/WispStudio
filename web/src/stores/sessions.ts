@@ -1,5 +1,6 @@
-import { ref } from 'vue'
 import { defineStore } from 'pinia'
+import { ref } from 'vue'
+import { useConnectionStore } from './connection'
 
 export interface Session {
   id: string
@@ -10,97 +11,49 @@ export interface Session {
   updated_at: string
 }
 
-const sessions = ref<Session[]>([])
-const currentSessionId = ref(localStorage.getItem('wisp_current_session_id') || '')
+const STORAGE_KEY = 'wisp_sessions_cache'
+function loadCached(): Session[] {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]') as Session[] } catch { return [] }
+}
+function saveCached(list: Session[]): void { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)) }
 
 export const useSessionsStore = defineStore('sessions', () => {
-  function baseURL(): string {
-    return (localStorage.getItem('wisp_server_url') || '').replace(/\/$/, '')
-  }
+  const sessions = ref<Session[]>(loadCached())
+  const currentSessionId = ref('')
+  const connection = useConnectionStore()
 
   async function loadSessions(): Promise<void> {
-    const base = baseURL()
-    if (!base) {
-      sessions.value = []
-      return
-    }
-    const response = await fetch(`${base}/api/sessions`)
+    if (!connection.isConnected) return
+    const response = await fetch(`${connection.serverUrl}/api/sessions`, { cache: 'no-store' })
     if (!response.ok) throw new Error(`读取会话失败 (${response.status})`)
-    sessions.value = (await response.json()) as Session[]
-    if (currentSessionId.value && !sessions.value.some((item) => item.id === currentSessionId.value)) {
-      currentSessionId.value = ''
-      localStorage.removeItem('wisp_current_session_id')
-    }
+    sessions.value = await response.json() as Session[]
+    saveCached(sessions.value)
   }
-
-  async function createSession(title: string): Promise<Session> {
-    const response = await fetch(`${baseURL()}/api/sessions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title }),
+  async function createPersistedSession(title: string): Promise<Session> {
+    const response = await fetch(`${connection.serverUrl}/api/sessions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }),
     })
-    if (!response.ok) throw new Error(await readError(response, '创建会话失败'))
-    const session = (await response.json()) as Session
-    sessions.value = [session, ...sessions.value.filter((item) => item.id !== session.id)]
-    selectSession(session.id)
+    if (!response.ok) throw new Error(`创建会话失败 (${response.status})`)
+    const session = await response.json() as Session
+    currentSessionId.value = session.id
+    sessions.value = [session, ...sessions.value.filter(item => item.id !== session.id)]
+    saveCached(sessions.value)
     return session
   }
-
-  function selectSession(id: string): void {
-    currentSessionId.value = id
-    if (id) localStorage.setItem('wisp_current_session_id', id)
-    else localStorage.removeItem('wisp_current_session_id')
-  }
-
-  function beginNewSession(): void {
-    selectSession('')
-  }
-
+  function beginNewSession(): void { currentSessionId.value = '' }
+  function selectSession(id: string): void { currentSessionId.value = id }
   async function renameSession(id: string, title: string): Promise<void> {
-    const response = await fetch(`${baseURL()}/api/sessions/${encodeURIComponent(id)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title }),
+    const response = await fetch(`${connection.serverUrl}/api/sessions/${encodeURIComponent(id)}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }),
     })
-    if (!response.ok) throw new Error(await readError(response, '重命名失败'))
-    const target = sessions.value.find((item) => item.id === id)
-    if (target) {
-      target.title = title
-      target.renamed = true
-      target.updated_at = new Date().toISOString()
-    }
+    if (!response.ok) throw new Error(`重命名失败 (${response.status})`)
+    await loadSessions()
   }
-
   async function deleteSession(id: string): Promise<void> {
-    const response = await fetch(`${baseURL()}/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
-    if (!response.ok) throw new Error(await readError(response, '删除会话失败'))
-    sessions.value = sessions.value.filter((item) => item.id !== id)
-    if (currentSessionId.value === id) selectSession('')
+    const response = await fetch(`${connection.serverUrl}/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    if (!response.ok) throw new Error(`删除失败 (${response.status})`)
+    if (currentSessionId.value === id) currentSessionId.value = ''
+    await loadSessions()
   }
-
-  function clear(): void {
-    sessions.value = []
-    selectSession('')
-  }
-
-  return {
-    sessions,
-    currentSessionId,
-    loadSessions,
-    createSession,
-    selectSession,
-    beginNewSession,
-    renameSession,
-    deleteSession,
-    clear,
-  }
+  return { sessions, currentSessionId, loadSessions, createPersistedSession, beginNewSession, selectSession, renameSession, deleteSession }
 })
-
-async function readError(response: Response, fallback: string): Promise<string> {
-  try {
-    const data = (await response.json()) as { error?: string }
-    return data.error || fallback
-  } catch {
-    return fallback
-  }
-}

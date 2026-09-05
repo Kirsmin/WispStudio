@@ -23,98 +23,89 @@ type Usage struct {
 	ReasoningTokens  int `json:"reasoning_tokens"`
 }
 
-type StreamReader struct {
-	reader io.ReadCloser
-	scan   *bufio.Scanner
-}
+type StreamReader struct{ scanner *bufio.Scanner }
 
-func NewStreamReader(r io.ReadCloser) *StreamReader {
-	scan := bufio.NewScanner(r)
-	scan.Buffer(make([]byte, 64<<10), 8<<20)
-	return &StreamReader{reader: r, scan: scan}
+func NewStreamReader(r io.Reader) *StreamReader {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	return &StreamReader{scanner: scanner}
 }
-
-func (sr *StreamReader) Close() error { return sr.reader.Close() }
 
 func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 	defer close(ch)
-	var dataLines []string
 	finish := ""
-	failed := false
-	doneMarker := false
-
-	flush := func() bool {
-		if len(dataLines) == 0 {
-			return false
+	for sr.scanner.Scan() {
+		line := strings.TrimSuffix(sr.scanner.Text(), "\r")
+		if !strings.HasPrefix(line, "data:") {
+			continue
 		}
-		data := strings.TrimSpace(strings.Join(dataLines, "\n"))
-		dataLines = dataLines[:0]
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "" {
-			return false
+			continue
 		}
 		if data == "[DONE]" {
-			doneMarker = true
-			return true
+			break
 		}
-		if data == "ping" || data == ": ping" {
-			return false
-		}
-		fr, err := parseChunk(data, ch)
-		if err != nil {
-			failed = true
-			ch <- StreamEvent{Type: "error", Error: err.Error()}
-			return true
-		}
-		if finish == "" && fr != "" {
-			finish = fr
-		}
-		return false
-	}
 
-	for sr.scan.Scan() {
-		line := strings.TrimSuffix(sr.scan.Text(), "\r")
-		if line == "" {
-			if flush() {
-				break
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			// 某些兼容网关会在 SSE 中返回 JSON 错误对象。
+			var upstreamErr struct {
+				Error   any    `json:"error"`
+				Message string `json:"message"`
+			}
+			if json.Unmarshal([]byte(data), &upstreamErr) == nil && (upstreamErr.Error != nil || upstreamErr.Message != "") {
+				ch <- StreamEvent{Type: "error", Error: firstNonEmpty(upstreamErr.Message, fmt.Sprint(upstreamErr.Error))}
+				finish = "error"
 			}
 			continue
 		}
-		// SSE 注释/keep-alive。
-		if strings.HasPrefix(line, ":") {
+		if chunk.Error != nil {
+			ch <- StreamEvent{Type: "error", Error: errorMessage(chunk.Error)}
+			finish = "error"
 			continue
 		}
-		if strings.HasPrefix(line, "data:") {
-			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		for _, choice := range chunk.Choices {
+			if text := rawText(choice.Delta.Content); text != "" {
+				ch <- StreamEvent{Type: "delta", Text: text}
+			}
+			reasoning := firstNonEmpty(choice.Delta.ReasoningContent, choice.Delta.Reasoning, choice.Delta.Thinking, choice.Delta.Analysis)
+			if reasoning != "" {
+				ch <- StreamEvent{Type: "reasoning", Text: reasoning}
+			}
+			if choice.FinishReason != nil && *choice.FinishReason != "" {
+				finish = *choice.FinishReason
+			}
+		}
+		if chunk.Usage != nil {
+			u := &Usage{PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens, ReasoningTokens: chunk.Usage.ReasoningTokens}
+			if chunk.Usage.PromptTokensDetails != nil {
+				u.CachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+			}
+			if chunk.Usage.CompletionTokensDetails != nil && chunk.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
+				u.ReasoningTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
+			}
+			ch <- StreamEvent{Type: "usage", Usage: u}
 		}
 	}
-	if !doneMarker && !failed {
-		_ = flush()
+	if err := sr.scanner.Err(); err != nil {
+		ch <- StreamEvent{Type: "error", Error: fmt.Sprintf("读取流失败: %v", err)}
+		return
 	}
-	if err := sr.scan.Err(); err != nil && !failed {
-		failed = true
-		ch <- StreamEvent{Type: "error", Error: fmt.Sprintf("读取上游流失败: %v", err)}
-	}
-	if failed {
-		finish = "error"
-	} else if finish == "" {
+	if finish == "" {
 		finish = "stop"
 	}
 	ch <- StreamEvent{Type: "done", Finish: finish}
 }
 
-type upstreamChunk struct {
-	Error *struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Code    any    `json:"code"`
-	} `json:"error"`
+type streamChunk struct {
 	Choices []struct {
 		Delta struct {
 			Content          json.RawMessage `json:"content"`
-			ReasoningContent json.RawMessage `json:"reasoning_content"`
-			Reasoning        json.RawMessage `json:"reasoning"`
-			ReasoningText    json.RawMessage `json:"reasoning_text"`
-			ReasoningDetails json.RawMessage `json:"reasoning_details"`
+			ReasoningContent string          `json:"reasoning_content"`
+			Reasoning        string          `json:"reasoning"`
+			Thinking         string          `json:"thinking"`
+			Analysis         string          `json:"analysis"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -129,83 +120,49 @@ type upstreamChunk struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details"`
 	} `json:"usage"`
+	Error any `json:"error"`
 }
 
-func parseChunk(data string, ch chan<- StreamEvent) (string, error) {
-	var chunk upstreamChunk
-	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-		return "", fmt.Errorf("解析上游 SSE JSON 失败: %w", err)
-	}
-	if chunk.Error != nil {
-		msg := strings.TrimSpace(chunk.Error.Message)
-		if msg == "" {
-			msg = "上游返回未知错误"
-		}
-		return "error", fmt.Errorf("%s", msg)
-	}
-	finish := ""
-	for _, choice := range chunk.Choices {
-		delta := choice.Delta
-		// 兼容网关可能同时镜像多个 reasoning 字段：按优先级只取第一个非空值，避免重复展示。
-		for _, raw := range []json.RawMessage{delta.ReasoningContent, delta.Reasoning, delta.ReasoningText, delta.ReasoningDetails} {
-			if text := extractText(raw); text != "" {
-				ch <- StreamEvent{Type: "reasoning", Text: text}
-				break
-			}
-		}
-		if text := extractText(delta.Content); text != "" {
-			ch <- StreamEvent{Type: "delta", Text: text}
-		}
-		if choice.FinishReason != nil && finish == "" {
-			finish = *choice.FinishReason
-		}
-	}
-	if chunk.Usage != nil {
-		u := &Usage{PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens}
-		if chunk.Usage.PromptTokensDetails != nil {
-			u.CachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
-		}
-		if chunk.Usage.CompletionTokensDetails != nil && chunk.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
-			u.ReasoningTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
-		} else {
-			u.ReasoningTokens = chunk.Usage.ReasoningTokens
-		}
-		ch <- StreamEvent{Type: "usage", Usage: u}
-	}
-	return finish, nil
-}
-
-func extractText(raw json.RawMessage) string {
+func rawText(raw json.RawMessage) string {
 	if len(raw) == 0 || string(raw) == "null" {
 		return ""
 	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		return s
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
 	}
-	var value any
-	if json.Unmarshal(raw, &value) != nil {
-		return ""
+	var parts []struct {
+		Type    string `json:"type"`
+		Text    string `json:"text"`
+		Content string `json:"content"`
 	}
-	var b strings.Builder
-	collectText(value, &b)
-	return b.String()
+	if json.Unmarshal(raw, &parts) == nil {
+		var b strings.Builder
+		for _, part := range parts {
+			b.WriteString(firstNonEmpty(part.Text, part.Content))
+		}
+		return b.String()
+	}
+	return ""
 }
 
-func collectText(v any, b *strings.Builder) {
-	switch x := v.(type) {
-	case string:
-		b.WriteString(x)
-	case []any:
-		for _, item := range x {
-			collectText(item, b)
-		}
-	case map[string]any:
-		for _, key := range []string{"text", "content", "value"} {
-			if val, ok := x[key]; ok {
-				collectText(val, b)
-				return
-			}
+func errorMessage(value any) string {
+	if value == nil {
+		return "上游流返回错误"
+	}
+	if object, ok := value.(map[string]any); ok {
+		if message, ok := object["message"].(string); ok {
+			return message
 		}
 	}
+	return fmt.Sprint(value)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }

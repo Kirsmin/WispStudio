@@ -19,31 +19,25 @@ type Client struct {
 }
 
 func NewClient(cfg *config.OpenAIConfig) *Client {
-	sec := cfg.TimeoutSec
-	if sec <= 0 {
-		sec = 120
+	seconds := cfg.TimeoutSec
+	if seconds <= 0 {
+		seconds = 120
 	}
-	dialTimeout := time.Duration(sec) * time.Second
+	timeout := time.Duration(seconds) * time.Second
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: dialTimeout,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
+		ResponseHeaderTimeout: timeout,
 		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     true,
 	}
-	// 不设置 http.Client.Timeout：长时间流式响应由每次生成的 context 控制。
 	return &Client{client: &http.Client{Transport: transport}}
 }
 
 type ChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
-}
-
-type StreamOptions struct {
-	IncludeUsage bool `json:"include_usage"`
 }
 
 type ChatRequest struct {
@@ -55,51 +49,46 @@ type ChatRequest struct {
 	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
 }
 
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 func (c *Client) BuildRequest(baseURL, apiKey, model, thinkingStyle, thinkingLevel string, messages []ChatMessage) (*http.Request, error) {
-	body := ChatRequest{
-		Model: model, Messages: messages, Stream: true,
-		StreamOptions: &StreamOptions{IncludeUsage: true},
+	body := ChatRequest{Model: model, Messages: messages, Stream: true, StreamOptions: &StreamOptions{IncludeUsage: true}}
+	level := strings.ToLower(strings.TrimSpace(thinkingLevel))
+	if level == "" {
+		level = "off"
 	}
-	level := strings.TrimSpace(strings.ToLower(thinkingLevel))
-	if level != "" && level != "off" && thinkingStyle != "none" {
-		switch thinkingStyle {
-		case "enable_thinking":
-			enabled := level != "off" && level != "false" && level != "0"
-			body.EnableThinking = &enabled
-		case "reasoning_effort":
-			body.ReasoningEffort = thinkingLevel
+	switch thinkingStyle {
+	case "enable_thinking":
+		enabled := level != "off" && level != "none" && level != "false"
+		body.EnableThinking = &enabled
+	case "reasoning_effort":
+		if level != "off" && level != "none" {
+			body.ReasoningEffort = level
+		}
+	case "reasoning_effort_none":
+		if level == "off" {
+			body.ReasoningEffort = "none"
+		} else {
+			body.ReasoningEffort = level
 		}
 	}
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	url := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/chat/completions"
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-		return nil, fmt.Errorf("无效的 base_url: %s", baseURL)
-	}
+	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	if strings.TrimSpace(apiKey) != "" {
+	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
+	req.Header.Set("Accept", "text/event-stream")
 	return req, nil
-}
-
-type UpstreamError struct {
-	StatusCode int
-	Message    string
-}
-
-func (e *UpstreamError) Error() string {
-	if e.StatusCode == 0 {
-		return e.Message
-	}
-	return fmt.Sprintf("上游 HTTP %d: %s", e.StatusCode, e.Message)
 }
 
 func (c *Client) DoStream(ctx context.Context, req *http.Request) (*http.Response, error) {
@@ -111,23 +100,10 @@ func (c *Client) DoStream(ctx context.Context, req *http.Request) (*http.Respons
 		return resp, nil
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	message := strings.TrimSpace(string(body))
-	var parsed struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-		Message string `json:"message"`
-	}
-	if json.Unmarshal(body, &parsed) == nil {
-		if parsed.Error.Message != "" {
-			message = parsed.Error.Message
-		} else if parsed.Message != "" {
-			message = parsed.Message
-		}
-	}
 	if message == "" {
 		message = http.StatusText(resp.StatusCode)
 	}
-	return nil, &UpstreamError{StatusCode: resp.StatusCode, Message: message}
+	return nil, fmt.Errorf("上游返回 HTTP %d: %s", resp.StatusCode, message)
 }

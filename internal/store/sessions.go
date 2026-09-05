@@ -2,196 +2,143 @@ package store
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 type Session struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
-	Renamed   bool      `json:"renamed"`
-	Model     string    `json:"model"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-type SessionsFile struct {
-	Version  int       `json:"version"`
-	Sessions []Session `json:"sessions"`
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Renamed   bool   `json:"renamed"`
+	Model     string `json:"model"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 type SessionStore struct {
+	mu      sync.RWMutex
 	dataDir string
-	mu      sync.Mutex
+	path    string
 }
 
 func NewSessionStore(dataDir string) *SessionStore {
-	_ = os.MkdirAll(dataDir, 0755)
-	return &SessionStore{dataDir: dataDir}
-}
-
-func (s *SessionStore) sessionsPath() string { return filepath.Join(s.dataDir, "sessions.json") }
-
-func (s *SessionStore) readSessions() (*SessionsFile, error) {
-	data, err := os.ReadFile(s.sessionsPath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &SessionsFile{Version: 1, Sessions: []Session{}}, nil
-		}
-		return nil, err
-	}
-	var sf SessionsFile
-	if err := json.Unmarshal(data, &sf); err != nil {
-		return nil, err
-	}
-	return &sf, nil
-}
-
-func (s *SessionStore) writeSessions(sf *SessionsFile) error {
-	data, err := json.MarshalIndent(sf, "", "  ")
-	if err != nil {
-		return err
-	}
-	path := s.sessionsPath()
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	_ = os.MkdirAll(dataDir, 0o755)
+	return &SessionStore{dataDir: dataDir, path: filepath.Join(dataDir, "sessions.json")}
 }
 
 func (s *SessionStore) List() ([]Session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sf, err := s.readSessions()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list, err := s.readLocked()
 	if err != nil {
 		return nil, err
 	}
-	result := append([]Session(nil), sf.Sessions...)
-	sort.Slice(result, func(i, j int) bool { return result[i].UpdatedAt.After(result[j].UpdatedAt) })
-	return result, nil
+	sort.SliceStable(list, func(i, j int) bool { return list[i].UpdatedAt > list[j].UpdatedAt })
+	return list, nil
 }
 
 func (s *SessionStore) Get(id string) (*Session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sf, err := s.readSessions()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list, err := s.readLocked()
 	if err != nil {
 		return nil, err
 	}
-	for i := range sf.Sessions {
-		if sf.Sessions[i].ID == id {
-			copy := sf.Sessions[i]
+	for i := range list {
+		if list[i].ID == id {
+			copy := list[i]
 			return &copy, nil
 		}
 	}
-	return nil, fmt.Errorf("会话不存在")
+	return nil, errors.New("会话不存在")
 }
 
 func (s *SessionStore) Create(title string) (*Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sf, err := s.readSessions()
+	list, err := s.readLocked()
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now().UTC()
-	sess := Session{
-		ID: "s_" + strings.ReplaceAll(uuid.NewString(), "-", ""), Title: strings.TrimSpace(title),
-		CreatedAt: now, UpdatedAt: now,
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "新会话"
 	}
-	if sess.Title == "" {
-		sess.Title = "新会话"
-	}
-	sf.Sessions = append(sf.Sessions, sess)
-	if err := s.writeSessions(sf); err != nil {
+	session := Session{ID: newID(), Title: title, CreatedAt: now, UpdatedAt: now}
+	list = append(list, session)
+	if err := s.writeLocked(list); err != nil {
 		return nil, err
 	}
-	return &sess, nil
+	return &session, nil
 }
 
-func (s *SessionStore) setTitle(id, title string, renamed bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sf, err := s.readSessions()
-	if err != nil {
-		return err
-	}
-	for i := range sf.Sessions {
-		if sf.Sessions[i].ID == id {
-			sf.Sessions[i].Title = title
-			sf.Sessions[i].Renamed = renamed
-			sf.Sessions[i].UpdatedAt = time.Now().UTC()
-			return s.writeSessions(sf)
+func (s *SessionStore) UpdateTitle(id, title string) error {
+	return s.update(id, func(session *Session) {
+		session.Title = strings.TrimSpace(title)
+		session.Renamed = true
+	})
+}
+
+func (s *SessionStore) UpdateAutoTitle(id, title string) error {
+	return s.update(id, func(session *Session) {
+		if !session.Renamed {
+			session.Title = strings.TrimSpace(title)
 		}
-	}
-	return fmt.Errorf("会话不存在")
+	})
 }
-
-func (s *SessionStore) UpdateTitle(id, title string) error  { return s.setTitle(id, title, true) }
-func (s *SessionStore) SetAutoTitle(id, title string) error { return s.setTitle(id, title, false) }
 
 func (s *SessionStore) UpdateModel(id, model string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sf, err := s.readSessions()
-	if err != nil {
-		return err
-	}
-	for i := range sf.Sessions {
-		if sf.Sessions[i].ID == id {
-			sf.Sessions[i].Model = model
-			sf.Sessions[i].UpdatedAt = time.Now().UTC()
-			return s.writeSessions(sf)
-		}
-	}
-	return fmt.Errorf("会话不存在")
+	return s.update(id, func(session *Session) { session.Model = model })
 }
 
 func (s *SessionStore) Touch(id string) error {
+	return s.update(id, func(_ *Session) {})
+}
+
+func (s *SessionStore) update(id string, mutate func(*Session)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sf, err := s.readSessions()
+	list, err := s.readLocked()
 	if err != nil {
 		return err
 	}
-	for i := range sf.Sessions {
-		if sf.Sessions[i].ID == id {
-			sf.Sessions[i].UpdatedAt = time.Now().UTC()
-			return s.writeSessions(sf)
+	for i := range list {
+		if list[i].ID != id {
+			continue
 		}
+		mutate(&list[i])
+		list[i].UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		return s.writeLocked(list)
 	}
-	return fmt.Errorf("会话不存在")
+	return errors.New("会话不存在")
 }
 
 func (s *SessionStore) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sf, err := s.readSessions()
+	list, err := s.readLocked()
 	if err != nil {
 		return err
 	}
-	filtered := make([]Session, 0, len(sf.Sessions))
 	found := false
-	for _, sess := range sf.Sessions {
-		if sess.ID == id {
+	filtered := list[:0]
+	for _, session := range list {
+		if session.ID == id {
 			found = true
 			continue
 		}
-		filtered = append(filtered, sess)
+		filtered = append(filtered, session)
 	}
 	if !found {
-		return fmt.Errorf("会话不存在")
+		return errors.New("会话不存在")
 	}
-	sf.Sessions = filtered
-	if err := s.writeSessions(sf); err != nil {
+	if err := s.writeLocked(filtered); err != nil {
 		return err
 	}
 	_ = os.Remove(filepath.Join(s.dataDir, "Sessions", id+".jsonl"))
@@ -199,13 +146,44 @@ func (s *SessionStore) Delete(id string) error {
 	return nil
 }
 
-func GenerateTitle(firstMessage string) string {
-	r := []rune(strings.TrimSpace(firstMessage))
-	if len(r) > 18 {
-		return string(r[:18]) + "…"
+func (s *SessionStore) readLocked() ([]Session, error) {
+	data, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return []Session{}, nil
 	}
-	if len(r) == 0 {
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return []Session{}, nil
+	}
+	var list []Session
+	if err := json.Unmarshal(data, &list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func (s *SessionStore) writeLocked(list []Session) error {
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
+}
+
+func GenerateTitle(message string) string {
+	message = strings.TrimSpace(strings.Join(strings.Fields(message), " "))
+	runes := []rune(message)
+	if len(runes) > 28 {
+		return string(runes[:28]) + "…"
+	}
+	if message == "" {
 		return "新会话"
 	}
-	return string(r)
+	return message
 }

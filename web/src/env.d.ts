@@ -1,11 +1,6 @@
-/// <reference types="vite/client" />
-
-import type { MessageApi } from 'naive-ui'
+import type { MessageProviderInst } from 'naive-ui'
 
 declare global {
-  interface Window {
-    $message?: MessageApi
-  }
+  interface Window { $message?: MessageProviderInst }
 }
-
 export {}
