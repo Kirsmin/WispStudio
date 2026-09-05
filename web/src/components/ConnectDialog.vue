@@ -29,22 +29,23 @@ import { useConnectionStore } from '../stores/connection'
 import { storeToRefs } from 'pinia'
 
 const connectionStore = useConnectionStore()
-const { isConnected, latency, lastOkTime, showConnectDialog } = storeToRefs(connectionStore)
+const { isConnected, latency, pingOk, showConnectDialog } = storeToRefs(connectionStore)
 const { connect: doConnect, disconnect } = connectionStore
 
 const message = useMessage()
 const serverUrl = ref(localStorage.getItem('serverUrl') || 'http://127.0.0.1:7860')
 const armed = ref(false)
 
+// 依据响应式 pingOk 求值：心跳失败立即显示"无响应"，恢复后自动回到延迟数字
 const latencyText = computed(() => {
-  if (Date.now() - lastOkTime.value > 10000) {
+  if (!pingOk.value) {
     return '无响应'
   }
   return latency.value > 0 ? `${latency.value}ms` : ''
 })
 
 const latencyColor = computed(() => {
-  if (Date.now() - lastOkTime.value > 10000) return 'var(--error)'
+  if (!pingOk.value) return 'var(--error)'
   if (latency.value > 500) return 'var(--error)'
   if (latency.value > 150) return 'var(--warn)'
   return 'var(--text-2)'

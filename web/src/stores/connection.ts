@@ -15,6 +15,8 @@ export const useConnectionStore = defineStore('connection', () => {
   const serverUrl = ref(localStorage.getItem('serverUrl') || 'http://127.0.0.1:7860')
   const latency = ref(0)
   const lastOkTime = ref(Date.now())
+  // 最近一次心跳是否成功（响应式），后端宕机时 UI 能立即切到"无响应"
+  const pingOk = ref(false)
   const models = ref<ModelConfig[]>([])
   const showConnectDialog = ref(false)
   let pingTimer: ReturnType<typeof setInterval> | null = null
@@ -34,6 +36,7 @@ export const useConnectionStore = defineStore('connection', () => {
       if (!res.ok) return false
       latency.value = Math.round(performance.now() - start)
       lastOkTime.value = Date.now()
+      pingOk.value = true
       serverUrl.value = url
       isConnected.value = true
       // 获取模型列表（映射 Go 大写驼峰到前端小写蛇形）
@@ -61,6 +64,7 @@ export const useConnectionStore = defineStore('connection', () => {
   function disconnect() {
     isConnected.value = false
     latency.value = 0
+    pingOk.value = false
     models.value = []
     stopPing()
   }
@@ -74,12 +78,15 @@ export const useConnectionStore = defineStore('connection', () => {
         const start = performance.now()
         const res = await fetch(`${serverUrl.value}/api/health`, { signal: controller.signal })
         clearTimeout(timeout)
-        if (res.ok) {
+        const ok = res.ok
+        if (ok) {
           latency.value = Math.round(performance.now() - start)
           lastOkTime.value = Date.now()
         }
+        // 每次心跳都刷新响应式状态：成功置 true，失败置 false（UI 据此显示"无响应"）
+        pingOk.value = ok
       } catch {
-        // ping 失败，不更新 lastOkTime
+        pingOk.value = false
       }
     }, 3000)
   }
@@ -96,6 +103,7 @@ export const useConnectionStore = defineStore('connection', () => {
     serverUrl,
     latency,
     lastOkTime,
+    pingOk,
     models,
     showConnectDialog,
     defaultModel,
