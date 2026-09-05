@@ -5,8 +5,8 @@ import (
 	"log"
 	"net/http"
 
-	"pylai/internal/api"
-	"pylai/internal/config"
+	"wisp/internal/api"
+	"wisp/internal/config"
 )
 
 func main() {

@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"time"
 
-	"pylai/internal/config"
-	"pylai/internal/store"
+	"wisp/internal/config"
+	"wisp/internal/store"
 )
 
 type Router struct {

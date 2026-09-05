@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"pylai/internal/config"
+	"wisp/internal/config"
 )
 
 type Client struct {

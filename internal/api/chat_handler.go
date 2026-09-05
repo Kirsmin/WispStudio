@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"pylai/internal/config"
-	"pylai/internal/openai"
-	"pylai/internal/store"
+	"wisp/internal/config"
+	"wisp/internal/openai"
+	"wisp/internal/store"
 )
 
 type ChatHandler struct {
