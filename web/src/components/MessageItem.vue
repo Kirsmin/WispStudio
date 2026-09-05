@@ -9,7 +9,7 @@
       </div>
       <MarkdownView :content="message.content" />
       <div v-if="message.type === 'assistant' && message.usage" class="meta">
-        {{ message.model || 'unknown' }} · in {{ message.usage.prompt_tokens }} · out {{ message.usage.completion_tokens }} · cache {{ message.usage.cached_tokens }} · {{ ((message.duration_ms ?? 0) / 1000).toFixed(1) }}s
+        {{ message.model || 'unknown' }} · in {{ message.usage.prompt_tokens }} · think {{ message.usage.reasoning_tokens ?? 0 }} · out {{ message.usage.completion_tokens }} · cache {{ message.usage.cached_tokens }} · {{ ((message.duration_ms ?? 0) / 1000).toFixed(1) }}s
       </div>
     </div>
   </div>
@@ -30,6 +30,7 @@ defineProps<{
       prompt_tokens: number
       completion_tokens: number
       cached_tokens: number
+      reasoning_tokens: number
     }
     duration_ms?: number
   }

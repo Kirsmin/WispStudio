@@ -13,6 +13,7 @@ export interface ChatMessage {
     prompt_tokens: number
     completion_tokens: number
     cached_tokens: number
+    reasoning_tokens: number
   }
   duration_ms?: number
 }
@@ -24,6 +25,9 @@ export const useChatStore = defineStore('chat', () => {
   const selectedModel = ref('')
   const selectedThinking = ref('off')
   const abortController = ref<AbortController | null>(null)
+
+  // 递增序号：只有最新一次流式任务能改写流状态，旧的收尾一律作废
+  let activeRun = 0
 
   const connectionStore = useConnectionStore()
   const sessionsStore = useSessionsStore()
@@ -44,6 +48,17 @@ export const useChatStore = defineStore('chat', () => {
     }
   })
 
+  // 切换会话时中止在途流：否则 A 会话生成中途切到 B，A 结束后会把历史写回 B 界面
+  watch(() => sessionsStore.currentSessionId, () => {
+    activeRun++
+    if (abortController.value) {
+      abortController.value.abort()
+    }
+    abortController.value = null
+    isStreaming.value = false
+    messages.value = [] // 立即清空旧会话消息，等待新会话加载
+  })
+
   async function loadMessages(sessionId: string) {
     if (!sessionId || !connectionStore.isConnected) {
       messages.value = []
@@ -52,6 +67,8 @@ export const useChatStore = defineStore('chat', () => {
     const res = await fetch(`${connectionStore.serverUrl}/api/sessions/${sessionId}/messages`)
     if (res.ok) {
       const data = await res.json()
+      // 加载期间若已切换会话，丢弃这份过期历史，防止串台
+      if (sessionsStore.currentSessionId !== sessionId) return
       messages.value = data.map((m: any) => ({
         id: m.id,
         type: m.type,
@@ -84,6 +101,7 @@ export const useChatStore = defineStore('chat', () => {
 
     const currentId = sessionsStore.currentSessionId
     if (!currentId) return
+    const run = ++activeRun
 
     // 添加 user 消息到列表（乐观更新）
     const userMsg: ChatMessage = {
@@ -112,12 +130,10 @@ export const useChatStore = defineStore('chat', () => {
 
       if (res.status === 409) {
         window.$message?.error('该会话有任务正在执行')
-        isStreaming.value = false
         return
       }
 
       if (!res.ok) {
-        isStreaming.value = false
         return
       }
 
@@ -154,15 +170,20 @@ export const useChatStore = defineStore('chat', () => {
         handleSSEBlock(buf, assistantMsg)
       }
 
-      // 刷新历史
-      await loadMessages(currentId)
+      // 刷新历史（loadMessages 内部会校验会话未切换）
+      if (run === activeRun && sessionsStore.currentSessionId === currentId) {
+        await loadMessages(currentId)
+      }
     } catch (e: any) {
       if (e.name !== 'AbortError') {
         console.error('发送失败', e)
       }
     } finally {
-      isStreaming.value = false
-      abortController.value = null
+      // 只有最新一次任务才能清理流状态，避免旧任务的 finally 覆盖新任务
+      if (run === activeRun) {
+        isStreaming.value = false
+        abortController.value = null
+      }
     }
   }
 
@@ -198,9 +219,12 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function stopStream() {
+    activeRun++
     if (abortController.value) {
       abortController.value.abort()
     }
+    abortController.value = null
+    isStreaming.value = false
   }
 
   return {
