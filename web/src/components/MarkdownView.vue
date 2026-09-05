@@ -1,9 +1,9 @@
 <template>
-  <div class="markdown-view md" v-html="sanitizedHtml"></div>
+  <div class="markdown-view md" v-html="renderedHtml"></div>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { ref, watch } from 'vue'
 import MarkdownIt from 'markdown-it'
 import DOMPurify from 'dompurify'
 
@@ -17,10 +17,25 @@ const md = new MarkdownIt({
   typographer: true,
 })
 
-const sanitizedHtml = computed(() => {
-  const raw = md.render(props.content || '')
-  return DOMPurify.sanitize(raw)
-})
+const renderedHtml = ref('')
+let renderTimer: ReturnType<typeof setTimeout> | null = null
+
+// 节流渲染：流式输出时避免每字符都触发完整 markdown 解析
+watch(() => props.content, (newContent) => {
+  if (renderTimer) {
+    clearTimeout(renderTimer)
+  }
+  // 立即渲染（首次或内容较短时）
+  if (!newContent || newContent.length < 100) {
+    renderedHtml.value = DOMPurify.sanitize(md.render(newContent || ''))
+    return
+  }
+  // 节流：最多每 80ms 渲染一次，减少 DOM 更新频率
+  renderTimer = setTimeout(() => {
+    renderedHtml.value = DOMPurify.sanitize(md.render(newContent || ''))
+    renderTimer = null
+  }, 80)
+}, { immediate: true })
 </script>
 
 <style scoped>

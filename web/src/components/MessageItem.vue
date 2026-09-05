@@ -1,13 +1,13 @@
 <template>
   <div class="message-item" :class="message.type">
     <div class="message-content">
-      <MarkdownView :content="message.content" />
       <div v-if="message.reasoning" class="reasoning-block">
         <div class="reasoning-toggle" @click="showReasoning = !showReasoning">
           思考 {{ showReasoning ? '▼' : '▶' }}
         </div>
         <div v-show="showReasoning" class="reasoning-text">{{ message.reasoning }}</div>
       </div>
+      <MarkdownView :content="message.content" />
       <div v-if="message.type === 'assistant' && message.usage" class="meta">
         {{ message.model || 'unknown' }} · in {{ message.usage.prompt_tokens }} · out {{ message.usage.completion_tokens }} · cache {{ message.usage.cached_tokens }} · {{ (message.duration_ms / 1000).toFixed(1) }}s
       </div>

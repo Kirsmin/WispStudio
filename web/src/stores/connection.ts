@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import { useSessionsStore } from './sessions'
 
 export interface ModelConfig {
   id: string
@@ -35,11 +36,21 @@ export const useConnectionStore = defineStore('connection', () => {
       lastOkTime.value = Date.now()
       serverUrl.value = url
       isConnected.value = true
-      // 获取模型列表
+      // 获取模型列表（映射 Go 大写驼峰到前端小写蛇形）
       const modelsRes = await fetch(`${url}/api/models`)
       if (modelsRes.ok) {
-        models.value = await modelsRes.json()
+        const raw = await modelsRes.json()
+        models.value = raw.map((m: any) => ({
+          id: m.ID || m.id || '',
+          name: m.Name || m.name || '',
+          default: m.Default ?? m.default ?? false,
+          thinking_levels: m.ThinkingLevels || m.thinking_levels || [],
+          thinking_style: m.ThinkingStyle || m.thinking_style || '',
+        }))
       }
+      // 连接成功后自动加载会话列表
+      const sessionsStore = useSessionsStore()
+      await sessionsStore.loadSessions()
       startPing()
       return true
     } catch {
