@@ -23,3 +23,7 @@ config.toml.local
 # OS
 .DS_Store
 Thumbs.db
+
+# Go 编译产物
+main
+*.exe
