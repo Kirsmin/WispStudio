@@ -103,6 +103,10 @@ func (s *MessageStore) List(sessionID string) ([]Message, error) {
 
 	var msgs []Message
 	scanner := bufio.NewScanner(f)
+	// 一条 assistant 消息就是一行 JSON，可能超过默认 64KB 单行上限；
+	// 扩容到最大 64MB，避免长回复加载历史时 Scanner 报错导致 500。
+	const maxLineSize = 64 * 1024 * 1024
+	scanner.Buffer(make([]byte, 64*1024), maxLineSize)
 	for scanner.Scan() {
 		var msg Message
 		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
