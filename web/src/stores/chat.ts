@@ -1,6 +1,6 @@
 import { computed, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
-import { useConnectionStore, type ModelInfo } from './connection'
+import { useConnectionStore } from './connection'
 import { useSessionsStore } from './sessions'
 
 export interface Usage {
