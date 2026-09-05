@@ -1,14 +1,22 @@
 <template>
-  <div>
-    <div v-if="isConnected" class="connected" @click="handleDisconnectClick">
+  <div class="connect-entry">
+    <div v-if="isConnected" class="status-pill" @click="handleDisconnectClick">
       <span class="dot"></span>
       <span class="latency" :style="{ color: latencyColor }">{{ latencyText }}</span>
     </div>
+    <button v-else class="link-btn" @click="showConnectDialog = true">连接服务器</button>
 
-    <n-modal v-model:show="showConnectDialog" title="连接服务器" preset="card" style="width: 400px">
-      <n-input v-model:value="serverUrl" placeholder="http://127.0.0.1:7860" />
+    <n-modal v-model:show="showConnectDialog" title="连接服务器" preset="card" style="width: 380px">
+      <n-input
+        v-model:value="serverUrl"
+        placeholder="http://127.0.0.1:7860"
+        @keydown.enter="connect"
+      />
       <template #footer>
-        <n-button type="primary" @click="connect">连接</n-button>
+        <div class="modal-footer">
+          <n-button @click="showConnectDialog = false">取消</n-button>
+          <n-button type="primary" @click="connect">连接</n-button>
+        </div>
       </template>
     </n-modal>
   </div>
@@ -65,27 +73,56 @@ function handleDisconnectClick() {
 </script>
 
 <style scoped>
-.connected {
+.connect-entry {
+  display: flex;
+  align-items: center;
+}
+
+.status-pill {
   display: flex;
   align-items: center;
   gap: 8px;
   cursor: pointer;
-  padding: 4px 8px;
-  border-radius: 8px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
 }
 
-.connected:hover {
+.status-pill:hover {
+  border-color: var(--accent-soft);
   background: var(--accent-tint);
 }
 
 .dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--dot);
 }
 
 .latency {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.link-btn {
+  border: none;
+  background: none;
+  padding: 5px 12px;
+  border-radius: 999px;
   font-size: 13px;
+  color: var(--accent-text);
+  cursor: pointer;
+}
+
+.link-btn:hover {
+  background: var(--accent-tint);
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 </style>

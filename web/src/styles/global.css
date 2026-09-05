@@ -1,15 +1,19 @@
 :root {
+  /* 统一粉色系调色板 */
   --bg:            #ffffff;
-  --text:          #1f2329;
-  --text-2:        #8a8f99;
-  --accent:        rgb(247, 202, 255);
-  --accent-hover:  rgb(240, 182, 252);
-  --accent-tint:   rgba(247, 202, 255, .18);
-  --accent-text:   #8a4fc8;
-  --border:        #f0f0f2;
+  --bg-soft:       #fdf6fa;
+  --text:          #2c2530;
+  --text-2:        #a394a3;
+  --accent:        #ec4899;
+  --accent-hover:  #db2777;
+  --accent-soft:   #fce8f2;
+  --accent-tint:   rgba(236, 72, 153, .07);
+  --accent-text:   #db2777;
+  --border:        #f6eaf1;
+  --border-strong: #efdcea;
   --warn:          #f0a020;
-  --error:         #d03050;
-  --dot:           #2080f0;
+  --error:         #e0455a;
+  --dot:           #ec4899;
 }
 
 *, *::before, *::after {
@@ -31,42 +35,43 @@ body {
   transition-duration: 0.2s;
 }
 
+/* 关闭 NaiveUI 所有弹出/进场动画（模态框、下拉、消息等） */
+[class*="transition-enter-active"],
+[class*="transition-leave-active"],
+[class*="transition-enter-from"],
+[class*="transition-leave-to"] {
+  transition: none !important;
+  animation: none !important;
+}
+
 /* 按钮样式 */
 button, .n-button {
   transform: none !important;
 }
 
-/* Markdown 样式 */
-.md li::marker {
-  color: rgb(247, 202, 255);
-  font-weight: 600;
+/* 滚动条细化 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
 }
 
-.md pre {
-  background: #faf8fb;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px;
-  overflow-x: auto;
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
 }
 
-.md code {
-  background: var(--accent-tint);
-  border-radius: 4px;
-  padding: 1px 5px;
-  font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-soft);
 }
 
-.md pre code {
+::-webkit-scrollbar-track {
   background: transparent;
-  padding: 0;
 }
 
-.md blockquote {
-  border-left: 3px solid var(--accent);
-  margin: 0;
-  padding-left: 12px;
-  color: var(--text-2);
+/* Markdown 细节（配合 md-editor-v3 的 github 主题） */
+.md li::marker {
+  color: var(--accent);
+  font-weight: 600;
 }
 
 .md a {
@@ -76,4 +81,9 @@ button, .n-button {
 
 .md a:hover {
   text-decoration: underline;
+}
+
+.md blockquote {
+  border-left: 3px solid var(--accent-soft);
+  color: var(--text-2);
 }

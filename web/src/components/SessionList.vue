@@ -1,9 +1,9 @@
 <template>
   <div class="session-list" :class="{ disabled: !isConnected }">
     <div class="session-header">
-      <n-button class="new-btn" :disabled="!isConnected" @click="createSession">
+      <n-button class="new-btn" type="primary" :disabled="!isConnected" @click="createSession">
         <template #icon>
-          <span>+</span>
+          <span class="plus">+</span>
         </template>
         新会话
       </n-button>
@@ -28,10 +28,13 @@
     </div>
 
     <!-- 重命名对话框 -->
-    <n-modal v-model:show="showRenameModal" title="重命名会话" preset="card" style="width: 400px">
-      <n-input v-model:value="renameValue" placeholder="新标题" />
+    <n-modal v-model:show="showRenameModal" title="重命名会话" preset="card" style="width: 380px">
+      <n-input v-model:value="renameValue" placeholder="新标题" @keydown.enter="confirmRename" />
       <template #footer>
-        <n-button type="primary" @click="confirmRename">保存</n-button>
+        <div class="modal-footer">
+          <n-button @click="showRenameModal = false">取消</n-button>
+          <n-button type="primary" @click="confirmRename">保存</n-button>
+        </div>
       </template>
     </n-modal>
   </div>
@@ -92,7 +95,7 @@ async function confirmRename() {
 
 <style scoped>
 .session-list {
-  width: 260px;
+  width: 248px;
   border-right: 1px solid var(--border);
   background: var(--bg);
   display: flex;
@@ -106,36 +109,35 @@ async function confirmRename() {
 }
 
 .session-header {
-  padding: 12px;
-  border-bottom: 1px solid var(--border);
+  padding: 14px 14px 10px;
 }
 
 .new-btn {
   width: 100%;
-  background: var(--accent);
-  color: #3d1a4e;
-  border: none;
+  font-weight: 500;
 }
 
-.new-btn:hover {
-  background: var(--accent-hover);
+.plus {
+  font-size: 16px;
+  line-height: 1;
 }
 
 .session-items {
   flex: 1;
   overflow-y: auto;
-  padding: 8px;
+  padding: 4px 10px 10px;
 }
 
 .session-item {
-  padding: 10px 12px;
-  border-radius: 8px;
+  padding: 9px 12px;
+  border-radius: 10px;
   cursor: pointer;
-  margin-bottom: 4px;
+  margin-bottom: 2px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   overflow: hidden;
+  color: var(--text);
 }
 
 .session-item:hover {
@@ -143,7 +145,9 @@ async function confirmRename() {
 }
 
 .session-item.active {
-  background: rgba(247, 202, 255, .32);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 500;
 }
 
 .session-title {
@@ -159,10 +163,21 @@ async function confirmRename() {
   font-size: 12px;
   padding: 2px 6px;
   cursor: pointer;
+  border-radius: 6px;
   color: var(--text-2);
+}
+
+.menu-btn:hover {
+  color: var(--accent-text);
 }
 
 .session-item:hover .menu-btn {
   opacity: 1;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 </style>

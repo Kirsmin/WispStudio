@@ -1,6 +1,4 @@
 // API 客户端封装
-const BASE_URL = '' // 使用相对路径，vite proxy 处理
-
 export async function fetchHealth(baseUrl: string) {
   const res = await fetch(`${baseUrl}/api/health`)
   return res.ok

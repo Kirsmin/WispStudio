@@ -9,7 +9,7 @@
       </div>
       <MarkdownView :content="message.content" />
       <div v-if="message.type === 'assistant' && message.usage" class="meta">
-        {{ message.model || 'unknown' }} · in {{ message.usage.prompt_tokens }} · out {{ message.usage.completion_tokens }} · cache {{ message.usage.cached_tokens }} · {{ (message.duration_ms / 1000).toFixed(1) }}s
+        {{ message.model || 'unknown' }} · in {{ message.usage.prompt_tokens }} · out {{ message.usage.completion_tokens }} · cache {{ message.usage.cached_tokens }} · {{ ((message.duration_ms ?? 0) / 1000).toFixed(1) }}s
       </div>
     </div>
   </div>
@@ -19,7 +19,7 @@
 import { ref } from 'vue'
 import MarkdownView from './MarkdownView.vue'
 
-const props = defineProps<{
+defineProps<{
   message: {
     id: string
     type: 'user' | 'assistant'
@@ -41,7 +41,7 @@ const showReasoning = ref(false)
 <style scoped>
 .message-item {
   display: flex;
-  margin-bottom: 16px;
+  margin-bottom: 18px;
 }
 
 .message-item.user {
@@ -55,43 +55,51 @@ const showReasoning = ref(false)
 .message-content {
   max-width: 760px;
   padding: 12px 16px;
-  border-radius: 8px;
+  border-radius: 16px;
+  word-break: break-word;
 }
 
 .message-item.user .message-content {
-  background: var(--accent-tint);
+  background: var(--accent-soft);
+  color: var(--text);
 }
 
 .message-item.assistant .message-content {
   background: transparent;
-  padding-left: 0;
+  padding-left: 2px;
+  padding-right: 2px;
 }
 
 .reasoning-block {
-  margin-top: 8px;
+  margin-bottom: 8px;
 }
 
 .reasoning-toggle {
   font-size: 12px;
-  color: var(--text-2);
-  font-style: italic;
+  color: var(--accent-text);
   cursor: pointer;
   user-select: none;
+  display: inline-block;
+  padding: 2px 0;
 }
 
 .reasoning-text {
   font-size: 13px;
   color: var(--text-2);
-  font-style: italic;
   margin-top: 4px;
-  padding: 8px;
-  background: #faf8fb;
-  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  white-space: pre-wrap;
+  max-height: 320px;
+  overflow-y: auto;
 }
 
 .meta {
   font-size: 12px;
   color: var(--text-2);
   margin-top: 8px;
+  font-variant-numeric: tabular-nums;
 }
 </style>
