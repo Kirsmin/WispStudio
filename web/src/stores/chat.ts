@@ -27,10 +27,10 @@ export interface ChatMessage {
   phase?: StreamPhase
 }
 
-// OpenAI Chat Completions reasoning_effort 当前是 model-dependent。
-// /v1/models 标准对象只提供基础模型信息，并不声明支持哪些 effort，因此：
-// 1) 后端/Provider 若明确返回 thinking_levels，优先使用；
-// 2) 旧配置只有 ["off"] 时，UI 暴露 OpenAI 标准 effort 集合，由上游模型做最终校验。
+// OpenAI Chat Completions reasoning_effort 是 model-dependent。
+// /v1/models 标准对象不声明模型具体支持哪些档位，因此：
+// 1) Provider 明确返回 thinking_levels 时优先使用；
+// 2) 旧配置只有 ["off"] 时展示 OpenAI-compatible 常见档位，由上游最终校验。
 export const OPENAI_REASONING_LEVELS = [
   'default',
   'none',
@@ -50,8 +50,6 @@ export function modelThinkingLevels(model?: { id?: string; thinking_levels?: str
 
   const modelId = String(model.id || '').toLowerCase()
   if (modelId.startsWith('deepseek-v4-')) {
-    // DeepSeek V4 Chat Completions: none 通过 thinking.type=disabled 表达；
-    // effort 映射支持 low/medium/high/xhigh/max，default 表示不覆盖服务端默认。
     return ['default', 'none', 'low', 'medium', 'high', 'xhigh', 'max']
   }
 
@@ -63,7 +61,6 @@ export function modelThinkingLevels(model?: { id?: string; thinking_levels?: str
     return ['default']
   }
 
-  // 兼容旧版 config.toml 中 thinking_levels=["off"], thinking_style="none"。
   if (configured.length === 0 || configured.every(level => level === 'off' || level === 'default')) {
     return [...OPENAI_REASONING_LEVELS]
   }
@@ -71,143 +68,7 @@ export function modelThinkingLevels(model?: { id?: string; thinking_levels?: str
 }
 
 type SSEMessage = { event: string; data: string }
-type VisualPartKind = 'reasoning' | 'answer'
 
-interface VisualPart {
-  kind: VisualPartKind
-  chars: string[]
-  offset: number
-}
-
-// 这是“视觉流”的节奏，而不是网络节流。
-// 即使浏览器一次 reader.read() 收到几十个 SSE delta，或者代理/TCP 把小包合并，
-// 也会在多个 animation frame 中逐步写入 Vue 的响应式 message，从而保证中间态可见。
-const TYPEWRITER_MIN_CHARS_PER_FRAME = 2
-const TYPEWRITER_MAX_CHARS_PER_FRAME = 24
-const TYPEWRITER_TARGET_DRAIN_FRAMES = 24
-const MIN_REASONING_VISIBLE_MS = 180
-
-class VisualStreamPump {
-  private queue: VisualPart[] = []
-  private queuedChars = 0
-  private rafId: number | null = null
-  private stopped = false
-  private reasoningVisibleAt = 0
-  private drainResolvers: Array<() => void> = []
-
-  constructor(
-    private readonly target: ChatMessage,
-    private readonly isActive: () => boolean,
-  ) {}
-
-  enqueue(kind: VisualPartKind, text: string): void {
-    if (this.stopped || !text) return
-    const chars = Array.from(text)
-    if (chars.length === 0) return
-
-    const last = this.queue[this.queue.length - 1]
-    if (last && last.kind === kind && last.offset === 0) {
-      last.chars.push(...chars)
-    } else {
-      this.queue.push({ kind, chars, offset: 0 })
-    }
-    this.queuedChars += chars.length
-    this.ensureFrame()
-  }
-
-  drain(): Promise<void> {
-    if (this.stopped || this.queuedChars === 0) return Promise.resolve()
-    this.ensureFrame()
-    return new Promise(resolve => this.drainResolvers.push(resolve))
-  }
-
-  cancel(): void {
-    if (this.stopped) return
-    this.stopped = true
-    this.queue = []
-    this.queuedChars = 0
-    if (this.rafId !== null) {
-      window.cancelAnimationFrame(this.rafId)
-      this.rafId = null
-    }
-    this.resolveDrainWaiters()
-  }
-
-  private ensureFrame(): void {
-    if (this.stopped || this.rafId !== null || this.queuedChars === 0) return
-    this.rafId = window.requestAnimationFrame(timestamp => this.renderFrame(timestamp))
-  }
-
-  private renderFrame(timestamp: number): void {
-    this.rafId = null
-    if (this.stopped || !this.isActive()) {
-      this.cancel()
-      return
-    }
-
-    const first = this.queue[0]
-    if (!first) {
-      this.resolveDrainWaiters()
-      return
-    }
-
-    // 如果 reasoning 和 answer 在同一个网络批次里到达，不能同一帧“展开又折叠”。
-    // 至少让 reasoning 区域真实绘制一小段时间，用户能看到思考中间态。
-    if (
-      first.kind === 'answer' &&
-      this.target.phase === 'reasoning' &&
-      this.reasoningVisibleAt > 0 &&
-      timestamp - this.reasoningVisibleAt < MIN_REASONING_VISIBLE_MS
-    ) {
-      this.ensureFrame()
-      return
-    }
-
-    const frameKind = first.kind
-    const adaptive = Math.ceil(this.queuedChars / TYPEWRITER_TARGET_DRAIN_FRAMES)
-    let budget = Math.min(
-      TYPEWRITER_MAX_CHARS_PER_FRAME,
-      Math.max(TYPEWRITER_MIN_CHARS_PER_FRAME, adaptive),
-    )
-
-    // 一个 frame 只渲染一种阶段。这样 reasoning -> answer 的阶段切换一定跨越浏览器绘制边界。
-    while (budget > 0 && this.queue.length > 0 && this.queue[0].kind === frameKind) {
-      const part = this.queue[0]
-      const remaining = part.chars.length - part.offset
-      const take = Math.min(budget, remaining)
-      const text = part.chars.slice(part.offset, part.offset + take).join('')
-
-      if (frameKind === 'reasoning') {
-        if (this.target.phase !== 'reasoning') {
-          this.target.phase = 'reasoning'
-          this.reasoningVisibleAt = timestamp
-        }
-        this.target.reasoning = (this.target.reasoning || '') + text
-      } else {
-        this.target.phase = 'answer'
-        this.target.content += text
-      }
-
-      part.offset += take
-      this.queuedChars -= take
-      budget -= take
-      if (part.offset >= part.chars.length) this.queue.shift()
-    }
-
-    if (this.queuedChars > 0) {
-      this.ensureFrame()
-    } else {
-      this.resolveDrainWaiters()
-    }
-  }
-
-  private resolveDrainWaiters(): void {
-    const waiters = this.drainResolvers.splice(0)
-    for (const resolve of waiters) resolve()
-  }
-}
-
-// 增量 SSE 解码器：兼容 \n\n 和 \r\n\r\n，支持多行 data。
 class SSEDecoder {
   private buffer = ''
 
@@ -256,6 +117,23 @@ function parseJSON(data: string): Record<string, unknown> {
   }
 }
 
+function visualChunkSize(backlog: number): number {
+  // 小块时保持"逐字/逐几个字"的视觉效果；积压很多时快速追赶，避免长回答动画拖太久。
+  if (backlog <= 8) return 1
+  if (backlog <= 40) return 2
+  return Math.min(64, Math.max(3, Math.ceil(backlog / 18)))
+}
+
+function takeTextChunk(source: string, count: number): [string, string] {
+  let end = Math.min(source.length, count)
+  // 不从 UTF-16 surrogate pair 中间切开 emoji / 扩展字符。
+  if (end > 0 && end < source.length) {
+    const code = source.charCodeAt(end - 1)
+    if (code >= 0xD800 && code <= 0xDBFF) end++
+  }
+  return [source.slice(0, end), source.slice(end)]
+}
+
 export const useChatStore = defineStore('chat', () => {
   const messages = ref<ChatMessage[]>([])
   const inputText = ref('')
@@ -266,93 +144,98 @@ export const useChatStore = defineStore('chat', () => {
   const abortController = ref<AbortController | null>(null)
 
   let activeRun = 0
-  let cancelVisualStream: (() => void) | null = null
+  let messageLoadSeq = 0
+  let cancelActiveVisual: (() => void) | null = null
 
   const connectionStore = useConnectionStore()
   const sessionsStore = useSessionsStore()
 
-  function modelsForProvider(providerId: string) {
+  function providerModels(providerId = selectedProvider.value) {
     if (!providerId) return connectionStore.models
     return connectionStore.models.filter(model => model.provider_id === providerId)
   }
 
-  function syncCatalogSelection(): void {
-    const providers = connectionStore.providers
-    if (providers.length > 0 && !providers.some(provider => provider.id === selectedProvider.value)) {
-      selectedProvider.value = connectionStore.defaultProvider || providers[0].id
+  function currentModel() {
+    return connectionStore.models.find(model =>
+      model.id === selectedModel.value && (!selectedProvider.value || model.provider_id === selectedProvider.value),
+    )
+  }
+
+  function ensureSelection() {
+    const providersWithModels = connectionStore.providers.filter(provider =>
+      connectionStore.models.some(model => model.provider_id === provider.id),
+    )
+    const currentProviderValid = selectedProvider.value && providersWithModels.some(provider => provider.id === selectedProvider.value)
+
+    if (!currentProviderValid) {
+      const defaultProvider = providersWithModels.find(provider => provider.default && provider.available)
+        || providersWithModels.find(provider => provider.available)
+        || providersWithModels[0]
+      selectedProvider.value = defaultProvider?.id || connectionStore.models[0]?.provider_id || ''
     }
 
-    const candidates = modelsForProvider(selectedProvider.value)
-    if (candidates.length === 0) {
-      selectedModel.value = ''
-      return
-    }
+    const candidates = providerModels()
     if (!candidates.some(model => model.id === selectedModel.value)) {
-      const preferred = candidates.find(model => model.default)
-      selectedModel.value = preferred?.id || candidates[0].id
+      const defaultModel = candidates.find(model => model.default) || candidates[0]
+      selectedModel.value = defaultModel?.id || ''
+    }
+
+    const levels = modelThinkingLevels(currentModel())
+    if (!levels.includes(selectedThinking.value)) {
+      selectedThinking.value = levels.includes('default') ? 'default' : levels[0]
     }
   }
 
   watch(
-    [() => connectionStore.providers, () => connectionStore.models],
-    syncCatalogSelection,
+    () => [connectionStore.providers, connectionStore.models],
+    ensureSelection,
     { immediate: true, deep: true },
   )
-
-  watch(selectedProvider, () => {
-    syncCatalogSelection()
-  })
-
-  watch(selectedModel, (modelId) => {
-    const model = connectionStore.models.find(item =>
-      item.id === modelId && (!selectedProvider.value || item.provider_id === selectedProvider.value),
-    )
-    if (model && selectedProvider.value !== model.provider_id) {
-      selectedProvider.value = model.provider_id
-    }
-    const levels = modelThinkingLevels(model)
+  watch(selectedProvider, ensureSelection)
+  watch(selectedModel, () => {
+    const levels = modelThinkingLevels(currentModel())
     if (!levels.includes(selectedThinking.value)) {
       selectedThinking.value = levels.includes('default') ? 'default' : levels[0]
     }
-  }, { immediate: true })
+  })
 
-  watch(() => sessionsStore.currentSessionId, (sessionId) => {
-    activeRun++
-    cancelVisualStream?.()
-    cancelVisualStream = null
-    abortController.value?.abort()
-    abortController.value = null
-    isStreaming.value = false
-    messages.value = []
-
+  function applySessionSelection(sessionId: string) {
     const session = sessionsStore.sessions.find(item => item.id === sessionId)
     if (!session) return
-    if (session.provider && connectionStore.providers.some(provider => provider.id === session.provider)) {
+
+    if (session.provider && connectionStore.models.some(model => model.provider_id === session.provider)) {
       selectedProvider.value = session.provider
     }
-    const sessionModel = connectionStore.models.find(model =>
-      model.id === session.model && (!session.provider || model.provider_id === session.provider),
-    )
-    if (sessionModel) {
-      selectedProvider.value = sessionModel.provider_id
-      selectedModel.value = sessionModel.id
+    if (session.model && connectionStore.models.some(model =>
+      model.id === session.model && (!selectedProvider.value || model.provider_id === selectedProvider.value),
+    )) {
+      selectedModel.value = session.model
     }
-  })
+    ensureSelection()
+  }
 
   async function loadMessages(sessionId: string) {
     if (!sessionId || !connectionStore.isConnected) {
       messages.value = []
       return
     }
+
+    const seq = ++messageLoadSeq
     const res = await fetch(`${connectionStore.serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/messages`, { cache: 'no-store' })
     if (!res.ok) return
     const data = await res.json()
+
+    // 防止旧的 loadMessages（尤其是"首条消息创建会话"时的空列表请求）覆盖正在流式显示的消息。
+    if (seq !== messageLoadSeq) return
     if (sessionsStore.currentSessionId !== sessionId) return
-    messages.value = data.map((m: any) => ({
+    if (isStreaming.value) return
+
+    messages.value = (Array.isArray(data) ? data : []).map((m: any) => ({
       id: m.id,
       type: m.type,
       content: m.content || '',
       reasoning: m.reasoning || '',
+      provider: m.provider,
       model: m.model,
       thinking: m.thinking,
       usage: m.usage,
@@ -365,163 +248,228 @@ export const useChatStore = defineStore('chat', () => {
     }))
   }
 
+  function createVisualStream(message: ChatMessage, run: number) {
+    let reasoningQueue = ''
+    let answerQueue = ''
+    let networkDone = false
+    let cancelled = false
+    let frameId: number | null = null
+    let answerTransitionDeadline = 0
+    let settled = false
+    let resolveDrain!: () => void
+
+    const drained = new Promise<void>((resolve) => {
+      resolveDrain = resolve
+    })
+
+    function settle() {
+      if (settled) return
+      settled = true
+      if (frameId !== null) {
+        cancelAnimationFrame(frameId)
+        frameId = null
+      }
+      resolveDrain()
+    }
+
+    function schedule() {
+      if (cancelled || settled || frameId !== null) return
+      frameId = requestAnimationFrame(tick)
+    }
+
+    function tick(now: number) {
+      frameId = null
+      if (cancelled || run !== activeRun) {
+        settle()
+        return
+      }
+
+      // 正常情况下 reasoning 一定在 answer 前。只要正文尚未开始显示，就先把 reasoning 队列画完。
+      if (reasoningQueue && !message.content) {
+        const [chunk, rest] = takeTextChunk(reasoningQueue, visualChunkSize(reasoningQueue.length))
+        reasoningQueue = rest
+        message.phase = 'reasoning'
+        message.reasoning = (message.reasoning || '') + chunk
+        schedule()
+        return
+      }
+
+      if (answerQueue) {
+        // 有可见思考时，在第一段正文前留一个很短的过渡，让"展开思考 -> 折叠 -> 正文"中间态真正能被浏览器画出来。
+        if (message.reasoning && !message.content) {
+          if (!answerTransitionDeadline) answerTransitionDeadline = now + 90
+          if (now < answerTransitionDeadline) {
+            schedule()
+            return
+          }
+        }
+
+        const [chunk, rest] = takeTextChunk(answerQueue, visualChunkSize(answerQueue.length))
+        answerQueue = rest
+        message.phase = 'answer'
+        message.content += chunk
+        schedule()
+        return
+      }
+
+      // 极少数兼容端可能在正文后补 reasoning；保留内容，但不要把 UI 从正文重新切回"思考中"。
+      if (reasoningQueue) {
+        const [chunk, rest] = takeTextChunk(reasoningQueue, visualChunkSize(reasoningQueue.length))
+        reasoningQueue = rest
+        message.reasoning = (message.reasoning || '') + chunk
+        schedule()
+        return
+      }
+
+      if (networkDone) {
+        settle()
+      }
+    }
+
+    return {
+      enqueueReasoning(text: string) {
+        if (!text || cancelled) return
+        reasoningQueue += text
+        schedule()
+      },
+      enqueueAnswer(text: string) {
+        if (!text || cancelled) return
+        answerQueue += text
+        schedule()
+      },
+      finishNetwork() {
+        networkDone = true
+        schedule()
+      },
+      waitForDrain() {
+        return drained
+      },
+      cancel() {
+        cancelled = true
+        settle()
+      },
+    }
+  }
+
   async function sendMessage() {
     const text = inputText.value.trim()
     if (!text || !connectionStore.isConnected || isStreaming.value || !selectedModel.value) return
 
-    if (!sessionsStore.currentSessionId) {
-      const res = await fetch(`${connectionStore.serverUrl}/api/sessions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: text.slice(0, 20) }),
-      })
-      if (!res.ok) return
-      const session = await res.json()
-      sessionsStore.currentSessionId = session.id
-      await sessionsStore.loadSessions()
-    }
-
-    const currentId = sessionsStore.currentSessionId
-    if (!currentId) return
+    ensureSelection()
+    const provider = selectedProvider.value
+    const model = selectedModel.value
+    const thinking = selectedThinking.value
     const run = ++activeRun
 
-    const userMsg: ChatMessage = {
+    // 关键：首条消息也先进入 UI，再创建持久化会话。
+    // currentSessionId 的变化不再由 watch 自动清空/加载消息，因此不会出现"闪一下又回到空白页"。
+    const userMsg = reactive<ChatMessage>({
       id: `temp_user_${Date.now()}`,
       type: 'user',
       content: text,
-      provider: selectedProvider.value,
-      model: selectedModel.value,
-      thinking: selectedThinking.value,
+      provider,
+      model,
+      thinking,
       phase: 'done',
-    }
-
-    // 必须保留这个 reactive()：之前把普通对象 push 进 reactive 数组后，
-    // SSE 回调仍直接修改那个“原始对象”，绕过了 Vue Proxy，导致每个 delta 都没有触发视图更新；
-    // 最后 loadMessages() 替换整个数组时才突然一次性显示完整回复。
+    })
     const assistantMsg = reactive<ChatMessage>({
       id: `stream_${Date.now()}`,
       type: 'assistant',
       content: '',
       reasoning: '',
-      provider: selectedProvider.value,
-      model: selectedModel.value,
-      thinking: selectedThinking.value,
+      provider,
+      model,
+      thinking,
       streaming: true,
       phase: 'waiting',
     })
 
-    // 先把 user + assistant 占位放进 UI，再发请求；用户点击发送后立即有反馈。
     messages.value.push(userMsg, assistantMsg)
     inputText.value = ''
     isStreaming.value = true
     abortController.value = new AbortController()
     const localController = abortController.value
 
-    const visualStream = new VisualStreamPump(assistantMsg, () => run === activeRun)
-    cancelVisualStream = () => visualStream.cancel()
+    cancelActiveVisual?.()
+    const visual = createVisualStream(assistantMsg, run)
+    cancelActiveVisual = visual.cancel
 
-    const decoder = new SSEDecoder()
-    const textDecoder = new TextDecoder()
+    let currentId = sessionsStore.currentSessionId
     let gotSSE = false
-    let finalUsage: ChatMessage['usage'] | undefined
-    let finalError = ''
     let finalFinish = ''
-    let finalDurationMs: number | undefined
-    let finalTTFTMs: number | undefined
-
-    const handleEvent = (message: SSEMessage) => {
-      if (run !== activeRun) return
-      gotSSE = true
-      const payload = parseJSON(message.data)
-      switch (message.event) {
-        case 'start':
-          assistantMsg.phase = 'waiting'
-          break
-        case 'ttft': {
-          const value = Number(payload.ms)
-          if (Number.isFinite(value)) {
-            finalTTFTMs = value
-            assistantMsg.ttft_ms = value
-          }
-          break
-        }
-        case 'reasoning': {
-          const textPart = String(payload.text || '')
-          if (textPart) visualStream.enqueue('reasoning', textPart)
-          break
-        }
-        case 'delta': {
-          const textPart = String(payload.text || '')
-          if (textPart) visualStream.enqueue('answer', textPart)
-          break
-        }
-        case 'usage':
-          finalUsage = payload as unknown as ChatMessage['usage']
-          break
-        case 'error':
-          finalError = String(payload.message || '生成失败')
-          break
-        case 'done': {
-          finalFinish = String(payload.finish || 'stop')
-          if (payload.error) finalError = String(payload.error)
-          if (Number.isFinite(Number(payload.duration_ms))) finalDurationMs = Number(payload.duration_ms)
-          if (Number.isFinite(Number(payload.ttft_ms))) finalTTFTMs = Number(payload.ttft_ms)
-          break
-        }
-      }
-    }
-
-    const finishVisualMessage = async (): Promise<void> => {
-      await visualStream.drain()
-      if (run !== activeRun) return
-
-      assistantMsg.streaming = false
-      assistantMsg.usage = finalUsage
-      assistantMsg.finish = finalFinish || (finalError ? 'error' : 'stop')
-      assistantMsg.duration_ms = finalDurationMs
-      if (finalTTFTMs !== undefined) assistantMsg.ttft_ms = finalTTFTMs
-      if (finalError) assistantMsg.error = finalError
-
-      if (assistantMsg.error) {
-        assistantMsg.phase = 'error'
-      } else if (assistantMsg.content || assistantMsg.reasoning) {
-        assistantMsg.phase = 'done'
-      } else {
-        assistantMsg.phase = 'error'
-        assistantMsg.error = '模型没有返回可显示的内容'
-      }
-    }
+    let finalError = ''
 
     try {
+      if (!currentId) {
+        const session = await sessionsStore.createPersistedSession(text.slice(0, 20))
+        currentId = session.id
+      }
+      if (!currentId || run !== activeRun) return
+
+      const decoder = new SSEDecoder()
+      const textDecoder = new TextDecoder()
+
+      const handleEvent = (message: SSEMessage) => {
+        gotSSE = true
+        const payload = parseJSON(message.data)
+        switch (message.event) {
+          case 'start':
+            break
+          case 'ttft': {
+            const value = Number(payload.ms)
+            if (Number.isFinite(value)) assistantMsg.ttft_ms = value
+            break
+          }
+          case 'reasoning': {
+            const textPart = String(payload.text || '')
+            if (textPart) visual.enqueueReasoning(textPart)
+            break
+          }
+          case 'delta': {
+            const textPart = String(payload.text || '')
+            if (textPart) visual.enqueueAnswer(textPart)
+            break
+          }
+          case 'usage':
+            assistantMsg.usage = payload as unknown as ChatMessage['usage']
+            break
+          case 'error':
+            finalError = String(payload.message || '生成失败')
+            break
+          case 'done': {
+            finalFinish = String(payload.finish || 'stop')
+            if (payload.error) finalError = String(payload.error)
+            if (Number.isFinite(Number(payload.duration_ms))) assistantMsg.duration_ms = Number(payload.duration_ms)
+            if (Number.isFinite(Number(payload.ttft_ms))) assistantMsg.ttft_ms = Number(payload.ttft_ms)
+            break
+          }
+        }
+      }
+
       const res = await fetch(`${connectionStore.serverUrl}/api/sessions/${encodeURIComponent(currentId)}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         body: JSON.stringify({
           message: text,
-          provider: selectedProvider.value,
-          model: selectedModel.value,
-          thinking: selectedThinking.value,
+          provider,
+          model,
+          thinking,
         }),
         signal: localController.signal,
       })
 
       if (res.status === 409) {
-        assistantMsg.streaming = false
-        assistantMsg.phase = 'error'
-        assistantMsg.error = '该会话有任务正在执行'
-        window.$message?.error(assistantMsg.error)
-        return
+        finalError = '该会话有任务正在执行'
+        throw new Error(finalError)
       }
       if (!res.ok) {
         const body = (await res.text()).trim()
-        assistantMsg.streaming = false
-        assistantMsg.phase = 'error'
-        assistantMsg.error = body || `发送失败 (${res.status})`
-        window.$message?.error(assistantMsg.error)
-        return
+        finalError = body || `发送失败 (${res.status})`
+        throw new Error(finalError)
       }
       if (!res.body) {
-        throw new Error('浏览器没有拿到流式响应体')
+        finalError = '浏览器没有拿到流式响应体'
+        throw new Error(finalError)
       }
 
       const reader = res.body.getReader()
@@ -534,38 +482,56 @@ export const useChatStore = defineStore('chat', () => {
       for (const event of decoder.feed(textDecoder.decode())) handleEvent(event)
       for (const event of decoder.flush()) handleEvent(event)
 
-      // 关键：不要在网络流结束时立刻 loadMessages()。
-      // 网络可能已经把全部 token 收完，但视觉流还在逐帧输出；如果此时重新读取数据库，
-      // 会用“完整文本”替换当前消息，再次造成一瞬间全出来。
-      await finishVisualMessage()
+      visual.finishNetwork()
+      await visual.waitForDrain()
 
-      if (run === activeRun && sessionsStore.currentSessionId === currentId) {
-        await loadMessages(currentId)
-        await sessionsStore.loadSessions().catch(() => undefined)
+      if (run !== activeRun || sessionsStore.currentSessionId !== currentId) return
+
+      assistantMsg.streaming = false
+      assistantMsg.finish = finalFinish || (finalError ? 'error' : 'stop')
+      assistantMsg.error = finalError || undefined
+      if (finalError) {
+        assistantMsg.phase = 'error'
+      } else if (assistantMsg.content || assistantMsg.reasoning) {
+        assistantMsg.phase = 'done'
+      } else {
+        assistantMsg.error = '模型没有返回可显示的内容'
+        assistantMsg.phase = 'error'
       }
-    } catch (e: any) {
-      if (e?.name !== 'AbortError' && run === activeRun) {
-        finalError = e instanceof Error ? e.message : String(e)
-        await finishVisualMessage()
-        if (!gotSSE) window.$message?.error(finalError)
-        console.error('发送失败', e)
-      }
+
+      // 不在这里 loadMessages()：服务端完整消息会直接覆盖视觉队列，重新造成"最后一下全出来"。
+      // 只刷新左侧会话标题/更新时间即可；下次真正打开会话时再从服务端读取完整消息。
+      await sessionsStore.loadSessions().catch(() => undefined)
+    } catch (error: any) {
+      visual.finishNetwork()
+      await visual.waitForDrain()
+
+      if (error?.name === 'AbortError' || run !== activeRun) return
+
+      const message = finalError || (error instanceof Error ? error.message : String(error))
+      assistantMsg.streaming = false
+      assistantMsg.phase = 'error'
+      assistantMsg.error = message
+      assistantMsg.finish = 'error'
+      if (!gotSSE || finalError) window.$message?.error(message)
+      console.error('发送失败', error)
     } finally {
       if (run === activeRun) {
         isStreaming.value = false
         if (abortController.value === localController) abortController.value = null
-        if (cancelVisualStream) cancelVisualStream = null
+        if (cancelActiveVisual === visual.cancel) cancelActiveVisual = null
       }
     }
   }
 
   function stopStream() {
     activeRun++
-    cancelVisualStream?.()
-    cancelVisualStream = null
+    cancelActiveVisual?.()
+    cancelActiveVisual = null
     abortController.value?.abort()
     abortController.value = null
     isStreaming.value = false
+
     const last = [...messages.value].reverse().find(message => message.type === 'assistant' && message.streaming)
     if (last) {
       last.streaming = false
@@ -575,13 +541,32 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function openSession(id: string) {
-    sessionsStore.currentSessionId = id
+    if (!id) return
+
+    activeRun++
+    messageLoadSeq++
+    cancelActiveVisual?.()
+    cancelActiveVisual = null
+    abortController.value?.abort()
+    abortController.value = null
+    isStreaming.value = false
+    messages.value = []
+
+    sessionsStore.selectSession(id)
+    applySessionSelection(id)
     await loadMessages(id)
   }
 
   function newConversation() {
-    sessionsStore.currentSessionId = ''
+    activeRun++
+    messageLoadSeq++
+    cancelActiveVisual?.()
+    cancelActiveVisual = null
+    abortController.value?.abort()
+    abortController.value = null
+    isStreaming.value = false
     messages.value = []
+    sessionsStore.beginNewSession()
   }
 
   return {

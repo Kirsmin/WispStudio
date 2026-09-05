@@ -65,17 +65,13 @@ async function scrollToBottomIfNeeded() {
   if (element) element.scrollTop = element.scrollHeight
 }
 
-watch(currentSessionId, (id) => {
+// 这里只重置自动跟随滚动状态，不再自动 loadMessages。
+// 会话读取由 chat.openSession() 显式负责；否则首条消息创建 session.id 时，
+// 一个"空会话"的 loadMessages 请求会在流式过程中把临时 user/assistant 消息整个覆盖掉。
+watch(currentSessionId, () => {
   stickToBottom = true
-  if (id) {
-    void chatStore.loadMessages(id)
-  } else {
-    chatStore.messages = []
-  }
 })
 
-// deep watch 能捕获 streaming message.content/reasoning 的增量变化。
-// 用户主动向上滚动后不强行抢滚动条；在底部时则跟随“打字机”输出。
 watch(messages, () => {
   void scrollToBottomIfNeeded()
 }, { deep: true, flush: 'post' })

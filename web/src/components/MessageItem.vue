@@ -1,40 +1,45 @@
 <template>
   <div class="message-item" :class="message.type">
     <div class="message-content">
-      <div v-if="showReasoningBlock" class="reasoning-block">
-        <button class="reasoning-toggle" type="button" @click="manualToggleReasoning">
-          <span>{{ reasoningLabel }}</span>
-          <span v-if="message.phase === 'reasoning' && message.streaming" class="thinking-spinner" />
-          <span v-else>{{ showReasoning ? '▼' : '▶' }}</span>
-        </button>
-        <div v-show="showReasoning" class="reasoning-text">
-          <MarkdownView v-if="message.reasoning" :content="message.reasoning" />
-          <span v-else>思考中…</span>
+      <!-- 用户消息不要走 Markdown Preview。MdPreview 自己的块级结构会让单行消息看起来像多了一行。 -->
+      <div v-if="message.type === 'user'" class="user-text">{{ message.content }}</div>
+
+      <template v-else>
+        <div v-if="showReasoningBlock" class="reasoning-block">
+          <button class="reasoning-toggle" type="button" @click="manualToggleReasoning">
+            <span>{{ reasoningLabel }}</span>
+            <span v-if="message.phase === 'reasoning' && message.streaming" class="thinking-spinner" />
+            <span v-else>{{ showReasoning ? '▼' : '▶' }}</span>
+          </button>
+          <div v-show="showReasoning" class="reasoning-text">
+            <MarkdownView v-if="message.reasoning" :content="message.reasoning" />
+            <span v-else>思考中…</span>
+          </div>
         </div>
-      </div>
 
-      <div v-if="message.content" class="answer-body">
-        <MarkdownView :content="message.content" />
-      </div>
-      <div
-        v-else-if="message.type === 'assistant' && message.streaming && message.phase === 'waiting'"
-        class="waiting-row"
-      >
-        <span class="thinking-spinner" />
-        <span>等待模型首个响应…</span>
-      </div>
+        <div v-if="message.content" class="answer-body">
+          <MarkdownView :content="message.content" />
+        </div>
+        <div
+          v-else-if="message.streaming && message.phase === 'waiting'"
+          class="waiting-row"
+        >
+          <span class="thinking-spinner" />
+          <span>等待模型首个响应…</span>
+        </div>
 
-      <div v-if="message.error" class="error-text">{{ message.error }}</div>
+        <div v-if="message.error" class="error-text">{{ message.error }}</div>
 
-      <div v-if="message.type === 'assistant' && message.usage" class="meta">
-        {{ message.model || 'unknown' }}
-        · in {{ message.usage.prompt_tokens }}
-        · think {{ message.usage.reasoning_tokens ?? 0 }}
-        · out {{ message.usage.completion_tokens }}
-        · cache {{ message.usage.cached_tokens ?? 0 }}
-        · {{ ((message.duration_ms ?? 0) / 1000).toFixed(1) }}s
-        <span v-if="message.ttft_ms"> · 首字 {{ message.ttft_ms }}ms</span>
-      </div>
+        <div v-if="message.usage" class="meta">
+          {{ message.model || 'unknown' }}
+          · in {{ message.usage.prompt_tokens }}
+          · think {{ message.usage.reasoning_tokens ?? 0 }}
+          · out {{ message.usage.completion_tokens }}
+          · cache {{ message.usage.cached_tokens ?? 0 }}
+          · {{ ((message.duration_ms ?? 0) / 1000).toFixed(1) }}s
+          <span v-if="message.ttft_ms"> · 首字 {{ message.ttft_ms }}ms</span>
+        </div>
+      </template>
     </div>
   </div>
 </template>
@@ -52,7 +57,7 @@ const showReasoning = ref(false)
 const manuallyChanged = ref(false)
 
 const showReasoningBlock = computed(() =>
-  props.message.type === 'assistant' && Boolean(props.message.reasoning || props.message.phase === 'reasoning')
+  props.message.type === 'assistant' && Boolean(props.message.reasoning || props.message.phase === 'reasoning'),
 )
 
 const reasoningLabel = computed(() => {
@@ -65,10 +70,6 @@ function manualToggleReasoning() {
   showReasoning.value = !showReasoning.value
 }
 
-// 自动阶段切换：
-// 1) 收到 reasoning token -> 自动展开；
-// 2) 第一段 answer delta 到达 -> reasoning 阶段结束，自动折叠；
-// 3) 用户手动点过后，不在同一阶段反复抢用户控制权。
 watch(() => props.message.phase, (phase, previous) => {
   if (phase === 'reasoning') {
     manuallyChanged.value = false
@@ -111,7 +112,14 @@ watch(() => props.message.phase, (phase, previous) => {
 .message-item.user .message-content {
   background: var(--accent-soft);
   color: var(--text);
+  padding: 10px 16px;
+}
+
+.user-text {
   white-space: pre-wrap;
+  line-height: 1.55;
+  margin: 0;
+  padding: 0;
 }
 
 .message-item.assistant .message-content {

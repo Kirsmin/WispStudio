@@ -12,12 +12,12 @@
       <div class="composer-bar">
         <div class="bar-left">
           <n-select
-            v-if="providers.length > 1"
+            v-if="showProviderSelect"
             v-model:value="selectedProvider"
             :options="providerOptions"
             size="small"
             class="pill-select"
-            style="width: 120px"
+            style="width: 128px"
           />
           <n-select
             v-model:value="selectedModel"
@@ -38,7 +38,7 @@
           class="send-btn"
           :class="{ streaming: isStreaming }"
           :disabled="!isStreaming && (!inputText.trim() || !selectedModel)"
-          :title="isStreaming ? '停止生成' : '发送 (Shift/Ctrl + Enter)'"
+          :title="isStreaming ? '停止生成' : '发送 (Shift+Enter / Ctrl+Enter)'"
           @click="isStreaming ? stopStream() : sendMessage()"
         >
           <svg v-if="isStreaming" viewBox="0 0 16 16" width="14" height="14">
@@ -65,8 +65,14 @@ const connectionStore = useConnectionStore()
 const { isStreaming, selectedProvider, selectedModel, selectedThinking, inputText } = storeToRefs(chatStore)
 const { providers, models } = storeToRefs(connectionStore)
 
+const showProviderSelect = computed(() => providers.value.length > 1)
+
 const providerOptions = computed(() =>
-  providers.value.map(provider => ({ label: provider.name, value: provider.id })),
+  providers.value.map(provider => ({
+    label: provider.name,
+    value: provider.id,
+    disabled: !provider.available,
+  })),
 )
 
 const modelOptions = computed(() =>
@@ -102,9 +108,8 @@ function handleKeydown(event: KeyboardEvent) {
   if (event.key !== 'Enter' || event.isComposing) return
 
   // Enter：正常换行。
-  // Shift + Enter / Ctrl + Enter：发送。
+  // Shift+Enter / Ctrl+Enter：发送，并阻止这次 Enter 被插入文本框。
   if (!event.shiftKey && !event.ctrlKey) return
-
   event.preventDefault()
   if (!isStreaming.value) void chatStore.sendMessage()
 }
