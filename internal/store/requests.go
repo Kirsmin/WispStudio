@@ -27,6 +27,7 @@ type RequestStore struct {
 }
 
 func NewRequestStore(dataDir string) *RequestStore {
+	_ = os.MkdirAll(dataDir, 0755)
 	return &RequestStore{dataDir: dataDir}
 }
 

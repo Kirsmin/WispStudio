@@ -11,8 +11,23 @@ export interface Session {
   updated_at: string
 }
 
+const STORAGE_KEY = 'wisp_sessions_cache'
+
+function loadCached(): Session[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    return raw ? JSON.parse(raw) : []
+  } catch {
+    return []
+  }
+}
+
+function saveCached(list: Session[]) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(list))
+}
+
 export const useSessionsStore = defineStore('sessions', () => {
-  const sessions = ref<Session[]>([])
+  const sessions = ref<Session[]>(loadCached())
   const currentSessionId = ref<string>('')
   const connectionStore = useConnectionStore()
 
@@ -21,6 +36,7 @@ export const useSessionsStore = defineStore('sessions', () => {
     const res = await fetch(`${connectionStore.serverUrl}/api/sessions`)
     if (res.ok) {
       sessions.value = await res.json()
+      saveCached(sessions.value)
     }
   }
 

@@ -47,6 +47,7 @@ type MessageStore struct {
 }
 
 func NewMessageStore(dataDir string) *MessageStore {
+	_ = os.MkdirAll(dataDir, 0755)
 	return &MessageStore{dataDir: dataDir}
 }
 

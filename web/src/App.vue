@@ -1,34 +1,35 @@
 <template>
-  <n-config-provider :theme-overrides="themeOverrides">
+  <n-dialog-provider>
     <n-message-provider>
-      <div class="app-layout">
+      <div class="app">
         <TopBar />
-        <div class="main-layout">
+        <div class="main">
           <SessionList />
           <ChatArea />
         </div>
+        <ConnectDialog />
       </div>
     </n-message-provider>
-  </n-config-provider>
+  </n-dialog-provider>
 </template>
 
 <script setup lang="ts">
-import { NConfigProvider, NMessageProvider } from 'naive-ui'
-import { themeOverrides } from './theme'
+import { NDialogProvider, NMessageProvider } from 'naive-ui'
 import TopBar from './components/TopBar.vue'
 import SessionList from './components/SessionList.vue'
 import ChatArea from './components/ChatArea.vue'
+import ConnectDialog from './components/ConnectDialog.vue'
 </script>
 
 <style scoped>
-.app-layout {
+.app {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  background: var(--bg);
+  overflow: hidden;
 }
 
-.main-layout {
+.main {
   display: flex;
   flex: 1;
   overflow: hidden;

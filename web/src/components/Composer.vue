@@ -49,7 +49,7 @@ const modelOptions = computed(() =>
 
 const thinkingOptions = computed(() => {
   const model = models.value.find(m => m.id === selectedModel.value)
-  if (!model) return []
+  if (!model || !model.thinking_levels) return []
   return model.thinking_levels.map(l => ({ label: l, value: l }))
 })
 

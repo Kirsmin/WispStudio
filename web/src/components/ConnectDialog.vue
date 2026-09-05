@@ -1,12 +1,11 @@
 <template>
   <div>
-    <n-button v-if="!isConnected" @click="showDialog = true">连接服务器</n-button>
-    <div v-else class="connected" @click="handleDisconnectClick">
+    <div v-if="isConnected" class="connected" @click="handleDisconnectClick">
       <span class="dot"></span>
       <span class="latency" :style="{ color: latencyColor }">{{ latencyText }}</span>
     </div>
 
-    <n-modal v-model:show="showDialog" title="连接服务器" preset="card" style="width: 400px">
+    <n-modal v-model:show="showConnectDialog" title="连接服务器" preset="card" style="width: 400px">
       <n-input v-model:value="serverUrl" placeholder="http://127.0.0.1:7860" />
       <template #footer>
         <n-button type="primary" @click="connect">连接</n-button>
@@ -22,11 +21,10 @@ import { useConnectionStore } from '../stores/connection'
 import { storeToRefs } from 'pinia'
 
 const connectionStore = useConnectionStore()
-const { isConnected, latency, lastOkTime } = storeToRefs(connectionStore)
+const { isConnected, latency, lastOkTime, showConnectDialog } = storeToRefs(connectionStore)
 const { connect: doConnect, disconnect } = connectionStore
 
 const message = useMessage()
-const showDialog = ref(false)
 const serverUrl = ref(localStorage.getItem('serverUrl') || 'http://127.0.0.1:7860')
 const armed = ref(false)
 
@@ -48,7 +46,7 @@ async function connect() {
   localStorage.setItem('serverUrl', serverUrl.value)
   const ok = await doConnect(serverUrl.value)
   if (ok) {
-    showDialog.value = false
+    showConnectDialog.value = false
   } else {
     message.error('连接失败')
   }

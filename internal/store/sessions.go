@@ -34,6 +34,7 @@ type SessionStore struct {
 }
 
 func NewSessionStore(dataDir string) *SessionStore {
+	_ = os.MkdirAll(dataDir, 0755)
 	return &SessionStore{dataDir: dataDir}
 }
 

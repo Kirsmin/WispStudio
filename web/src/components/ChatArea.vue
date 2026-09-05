@@ -2,7 +2,7 @@
   <div class="chat-area">
     <div v-if="!isConnected" class="not-connected">
       <div class="not-connected-text">未连接服务器</div>
-      <n-button class="connect-btn" @click="showConnectDialog = true">连接</n-button>
+      <n-button class="connect-btn" @click="openConnectDialog">连接</n-button>
     </div>
     <template v-else>
       <div class="messages">
@@ -32,9 +32,13 @@ import Composer from './Composer.vue'
 const connectionStore = useConnectionStore()
 const chatStore = useChatStore()
 const sessionsStore = useSessionsStore()
-const { isConnected, showConnectDialog } = storeToRefs(connectionStore)
+const { isConnected } = storeToRefs(connectionStore)
 const { messages } = storeToRefs(chatStore)
 const { currentSessionId } = storeToRefs(sessionsStore)
+
+function openConnectDialog() {
+  connectionStore.showConnectDialog = true
+}
 
 // 切换会话时加载消息
 watch(currentSessionId, (id) => {

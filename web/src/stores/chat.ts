@@ -40,7 +40,7 @@ export const useChatStore = defineStore('chat', () => {
   watch(selectedModel, (modelId) => {
     const model = connectionStore.models.find(m => m.id === modelId)
     if (model) {
-      selectedThinking.value = model.thinking_levels[0] || 'off'
+      selectedThinking.value = model.thinking_levels?.[0] || 'off'
     }
   })
 
