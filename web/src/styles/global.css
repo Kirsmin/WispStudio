@@ -1,0 +1,79 @@
+:root {
+  --bg:            #ffffff;
+  --text:          #1f2329;
+  --text-2:        #8a8f99;
+  --accent:        rgb(247, 202, 255);
+  --accent-hover:  rgb(240, 182, 252);
+  --accent-tint:   rgba(247, 202, 255, .18);
+  --accent-text:   #8a4fc8;
+  --border:        #f0f0f2;
+  --warn:          #f0a020;
+  --error:         #d03050;
+  --dot:           #2080f0;
+}
+
+*, *::before, *::after {
+  box-shadow: none !important;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 无抖动：只允许背景色/颜色/边框色/透明度过渡 */
+*, *::before, *::after {
+  transition-property: background-color, color, border-color, opacity;
+  transition-duration: 0.2s;
+}
+
+/* 按钮样式 */
+button, .n-button {
+  transform: none !important;
+}
+
+/* Markdown 样式 */
+.md li::marker {
+  color: rgb(247, 202, 255);
+  font-weight: 600;
+}
+
+.md pre {
+  background: #faf8fb;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  overflow-x: auto;
+}
+
+.md code {
+  background: var(--accent-tint);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+}
+
+.md pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.md blockquote {
+  border-left: 3px solid var(--accent);
+  margin: 0;
+  padding-left: 12px;
+  color: var(--text-2);
+}
+
+.md a {
+  color: var(--accent-text);
+  text-decoration: none;
+}
+
+.md a:hover {
+  text-decoration: underline;
+}
