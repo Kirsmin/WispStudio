@@ -48,11 +48,12 @@ type ChatMessage struct {
 }
 
 type ChatRequest struct {
-	Model         string         `json:"model"`
-	Messages      []ChatMessage  `json:"messages"`
-	Stream        bool           `json:"stream"`
-	StreamOptions *StreamOptions `json:"stream_options,omitempty"`
-	EnableThinking interface{}   `json:"enable_thinking,omitempty"`
+	Model           string         `json:"model"`
+	Messages        []ChatMessage  `json:"messages"`
+	Stream          bool           `json:"stream"`
+	StreamOptions   *StreamOptions `json:"stream_options,omitempty"`
+	EnableThinking  interface{}    `json:"enable_thinking,omitempty"`
+	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
 }
 
 type StreamOptions struct {
@@ -60,7 +61,6 @@ type StreamOptions struct {
 }
 
 // BuildRequest 构造上游请求；baseURL / apiKey 传模型生效后的值
-// （模型配置里可覆盖 base_url / api_key，未覆盖时即为全局 [openai] 的值）
 func (c *Client) BuildRequest(baseURL, apiKey, model, thinkingStyle, thinkingLevel string, messages []ChatMessage) (*http.Request, error) {
 	body := ChatRequest{
 		Model:         model,
@@ -69,10 +69,17 @@ func (c *Client) BuildRequest(baseURL, apiKey, model, thinkingStyle, thinkingLev
 		StreamOptions: &StreamOptions{IncludeUsage: true},
 	}
 
-	// 按模型的 thinking_style 决定开启思考的方式
-	switch thinkingStyle {
-	case "enable_thinking":
-		body.EnableThinking = thinkingLevel != "off"
+	// 只在 thinkingLevel 不为 off 时发送推理参数
+	if thinkingLevel != "off" && thinkingLevel != "" {
+		switch thinkingStyle {
+		case "enable_thinking":
+			body.EnableThinking = true
+		case "reasoning_effort":
+			body.ReasoningEffort = thinkingLevel
+		default:
+			// 默认使用 reasoning_effort（OpenAI 标准）
+			body.ReasoningEffort = thinkingLevel
+		}
 	}
 
 	jsonBody, err := json.Marshal(body)

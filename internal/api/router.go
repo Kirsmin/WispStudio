@@ -6,16 +6,19 @@ import (
 	"time"
 
 	"wisp/internal/config"
+	"wisp/internal/provider"
 	"wisp/internal/store"
 )
 
 type Router struct {
-	cfg          *config.Config
-	mux          *http.ServeMux
-	sessionStore *store.SessionStore
-	messageStore *store.MessageStore
-	requestStore *store.RequestStore
-	chatHandler  *ChatHandler
+	cfg            *config.Config
+	mux            *http.ServeMux
+	sessionStore   *store.SessionStore
+	messageStore   *store.MessageStore
+	requestStore   *store.RequestStore
+	chatHandler    *ChatHandler
+	providerClient *provider.Client
+	cachedModels   []provider.ModelInfo
 }
 
 func NewRouter(cfg *config.Config) *Router {
@@ -23,16 +26,42 @@ func NewRouter(cfg *config.Config) *Router {
 	ms := store.NewMessageStore(cfg.Storage.DataDir)
 	rs := store.NewRequestStore(cfg.Storage.DataDir)
 
+	pclient := provider.NewClient()
+	var cachedModels []provider.ModelInfo
+	if len(cfg.Providers) > 0 {
+		cachedModels = pclient.FetchModels(cfg.Providers, cfg.OpenAI)
+	} else if len(cfg.Models) > 0 {
+		cachedModels = convertLegacyModels(cfg.Models)
+	}
+
 	r := &Router{
-		cfg:          cfg,
-		mux:          http.NewServeMux(),
-		sessionStore: ss,
-		messageStore: ms,
-		requestStore: rs,
-		chatHandler:  NewChatHandler(cfg, ss, ms, rs),
+		cfg:            cfg,
+		mux:            http.NewServeMux(),
+		sessionStore:   ss,
+		messageStore:   ms,
+		requestStore:   rs,
+		chatHandler:    NewChatHandler(cfg, ss, ms, rs, cachedModels),
+		providerClient: pclient,
+		cachedModels:   cachedModels,
 	}
 	r.registerRoutes()
 	return r
+}
+
+func convertLegacyModels(models []config.ModelConfig) []provider.ModelInfo {
+	result := make([]provider.ModelInfo, len(models))
+	for i, m := range models {
+		result[i] = provider.ModelInfo{
+			ID:             m.ID,
+			Name:           m.Name,
+			Default:        m.Default,
+			ThinkingLevels: m.ThinkingLevels,
+			ThinkingStyle:  m.ThinkingStyle,
+			BaseURL:        m.BaseURL,
+			APIKey:         m.APIKey,
+		}
+	}
+	return result
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -65,8 +94,11 @@ func (r *Router) handleModels(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
 	}
+	if len(r.cfg.Providers) > 0 {
+		r.cachedModels = r.providerClient.FetchModels(r.cfg.Providers, r.cfg.OpenAI)
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(r.cfg.Models)
+	json.NewEncoder(w).Encode(r.cachedModels)
 }
 
 func (r *Router) handleSessions(w http.ResponseWriter, req *http.Request) {

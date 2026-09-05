@@ -10,28 +10,30 @@ import (
 
 	"wisp/internal/config"
 	"wisp/internal/openai"
+	"wisp/internal/provider"
 	"wisp/internal/store"
 )
 
-// streamLockShards 会话流锁分片数。用定长数组而非 map，避免锁对象只增不减的内存泄漏
 const streamLockShards = 64
 
 type ChatHandler struct {
-	cfg          *config.Config
-	sessionStore *store.SessionStore
-	messageStore *store.MessageStore
-	requestStore *store.RequestStore
-	openaiClient *openai.Client
-	streamLocks  [streamLockShards]sync.Mutex
+	cfg            *config.Config
+	sessionStore   *store.SessionStore
+	messageStore   *store.MessageStore
+	requestStore   *store.RequestStore
+	openaiClient   *openai.Client
+	streamLocks    [streamLockShards]sync.Mutex
+	cachedModels   []provider.ModelInfo
 }
 
-func NewChatHandler(cfg *config.Config, ss *store.SessionStore, ms *store.MessageStore, rs *store.RequestStore) *ChatHandler {
+func NewChatHandler(cfg *config.Config, ss *store.SessionStore, ms *store.MessageStore, rs *store.RequestStore, cachedModels []provider.ModelInfo) *ChatHandler {
 	return &ChatHandler{
 		cfg:          cfg,
 		sessionStore: ss,
 		messageStore: ms,
 		requestStore: rs,
 		openaiClient: openai.NewClient(&cfg.OpenAI),
+		cachedModels: cachedModels,
 	}
 }
 
@@ -136,30 +138,41 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		h.sessionStore.UpdateTitle(sessionID, title)
 	}
 
-	// 查找模型配置
-	var modelCfg *config.ModelConfig
-	for i := range h.cfg.Models {
-		if h.cfg.Models[i].ID == req.Model {
-			modelCfg = &h.cfg.Models[i]
-			break
+	// 查找模型配置（从 Provider 缓存的模型列表中查找）
+	modelInfo := provider.FindModel(h.cachedModels, req.Model)
+	if modelInfo == nil {
+		// 向后兼容：从 cfg.Models 中查找
+		for i := range h.cfg.Models {
+			if h.cfg.Models[i].ID == req.Model {
+				m := h.cfg.Models[i]
+				modelInfo = &provider.ModelInfo{
+					ID:             m.ID,
+					Name:           m.Name,
+					ThinkingLevels: m.ThinkingLevels,
+					ThinkingStyle:  m.ThinkingStyle,
+					BaseURL:        m.BaseURL,
+					APIKey:         m.APIKey,
+				}
+				break
+			}
 		}
 	}
-	if modelCfg == nil {
+	if modelInfo == nil {
 		http.Error(w, "模型不存在", http.StatusBadRequest)
 		return
 	}
 
 	// 解析模型生效的网关与密钥：模型可单独覆盖 base_url / api_key，否则沿用全局
 	baseURL, apiKey := h.cfg.OpenAI.BaseURL, h.cfg.OpenAI.APIKey
-	if modelCfg.BaseURL != "" {
-		baseURL = modelCfg.BaseURL
+	if modelInfo.BaseURL != "" {
+		baseURL = modelInfo.BaseURL
 	}
-	if modelCfg.APIKey != "" {
-		apiKey = modelCfg.APIKey
+	if modelInfo.APIKey != "" {
+		apiKey = modelInfo.APIKey
 	}
 
 	// 构造上游请求
-	upReq, err := h.openaiClient.BuildRequest(baseURL, apiKey, req.Model, modelCfg.ThinkingStyle, req.Thinking, messages)
+	upReq, err := h.openaiClient.BuildRequest(baseURL, apiKey, req.Model, modelInfo.ThinkingStyle, req.Thinking, messages)
 	if err != nil {
 		http.Error(w, "构造请求失败", http.StatusInternalServerError)
 		return
@@ -200,6 +213,7 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	go reader.ReadEvents(ch)
 
 	startTime := time.Now()
+	var firstTokenTime time.Time
 	var fullContent string
 	var fullReasoning string
 	var finalUsage *openai.Usage
@@ -208,9 +222,17 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	for evt := range ch {
 		switch evt.Type {
 		case "delta":
+			if firstTokenTime.IsZero() {
+				firstTokenTime = time.Now()
+				_ = sse.WriteEvent("ttft", fmt.Sprintf(`{"ms":%d}`, int(firstTokenTime.Sub(startTime).Milliseconds())))
+			}
 			fullContent += evt.Text
 			_ = sse.WriteEvent("delta", fmt.Sprintf(`{"text":%q}`, evt.Text))
 		case "reasoning":
+			if firstTokenTime.IsZero() {
+				firstTokenTime = time.Now()
+				_ = sse.WriteEvent("ttft", fmt.Sprintf(`{"ms":%d}`, int(firstTokenTime.Sub(startTime).Milliseconds())))
+			}
 			fullReasoning += evt.Text
 			_ = sse.WriteEvent("reasoning", fmt.Sprintf(`{"text":%q}`, evt.Text))
 		case "usage":

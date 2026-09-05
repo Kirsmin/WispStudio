@@ -9,7 +9,7 @@
       </n-button>
     </div>
     <template v-else>
-      <div class="messages">
+      <div ref="messagesRef" class="messages">
         <div class="messages-inner">
           <div v-if="messages.length === 0" class="empty-chat">
             <div class="empty-title">开始一段对话</div>
@@ -30,7 +30,7 @@
 <script setup lang="ts">
 import { NButton } from 'naive-ui'
 import { storeToRefs } from 'pinia'
-import { watch } from 'vue'
+import { watch, ref, nextTick } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 import { useChatStore } from '../stores/chat'
 import { useSessionsStore } from '../stores/sessions'
@@ -44,6 +44,8 @@ const { isConnected } = storeToRefs(connectionStore)
 const { messages } = storeToRefs(chatStore)
 const { currentSessionId } = storeToRefs(sessionsStore)
 
+const messagesRef = ref<HTMLDivElement | null>(null)
+
 function openConnectDialog() {
   connectionStore.showConnectDialog = true
 }
@@ -56,6 +58,14 @@ watch(currentSessionId, (id) => {
     chatStore.messages = []
   }
 })
+
+// 自动滚动到底部
+watch(messages, async () => {
+  await nextTick()
+  if (messagesRef.value) {
+    messagesRef.value.scrollTop = messagesRef.value.scrollHeight
+  }
+}, { deep: true })
 </script>
 
 <style scoped>

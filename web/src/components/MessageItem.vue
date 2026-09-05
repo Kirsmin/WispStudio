@@ -1,13 +1,30 @@
 <template>
   <div class="message-item" :class="message.type">
     <div class="message-content">
-      <div v-if="message.reasoning" class="reasoning-block">
+      <div v-if="message.reasoning || message.isThinking" class="reasoning-block">
         <div class="reasoning-toggle" @click="showReasoning = !showReasoning">
-          思考 {{ showReasoning ? '▼' : '▶' }}
+          <template v-if="message.isThinking">
+            思考中 <span class="thinking-spinner"></span>
+          </template>
+          <template v-else>
+            思考 {{ showReasoning ? '▼' : '▶' }}
+            <span v-if="message.thinkingDuration" class="thinking-duration">
+              {{ (message.thinkingDuration / 1000).toFixed(1) }}s
+            </span>
+          </template>
         </div>
-        <div v-show="showReasoning" class="reasoning-text">{{ message.reasoning }}</div>
+        <div v-show="showReasoning || message.isThinking" class="reasoning-text">
+          {{ message.reasoning || '思考中...' }}
+        </div>
       </div>
-      <MarkdownView :content="message.content" />
+      
+      <div v-if="message.content || !message.isThinking" class="message-body">
+        <MarkdownView :content="message.content" />
+      </div>
+      <div v-else-if="message.isThinking && !message.reasoning" class="thinking-placeholder">
+        <span class="thinking-spinner"></span> 思考中...
+      </div>
+      
       <div v-if="message.type === 'assistant' && message.usage" class="meta">
         {{ message.model || 'unknown' }} · in {{ message.usage.prompt_tokens }} · think {{ message.usage.reasoning_tokens ?? 0 }} · out {{ message.usage.completion_tokens }} · cache {{ message.usage.cached_tokens }} · {{ ((message.duration_ms ?? 0) / 1000).toFixed(1) }}s
       </div>
@@ -16,10 +33,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import MarkdownView from './MarkdownView.vue'
 
-defineProps<{
+const props = defineProps<{
   message: {
     id: string
     type: 'user' | 'assistant'
@@ -33,10 +50,19 @@ defineProps<{
       reasoning_tokens: number
     }
     duration_ms?: number
+    finish?: string
+    isThinking?: boolean
+    thinkingDuration?: number
   }
 }>()
 
-const showReasoning = ref(false)
+const showReasoning = ref(props.message.isThinking ?? false)
+
+watch(() => props.message.isThinking, (isThinking) => {
+  if (isThinking) {
+    showReasoning.value = true
+  }
+})
 </script>
 
 <style scoped>
@@ -80,8 +106,15 @@ const showReasoning = ref(false)
   color: var(--accent-text);
   cursor: pointer;
   user-select: none;
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 2px 0;
+}
+
+.thinking-duration {
+  color: var(--text-2);
+  font-size: 11px;
 }
 
 .reasoning-text {
@@ -95,6 +128,35 @@ const showReasoning = ref(false)
   white-space: pre-wrap;
   max-height: 320px;
   overflow-y: auto;
+}
+
+.thinking-placeholder {
+  font-size: 13px;
+  color: var(--text-2);
+  padding: 8px 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.thinking-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.message-body {
+  min-height: 1em;
 }
 
 .meta {

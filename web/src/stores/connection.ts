@@ -8,6 +8,7 @@ export interface ModelConfig {
   default: boolean
   thinking_levels: string[]
   thinking_style: string
+  provider_name?: string
 }
 
 export const useConnectionStore = defineStore('connection', () => {
@@ -17,6 +18,8 @@ export const useConnectionStore = defineStore('connection', () => {
   const lastOkTime = ref(Date.now())
   // 最近一次心跳是否成功（响应式），后端宕机时 UI 能立即切到"无响应"
   const pingOk = ref(false)
+  // 最近一次聊天的首字延迟（TTFT），有值时优先显示这个
+  const ttft = ref(0)
   const models = ref<ModelConfig[]>([])
   const showConnectDialog = ref(false)
   let pingTimer: ReturnType<typeof setInterval> | null = null
@@ -24,6 +27,18 @@ export const useConnectionStore = defineStore('connection', () => {
   const defaultModel = computed(() => {
     const m = models.value.find(x => x.default)
     return m?.id || models.value[0]?.id || ''
+  })
+
+  // UI 显示的延迟：有 TTFT 时显示首字延迟，否则显示心跳 RTT
+  const displayLatency = computed(() => {
+    if (ttft.value > 0) return ttft.value
+    return latency.value
+  })
+
+  // 延迟标签：TTFT 时显示 "首字"，否则显示空（保持原有样式）
+  const latencyLabel = computed(() => {
+    if (ttft.value > 0) return '首字'
+    return ''
   })
 
   async function connect(url: string): Promise<boolean> {
@@ -49,6 +64,7 @@ export const useConnectionStore = defineStore('connection', () => {
           default: m.Default ?? m.default ?? false,
           thinking_levels: m.ThinkingLevels || m.thinking_levels || [],
           thinking_style: m.ThinkingStyle || m.thinking_style || '',
+          provider_name: m.ProviderName || m.provider_name || '',
         }))
       }
       // 连接成功后自动加载会话列表
@@ -64,6 +80,7 @@ export const useConnectionStore = defineStore('connection', () => {
   function disconnect() {
     isConnected.value = false
     latency.value = 0
+    ttft.value = 0
     pingOk.value = false
     models.value = []
     stopPing()
@@ -102,6 +119,9 @@ export const useConnectionStore = defineStore('connection', () => {
     isConnected,
     serverUrl,
     latency,
+    displayLatency,
+    latencyLabel,
+    ttft,
     lastOkTime,
     pingOk,
     models,
