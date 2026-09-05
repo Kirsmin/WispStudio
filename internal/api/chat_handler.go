@@ -49,6 +49,7 @@ func (h *ChatHandler) getStreamLock(sessionID string) *sync.Mutex {
 
 type chatRequest struct {
 	Message  string `json:"message"`
+	Provider string `json:"provider"`
 	Model    string `json:"model"`
 	Thinking string `json:"thinking"`
 }
@@ -90,16 +91,31 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	provCfg, modelInfo, err := h.catalog.Resolve(r.Context(), "", req.Model)
+	// Provider 与 Model 必须成对解析。旧版前端只传 model，之前这里却把
+	// providerID 固定传成空字符串，而 Catalog.Resolve 又按 provider 精确匹配，
+	// 结果任何模型都会被误判成“不存在”。
+	//
+	// 新前端会显式传 provider；旧前端则优先沿用会话保存的 Provider，仍解析
+	// 不到时再按模型 ID 做兼容查找。
+	providerID := strings.TrimSpace(req.Provider)
+	if providerID == "" {
+		providerID = strings.TrimSpace(sess.Provider)
+	}
+	provCfg, modelInfo, err := h.catalog.Resolve(r.Context(), providerID, req.Model)
+	if err != nil && strings.TrimSpace(req.Provider) == "" && providerID != "" {
+		provCfg, modelInfo, err = h.catalog.Resolve(r.Context(), "", req.Model)
+	}
 	if err != nil {
-		http.Error(w, "模型不存在", http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if req.Model != "" {
-		_ = h.sessionStore.UpdateSelection(sessionID, provCfg.ID, req.Model)
-		sess.Model = req.Model
-	}
+	// 后续统一使用目录实际解析出的 Provider / Model，避免旧会话中的选择残留。
+	req.Provider = provCfg.ID
+	req.Model = modelInfo.ID
+	_ = h.sessionStore.UpdateSelection(sessionID, req.Provider, req.Model)
+	sess.Provider = req.Provider
+	sess.Model = req.Model
 
 	history, err := h.messageStore.List(sessionID)
 	if err != nil {

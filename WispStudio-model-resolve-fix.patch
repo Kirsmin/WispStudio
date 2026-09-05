@@ -1,0 +1,316 @@
+--- a/internal/api/chat_handler.go
++++ b/internal/api/chat_handler.go
+@@ -49,6 +49,7 @@
+ 
+ type chatRequest struct {
+ 	Message  string `json:"message"`
++	Provider string `json:"provider"`
+ 	Model    string `json:"model"`
+ 	Thinking string `json:"thinking"`
+ }
+@@ -90,16 +91,31 @@
+ 		return
+ 	}
+ 
+-	provCfg, modelInfo, err := h.catalog.Resolve(r.Context(), "", req.Model)
++	// Provider 与 Model 必须成对解析。旧版前端只传 model，之前这里却把
++	// providerID 固定传成空字符串，而 Catalog.Resolve 又按 provider 精确匹配，
++	// 结果任何模型都会被误判成“不存在”。
++	//
++	// 新前端会显式传 provider；旧前端则优先沿用会话保存的 Provider，仍解析
++	// 不到时再按模型 ID 做兼容查找。
++	providerID := strings.TrimSpace(req.Provider)
++	if providerID == "" {
++		providerID = strings.TrimSpace(sess.Provider)
++	}
++	provCfg, modelInfo, err := h.catalog.Resolve(r.Context(), providerID, req.Model)
++	if err != nil && strings.TrimSpace(req.Provider) == "" && providerID != "" {
++		provCfg, modelInfo, err = h.catalog.Resolve(r.Context(), "", req.Model)
++	}
+ 	if err != nil {
+-		http.Error(w, "模型不存在", http.StatusBadRequest)
++		http.Error(w, err.Error(), http.StatusBadRequest)
+ 		return
+ 	}
+ 
+-	if req.Model != "" {
+-		_ = h.sessionStore.UpdateSelection(sessionID, provCfg.ID, req.Model)
+-		sess.Model = req.Model
+-	}
++	// 后续统一使用目录实际解析出的 Provider / Model，避免旧会话中的选择残留。
++	req.Provider = provCfg.ID
++	req.Model = modelInfo.ID
++	_ = h.sessionStore.UpdateSelection(sessionID, req.Provider, req.Model)
++	sess.Provider = req.Provider
++	sess.Model = req.Model
+ 
+ 	history, err := h.messageStore.List(sessionID)
+ 	if err != nil {
+--- a/internal/provider/catalog.go
++++ b/internal/provider/catalog.go
+@@ -195,40 +195,104 @@
+ }
+ 
+ func (c *Catalog) Resolve(ctx context.Context, providerID, modelID string) (*config.ProviderConfig, *ModelInfo, error) {
+-	lookup := func() (*config.ProviderConfig, *ModelInfo) {
++	providerID = strings.TrimSpace(providerID)
++	modelID = strings.TrimSpace(modelID)
++	if modelID == "" {
++		return nil, nil, fmt.Errorf("缺少模型 ID")
++	}
++
++	lookup := func() (*config.ProviderConfig, *ModelInfo, error) {
+ 		c.mu.RLock()
+ 		defer c.mu.RUnlock()
+-		var model *ModelInfo
++
++		// 新客户端会显式传 provider。此时必须做精确匹配，避免同名模型
++		// 在不同 Provider 之间串线。
++		if providerID != "" {
++			for i := range c.snapshot.Models {
++				candidate := c.snapshot.Models[i]
++				if candidate.ProviderID != providerID || candidate.ID != modelID {
++					continue
++				}
++				provider := c.providerConfigLocked(providerID)
++				if provider == nil {
++					return nil, nil, nil
++				}
++				model := candidate
++				return provider, &model, nil
++			}
++			return nil, nil, nil
++		}
++
++		// 兼容旧客户端：旧请求只有 model，没有 provider。
++		// 如果模型 ID 唯一，直接找到它；若多个 Provider 都有同名模型，
++		// 优先使用默认 Provider。新客户端不会走到这个歧义分支。
++		var candidates []ModelInfo
+ 		for i := range c.snapshot.Models {
+ 			candidate := c.snapshot.Models[i]
+-			if candidate.ProviderID == providerID && candidate.ID == modelID {
+-				copy := candidate
+-				model = &copy
+-				break
++			if candidate.ID == modelID {
++				candidates = append(candidates, candidate)
+ 			}
+ 		}
+-		if model == nil {
+-			return nil, nil
++		if len(candidates) == 0 {
++			return nil, nil, nil
+ 		}
+-		for i := range c.providers {
+-			if c.providers[i].Config.ID == providerID {
+-				copy := c.providers[i].Config
+-				return &copy, model
++
++		chosen := candidates[0]
++		if len(candidates) > 1 {
++			defaultProviderID := ""
++			for _, info := range c.snapshot.Providers {
++				if info.Default {
++					defaultProviderID = info.ID
++					break
++				}
++			}
++			if defaultProviderID != "" {
++				for _, candidate := range candidates {
++					if candidate.ProviderID == defaultProviderID {
++						chosen = candidate
++						break
++					}
++				}
+ 			}
+ 		}
+-		return nil, nil
++
++		provider := c.providerConfigLocked(chosen.ProviderID)
++		if provider == nil {
++			return nil, nil, nil
++		}
++		model := chosen
++		return provider, &model, nil
+ 	}
+ 
+-	if provider, model := lookup(); provider != nil && model != nil {
++	if provider, model, err := lookup(); err != nil {
++		return nil, nil, err
++	} else if provider != nil && model != nil {
+ 		return provider, model, nil
+ 	}
++
+ 	_ = c.Refresh(ctx)
+-	if provider, model := lookup(); provider != nil && model != nil {
++	if provider, model, err := lookup(); err != nil {
++		return nil, nil, err
++	} else if provider != nil && model != nil {
+ 		return provider, model, nil
+ 	}
++
++	if providerID == "" {
++		return nil, nil, fmt.Errorf("不存在模型 %q", modelID)
++	}
+ 	return nil, nil, fmt.Errorf("Provider %q 中不存在模型 %q", providerID, modelID)
+ }
+ 
++func (c *Catalog) providerConfigLocked(providerID string) *config.ProviderConfig {
++	for i := range c.providers {
++		if c.providers[i].Config.ID == providerID {
++			provider := c.providers[i].Config
++			return &provider
++		}
++	}
++	return nil
++}
++
+ func (c *Catalog) fetchProvider(parent context.Context, provider config.ProviderConfig) (ProviderInfo, []ModelInfo) {
+ 	info := ProviderInfo{ID: provider.ID, Name: provider.Name, Default: provider.Default}
+ 	fallback := modelsFromOverrides(provider)
+--- a/web/src/stores/chat.ts
++++ b/web/src/stores/chat.ts
+@@ -124,6 +124,7 @@
+   const messages = ref<ChatMessage[]>([])
+   const inputText = ref('')
+   const isStreaming = ref(false)
++  const selectedProvider = ref('')
+   const selectedModel = ref('')
+   const selectedThinking = ref('default')
+   const abortController = ref<AbortController | null>(null)
+@@ -133,15 +134,41 @@
+   const connectionStore = useConnectionStore()
+   const sessionsStore = useSessionsStore()
+ 
+-  watch(() => connectionStore.models, (models) => {
+-    if (models.length > 0 && !models.some(model => model.id === selectedModel.value)) {
+-      const def = models.find(model => model.default)
+-      selectedModel.value = def?.id || models[0].id
++  function syncCatalogSelection(): void {
++    const providers = connectionStore.providers
++    const models = connectionStore.models
++    if (models.length === 0) {
++      selectedProvider.value = ''
++      selectedModel.value = ''
++      return
++    }
++
++    const providerHasModels = (providerId: string) => models.some(model => model.provider_id === providerId)
++    if (!selectedProvider.value || !providers.some(provider => provider.id === selectedProvider.value) || !providerHasModels(selectedProvider.value)) {
++      const preferred = providers.find(provider => provider.default && providerHasModels(provider.id))
++        || providers.find(provider => providerHasModels(provider.id))
++      selectedProvider.value = preferred?.id || models[0].provider_id
+     }
+-  }, { immediate: true, deep: true })
+ 
+-  watch(selectedModel, (modelId) => {
+-    const model = connectionStore.models.find(item => item.id === modelId)
++    const providerModels = models.filter(model => model.provider_id === selectedProvider.value)
++    if (!providerModels.some(model => model.id === selectedModel.value)) {
++      const def = providerModels.find(model => model.default)
++      selectedModel.value = def?.id || providerModels[0]?.id || ''
++    }
++  }
++
++  watch(
++    [() => connectionStore.providers, () => connectionStore.models],
++    syncCatalogSelection,
++    { immediate: true, deep: true },
++  )
++
++  watch(selectedProvider, () => {
++    syncCatalogSelection()
++  })
++
++  watch([selectedProvider, selectedModel], ([providerId, modelId]) => {
++    const model = connectionStore.models.find(item => item.provider_id === providerId && item.id === modelId)
+     const levels = modelThinkingLevels(model)
+     if (!levels.includes(selectedThinking.value)) {
+       selectedThinking.value = levels.includes('default') ? 'default' : levels[0]
+@@ -284,6 +311,9 @@
+         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+         body: JSON.stringify({
+           message: text,
++          // model ID 在不同 Provider 中可能重名，因此 provider 必须作为选择的一部分发送。
++          // 后端仍兼容旧客户端只传 model 的请求。
++          provider: selectedProvider.value,
+           model: selectedModel.value,
+           thinking: selectedThinking.value,
+         }),
+@@ -360,6 +390,17 @@
+   }
+ 
+   async function openSession(id: string) {
++    const session = sessionsStore.sessions.find(item => item.id === id)
++    if (session?.provider && connectionStore.models.some(model => model.provider_id === session.provider && model.id === session.model)) {
++      selectedProvider.value = session.provider
++      selectedModel.value = session.model
++    } else if (session?.model) {
++      const candidate = connectionStore.models.find(model => model.id === session.model)
++      if (candidate) {
++        selectedProvider.value = candidate.provider_id
++        selectedModel.value = candidate.id
++      }
++    }
+     sessionsStore.currentSessionId = id
+     await loadMessages(id)
+   }
+@@ -373,6 +414,7 @@
+     messages,
+     inputText,
+     isStreaming,
++    selectedProvider,
+     selectedModel,
+     selectedThinking,
+     loadMessages,
+--- a/web/src/components/Composer.vue
++++ b/web/src/components/Composer.vue
+@@ -12,6 +12,14 @@
+       <div class="composer-bar">
+         <div class="bar-left">
+           <n-select
++            v-if="providerOptions.length > 1"
++            v-model:value="selectedProvider"
++            :options="providerOptions"
++            size="small"
++            class="pill-select"
++            style="width: 120px"
++          />
++          <n-select
+             v-model:value="selectedModel"
+             :options="modelOptions"
+             size="small"
+@@ -54,11 +62,21 @@
+ 
+ const chatStore = useChatStore()
+ const connectionStore = useConnectionStore()
+-const { isStreaming, selectedModel, selectedThinking, inputText } = storeToRefs(chatStore)
+-const { models } = storeToRefs(connectionStore)
++const { isStreaming, selectedProvider, selectedModel, selectedThinking, inputText } = storeToRefs(chatStore)
++const { providers, models } = storeToRefs(connectionStore)
++
++const providerOptions = computed(() =>
++  providers.value.map(provider => ({
++    label: provider.name,
++    value: provider.id,
++    disabled: !provider.available && provider.models_count === 0,
++  }))
++)
+ 
+ const modelOptions = computed(() =>
+-  models.value.map(model => ({ label: model.name, value: model.id }))
++  models.value
++    .filter(model => model.provider_id === selectedProvider.value)
++    .map(model => ({ label: model.name, value: model.id }))
+ )
+ 
+ const thinkingLabels: Record<string, string> = {
+@@ -75,7 +93,7 @@
+ }
+ 
+ const thinkingOptions = computed(() => {
+-  const model = models.value.find(item => item.id === selectedModel.value)
++  const model = models.value.find(item => item.provider_id === selectedProvider.value && item.id === selectedModel.value)
+   return modelThinkingLevels(model).map(level => ({
+     label: thinkingLabels[level] || level,
+     value: level,

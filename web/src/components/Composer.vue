@@ -12,6 +12,14 @@
       <div class="composer-bar">
         <div class="bar-left">
           <n-select
+            v-if="providerOptions.length > 1"
+            v-model:value="selectedProvider"
+            :options="providerOptions"
+            size="small"
+            class="pill-select"
+            style="width: 120px"
+          />
+          <n-select
             v-model:value="selectedModel"
             :options="modelOptions"
             size="small"
@@ -54,11 +62,21 @@ import { useConnectionStore } from '../stores/connection'
 
 const chatStore = useChatStore()
 const connectionStore = useConnectionStore()
-const { isStreaming, selectedModel, selectedThinking, inputText } = storeToRefs(chatStore)
-const { models } = storeToRefs(connectionStore)
+const { isStreaming, selectedProvider, selectedModel, selectedThinking, inputText } = storeToRefs(chatStore)
+const { providers, models } = storeToRefs(connectionStore)
+
+const providerOptions = computed(() =>
+  providers.value.map(provider => ({
+    label: provider.name,
+    value: provider.id,
+    disabled: !provider.available && provider.models_count === 0,
+  }))
+)
 
 const modelOptions = computed(() =>
-  models.value.map(model => ({ label: model.name, value: model.id }))
+  models.value
+    .filter(model => model.provider_id === selectedProvider.value)
+    .map(model => ({ label: model.name, value: model.id }))
 )
 
 const thinkingLabels: Record<string, string> = {
@@ -75,7 +93,7 @@ const thinkingLabels: Record<string, string> = {
 }
 
 const thinkingOptions = computed(() => {
-  const model = models.value.find(item => item.id === selectedModel.value)
+  const model = models.value.find(item => item.provider_id === selectedProvider.value && item.id === selectedModel.value)
   return modelThinkingLevels(model).map(level => ({
     label: thinkingLabels[level] || level,
     value: level,

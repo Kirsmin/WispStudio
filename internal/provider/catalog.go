@@ -195,38 +195,102 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 }
 
 func (c *Catalog) Resolve(ctx context.Context, providerID, modelID string) (*config.ProviderConfig, *ModelInfo, error) {
-	lookup := func() (*config.ProviderConfig, *ModelInfo) {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var model *ModelInfo
-		for i := range c.snapshot.Models {
-			candidate := c.snapshot.Models[i]
-			if candidate.ProviderID == providerID && candidate.ID == modelID {
-				copy := candidate
-				model = &copy
-				break
-			}
-		}
-		if model == nil {
-			return nil, nil
-		}
-		for i := range c.providers {
-			if c.providers[i].Config.ID == providerID {
-				copy := c.providers[i].Config
-				return &copy, model
-			}
-		}
-		return nil, nil
+	providerID = strings.TrimSpace(providerID)
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil, nil, fmt.Errorf("缺少模型 ID")
 	}
 
-	if provider, model := lookup(); provider != nil && model != nil {
+	lookup := func() (*config.ProviderConfig, *ModelInfo, error) {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+
+		// 新客户端会显式传 provider。此时必须做精确匹配，避免同名模型
+		// 在不同 Provider 之间串线。
+		if providerID != "" {
+			for i := range c.snapshot.Models {
+				candidate := c.snapshot.Models[i]
+				if candidate.ProviderID != providerID || candidate.ID != modelID {
+					continue
+				}
+				provider := c.providerConfigLocked(providerID)
+				if provider == nil {
+					return nil, nil, nil
+				}
+				model := candidate
+				return provider, &model, nil
+			}
+			return nil, nil, nil
+		}
+
+		// 兼容旧客户端：旧请求只有 model，没有 provider。
+		// 如果模型 ID 唯一，直接找到它；若多个 Provider 都有同名模型，
+		// 优先使用默认 Provider。新客户端不会走到这个歧义分支。
+		var candidates []ModelInfo
+		for i := range c.snapshot.Models {
+			candidate := c.snapshot.Models[i]
+			if candidate.ID == modelID {
+				candidates = append(candidates, candidate)
+			}
+		}
+		if len(candidates) == 0 {
+			return nil, nil, nil
+		}
+
+		chosen := candidates[0]
+		if len(candidates) > 1 {
+			defaultProviderID := ""
+			for _, info := range c.snapshot.Providers {
+				if info.Default {
+					defaultProviderID = info.ID
+					break
+				}
+			}
+			if defaultProviderID != "" {
+				for _, candidate := range candidates {
+					if candidate.ProviderID == defaultProviderID {
+						chosen = candidate
+						break
+					}
+				}
+			}
+		}
+
+		provider := c.providerConfigLocked(chosen.ProviderID)
+		if provider == nil {
+			return nil, nil, nil
+		}
+		model := chosen
+		return provider, &model, nil
+	}
+
+	if provider, model, err := lookup(); err != nil {
+		return nil, nil, err
+	} else if provider != nil && model != nil {
 		return provider, model, nil
 	}
+
 	_ = c.Refresh(ctx)
-	if provider, model := lookup(); provider != nil && model != nil {
+	if provider, model, err := lookup(); err != nil {
+		return nil, nil, err
+	} else if provider != nil && model != nil {
 		return provider, model, nil
+	}
+
+	if providerID == "" {
+		return nil, nil, fmt.Errorf("不存在模型 %q", modelID)
 	}
 	return nil, nil, fmt.Errorf("Provider %q 中不存在模型 %q", providerID, modelID)
+}
+
+func (c *Catalog) providerConfigLocked(providerID string) *config.ProviderConfig {
+	for i := range c.providers {
+		if c.providers[i].Config.ID == providerID {
+			provider := c.providers[i].Config
+			return &provider
+		}
+	}
+	return nil
 }
 
 func (c *Catalog) fetchProvider(parent context.Context, provider config.ProviderConfig) (ProviderInfo, []ModelInfo) {

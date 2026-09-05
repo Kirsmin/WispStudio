@@ -124,6 +124,7 @@ export const useChatStore = defineStore('chat', () => {
   const messages = ref<ChatMessage[]>([])
   const inputText = ref('')
   const isStreaming = ref(false)
+  const selectedProvider = ref('')
   const selectedModel = ref('')
   const selectedThinking = ref('default')
   const abortController = ref<AbortController | null>(null)
@@ -133,15 +134,41 @@ export const useChatStore = defineStore('chat', () => {
   const connectionStore = useConnectionStore()
   const sessionsStore = useSessionsStore()
 
-  watch(() => connectionStore.models, (models) => {
-    if (models.length > 0 && !models.some(model => model.id === selectedModel.value)) {
-      const def = models.find(model => model.default)
-      selectedModel.value = def?.id || models[0].id
+  function syncCatalogSelection(): void {
+    const providers = connectionStore.providers
+    const models = connectionStore.models
+    if (models.length === 0) {
+      selectedProvider.value = ''
+      selectedModel.value = ''
+      return
     }
-  }, { immediate: true, deep: true })
 
-  watch(selectedModel, (modelId) => {
-    const model = connectionStore.models.find(item => item.id === modelId)
+    const providerHasModels = (providerId: string) => models.some(model => model.provider_id === providerId)
+    if (!selectedProvider.value || !providers.some(provider => provider.id === selectedProvider.value) || !providerHasModels(selectedProvider.value)) {
+      const preferred = providers.find(provider => provider.default && providerHasModels(provider.id))
+        || providers.find(provider => providerHasModels(provider.id))
+      selectedProvider.value = preferred?.id || models[0].provider_id
+    }
+
+    const providerModels = models.filter(model => model.provider_id === selectedProvider.value)
+    if (!providerModels.some(model => model.id === selectedModel.value)) {
+      const def = providerModels.find(model => model.default)
+      selectedModel.value = def?.id || providerModels[0]?.id || ''
+    }
+  }
+
+  watch(
+    [() => connectionStore.providers, () => connectionStore.models],
+    syncCatalogSelection,
+    { immediate: true, deep: true },
+  )
+
+  watch(selectedProvider, () => {
+    syncCatalogSelection()
+  })
+
+  watch([selectedProvider, selectedModel], ([providerId, modelId]) => {
+    const model = connectionStore.models.find(item => item.provider_id === providerId && item.id === modelId)
     const levels = modelThinkingLevels(model)
     if (!levels.includes(selectedThinking.value)) {
       selectedThinking.value = levels.includes('default') ? 'default' : levels[0]
@@ -284,6 +311,9 @@ export const useChatStore = defineStore('chat', () => {
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         body: JSON.stringify({
           message: text,
+          // model ID 在不同 Provider 中可能重名，因此 provider 必须作为选择的一部分发送。
+          // 后端仍兼容旧客户端只传 model 的请求。
+          provider: selectedProvider.value,
           model: selectedModel.value,
           thinking: selectedThinking.value,
         }),
@@ -360,6 +390,17 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function openSession(id: string) {
+    const session = sessionsStore.sessions.find(item => item.id === id)
+    if (session?.provider && connectionStore.models.some(model => model.provider_id === session.provider && model.id === session.model)) {
+      selectedProvider.value = session.provider
+      selectedModel.value = session.model
+    } else if (session?.model) {
+      const candidate = connectionStore.models.find(model => model.id === session.model)
+      if (candidate) {
+        selectedProvider.value = candidate.provider_id
+        selectedModel.value = candidate.id
+      }
+    }
     sessionsStore.currentSessionId = id
     await loadMessages(id)
   }
@@ -373,6 +414,7 @@ export const useChatStore = defineStore('chat', () => {
     messages,
     inputText,
     isStreaming,
+    selectedProvider,
     selectedModel,
     selectedThinking,
     loadMessages,
