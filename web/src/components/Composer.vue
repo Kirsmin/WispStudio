@@ -12,35 +12,28 @@
       <div class="composer-bar">
         <div class="bar-left">
           <n-select
-            v-model:value="selectedProvider"
-            :options="providerOptions"
-            :disabled="isBusy || providerOptions.length === 0"
-            size="small"
-            class="pill-select provider-select"
-          />
-          <n-select
             v-model:value="selectedModel"
             :options="modelOptions"
-            :disabled="isBusy || modelOptions.length === 0"
             size="small"
-            class="pill-select model-select"
+            class="pill-select"
+            style="width: 160px"
           />
           <n-select
             v-model:value="selectedThinking"
             :options="thinkingOptions"
-            :disabled="isBusy || thinkingOptions.length === 0"
             size="small"
-            class="pill-select thinking-select"
+            class="pill-select"
+            style="width: 104px"
           />
         </div>
         <button
           class="send-btn"
-          :class="{ streaming: isBusy }"
-          :disabled="!isBusy && (!inputText.trim() || !selectedProvider || !selectedModel)"
-          :title="isBusy ? '停止生成' : '发送 (Enter)'"
-          @click="isBusy ? stopGeneration() : sendMessage()"
+          :class="{ streaming: isStreaming }"
+          :disabled="!isStreaming && (!inputText.trim() || !selectedModel)"
+          :title="isStreaming ? '停止生成' : '发送 (Enter)'"
+          @click="isStreaming ? stopStream() : sendMessage()"
         >
-          <svg v-if="isBusy" viewBox="0 0 16 16" width="14" height="14">
+          <svg v-if="isStreaming" viewBox="0 0 16 16" width="14" height="14">
             <rect x="3.5" y="3.5" width="9" height="9" rx="2" fill="currentColor" />
           </svg>
           <svg v-else viewBox="0 0 16 16" width="14" height="14">
@@ -53,64 +46,54 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
 import { NInput, NSelect } from 'naive-ui'
+import { computed } from 'vue'
 import { storeToRefs } from 'pinia'
-import { useChatStore } from '../stores/chat'
+import { modelThinkingLevels, useChatStore } from '../stores/chat'
 import { useConnectionStore } from '../stores/connection'
 
-const chat = useChatStore()
-const connection = useConnectionStore()
-const {
-  inputText,
-  selectedProvider,
-  selectedModel,
-  selectedThinking,
-  modelsForProvider,
-  thinkingLevels,
-  isBusy,
-} = storeToRefs(chat)
-const { providers } = storeToRefs(connection)
+const chatStore = useChatStore()
+const connectionStore = useConnectionStore()
+const { isStreaming, selectedModel, selectedThinking, inputText } = storeToRefs(chatStore)
+const { models } = storeToRefs(connectionStore)
 
-const providerOptions = computed(() => providers.value.map(provider => ({
-  label: provider.name,
-  value: provider.id,
-  disabled: !provider.available && provider.models_count === 0,
-})))
-
-const modelOptions = computed(() => modelsForProvider.value.map(model => ({
-  label: model.name,
-  value: model.id,
-})))
+const modelOptions = computed(() =>
+  models.value.map(model => ({ label: model.name, value: model.id }))
+)
 
 const thinkingLabels: Record<string, string> = {
+  default: '默认',
   off: '关闭',
-  none: '关闭',
   on: '开启',
-  auto: '自动',
+  none: '关闭',
   minimal: '最小',
   low: '低',
   medium: '中',
   high: '高',
+  xhigh: '极高',
+  max: '最大',
 }
 
-const thinkingOptions = computed(() => thinkingLevels.value.map(level => ({
-  label: thinkingLabels[level] || level,
-  value: level,
-})))
+const thinkingOptions = computed(() => {
+  const model = models.value.find(item => item.id === selectedModel.value)
+  return modelThinkingLevels(model).map(level => ({
+    label: thinkingLabels[level] || level,
+    value: level,
+  }))
+})
 
-function handleKeydown(event: KeyboardEvent): void {
+function handleKeydown(event: KeyboardEvent) {
   if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return
   event.preventDefault()
-  if (!isBusy.value) void chat.sendMessage()
+  if (!isStreaming.value) void chatStore.sendMessage()
 }
 
-function sendMessage(): void {
-  void chat.sendMessage()
+function sendMessage() {
+  void chatStore.sendMessage()
 }
 
-function stopGeneration(): void {
-  void chat.stopGeneration()
+function stopStream() {
+  chatStore.stopStream()
 }
 </script>
 
@@ -155,12 +138,7 @@ function stopGeneration(): void {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-width: 0;
 }
-
-.provider-select { width: 116px; }
-.model-select { width: 160px; }
-.thinking-select { width: 92px; }
 
 .pill-select :deep(.n-base-selection) {
   border-radius: 999px;
@@ -192,19 +170,5 @@ function stopGeneration(): void {
 
 .send-btn.streaming {
   background: var(--accent-hover);
-}
-
-@media (max-width: 720px) {
-  .provider-select { width: 96px; }
-  .model-select { width: 128px; }
-  .thinking-select { width: 78px; }
-}
-
-@media (max-width: 560px) {
-  .composer { padding-left: 10px; padding-right: 10px; }
-  .bar-left { gap: 4px; }
-  .provider-select { width: 82px; }
-  .model-select { width: 108px; }
-  .thinking-select { width: 72px; }
 }
 </style>

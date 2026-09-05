@@ -9,17 +9,16 @@
       </n-button>
     </div>
     <template v-else>
-      <div ref="messagesRef" class="messages">
+      <div ref="messagesRef" class="messages" @scroll="handleScroll">
         <div class="messages-inner">
           <div v-if="messages.length === 0" class="empty-chat">
             <div class="empty-title">开始一段对话</div>
-            <div class="empty-sub">消息将发送给当前选中的 Provider 与模型</div>
+            <div class="empty-sub">消息将发送给当前选中的模型</div>
           </div>
-          <div v-if="notice" class="notice">{{ notice }}</div>
           <MessageItem
-            v-for="message in messages"
-            :key="message.id"
-            :message="message"
+            v-for="msg in messages"
+            :key="msg.id"
+            :message="msg"
           />
         </div>
       </div>
@@ -29,30 +28,57 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, ref, watch } from 'vue'
 import { NButton } from 'naive-ui'
 import { storeToRefs } from 'pinia'
+import { nextTick, ref, watch } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 import { useChatStore } from '../stores/chat'
+import { useSessionsStore } from '../stores/sessions'
 import MessageItem from './MessageItem.vue'
 import Composer from './Composer.vue'
 
-const connection = useConnectionStore()
-const chat = useChatStore()
-const { isConnected } = storeToRefs(connection)
-const { messages, notice } = storeToRefs(chat)
-const messagesRef = ref<HTMLDivElement | null>(null)
+const connectionStore = useConnectionStore()
+const chatStore = useChatStore()
+const sessionsStore = useSessionsStore()
+const { isConnected } = storeToRefs(connectionStore)
+const { messages } = storeToRefs(chatStore)
+const { currentSessionId } = storeToRefs(sessionsStore)
 
-function openConnectDialog(): void {
-  connection.showConnectDialog = true
+const messagesRef = ref<HTMLDivElement | null>(null)
+let stickToBottom = true
+
+function openConnectDialog() {
+  connectionStore.showConnectDialog = true
 }
 
-watch(messages, async () => {
-  await nextTick()
+function handleScroll() {
   const element = messagesRef.value
   if (!element) return
-  element.scrollTop = element.scrollHeight
-}, { deep: true })
+  const distance = element.scrollHeight - element.scrollTop - element.clientHeight
+  stickToBottom = distance < 120
+}
+
+async function scrollToBottomIfNeeded() {
+  if (!stickToBottom) return
+  await nextTick()
+  const element = messagesRef.value
+  if (element) element.scrollTop = element.scrollHeight
+}
+
+watch(currentSessionId, (id) => {
+  stickToBottom = true
+  if (id) {
+    void chatStore.loadMessages(id)
+  } else {
+    chatStore.messages = []
+  }
+})
+
+// deep watch 能捕获 streaming message.content/reasoning 的增量变化。
+// 用户主动向上滚动后不强行抢滚动条；在底部时则跟随“打字机”输出。
+watch(messages, () => {
+  void scrollToBottomIfNeeded()
+}, { deep: true, flush: 'post' })
 </script>
 
 <style scoped>
@@ -123,19 +149,5 @@ watch(messages, async () => {
 .messages-inner {
   max-width: 760px;
   margin: 0 auto;
-}
-
-.notice {
-  margin: 0 0 14px;
-  padding: 8px 12px;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--accent-tint);
-  color: var(--accent-text);
-  font-size: 12px;
-}
-
-@media (max-width: 640px) {
-  .messages { padding-left: 12px; padding-right: 12px; }
 }
 </style>

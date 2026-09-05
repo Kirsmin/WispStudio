@@ -39,7 +39,7 @@ func NewRouter(cfg *config.Config) *Router {
 		messageStore: ms,
 		requestStore: rs,
 	}
-	router.chatHandler = NewChatHandler(cfg, catalog, runs, ss, ms, rs)
+	router.chatHandler = NewChatHandler(cfg, catalog, ss, ms, rs)
 	router.registerRoutes()
 	return router
 }

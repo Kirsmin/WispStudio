@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 )
 
+// MessageType 消息类型
 type MessageType string
 
 const (
@@ -18,6 +19,7 @@ const (
 	MessageTypeAssistant MessageType = "assistant"
 )
 
+// Usage 用量信息
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
@@ -25,12 +27,12 @@ type Usage struct {
 	ReasoningTokens  int `json:"reasoning_tokens"`
 }
 
+// Message 单条消息
 type Message struct {
 	Type       MessageType `json:"type"`
 	ID         string      `json:"id"`
 	TS         string      `json:"ts"`
 	Content    string      `json:"content"`
-	Provider   string      `json:"provider,omitempty"`
 	Model      string      `json:"model,omitempty"`
 	Thinking   string      `json:"thinking,omitempty"`
 	Reasoning  string      `json:"reasoning,omitempty"`
@@ -43,11 +45,11 @@ type Message struct {
 
 type MessageStore struct {
 	dataDir string
-	mu      sync.RWMutex
+	mu      sync.Mutex
 }
 
 func NewMessageStore(dataDir string) *MessageStore {
-	_ = os.MkdirAll(filepath.Join(dataDir, "Sessions"), 0755)
+	_ = os.MkdirAll(dataDir, 0755)
 	return &MessageStore{dataDir: dataDir}
 }
 
@@ -55,63 +57,62 @@ func (s *MessageStore) messagePath(sessionID string) string {
 	return filepath.Join(s.dataDir, "Sessions", sessionID+".jsonl")
 }
 
-func (s *MessageStore) Append(sessionID string, message Message) (*Message, error) {
-	if err := validateSessionID(sessionID); err != nil {
-		return nil, err
-	}
+func (s *MessageStore) ensureDir(sessionID string) error {
+	dir := filepath.Join(s.dataDir, "Sessions")
+	return os.MkdirAll(dir, 0755)
+}
+
+func (s *MessageStore) Append(sessionID string, msg Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if message.ID == "" {
-		message.ID = "m_" + uuid.New().String()
+	if err := s.ensureDir(sessionID); err != nil {
+		return err
 	}
-	if message.TS == "" {
-		message.TS = time.Now().UTC().Format(time.RFC3339Nano)
+	if msg.ID == "" {
+		msg.ID = "m_" + uuid.New().String()
 	}
-	data, err := json.Marshal(message)
+	if msg.TS == "" {
+		msg.TS = time.Now().UTC().Format(time.RFC3339)
+	}
+	data, err := json.Marshal(msg)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	file, err := os.OpenFile(s.messagePath(sessionID), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	path := s.messagePath(sessionID)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	defer file.Close()
-	if _, err := file.Write(append(data, '\n')); err != nil {
-		return nil, err
-	}
-	return &message, nil
+	defer f.Close()
+	_, err = f.WriteString(string(data) + "\n")
+	return err
 }
 
 func (s *MessageStore) List(sessionID string) ([]Message, error) {
-	if err := validateSessionID(sessionID); err != nil {
-		return nil, err
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	file, err := os.Open(s.messagePath(sessionID))
+	path := s.messagePath(sessionID)
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []Message{}, nil
 		}
 		return nil, err
 	}
-	defer file.Close()
+	defer f.Close()
 
-	messages := make([]Message, 0)
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
+	var msgs []Message
+	scanner := bufio.NewScanner(f)
+	const maxLineSize = 64 * 1024 * 1024
+	scanner.Buffer(make([]byte, 64*1024), maxLineSize)
 	for scanner.Scan() {
-		if len(scanner.Bytes()) == 0 {
+		var msg Message
+		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
 			continue
 		}
-		var message Message
-		if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
-			// 单条历史损坏不应该让整个会话打不开。
-			continue
-		}
-		messages = append(messages, message)
+		msgs = append(msgs, msg)
 	}
-	return messages, scanner.Err()
+	return msgs, scanner.Err()
 }

@@ -1,28 +1,33 @@
 <template>
   <div class="message-item" :class="message.type">
     <div class="message-content">
-      <div v-if="message.type === 'assistant' && (message.reasoning || message.status === 'streaming')" class="reasoning-block">
-        <button class="reasoning-toggle" type="button" @click="showReasoning = !showReasoning">
-          <template v-if="message.status === 'streaming' && !message.content">
-            思考中 <span class="thinking-spinner"></span>
-          </template>
-          <template v-else>
-            思考 {{ showReasoning ? '▼' : '▶' }}
-          </template>
+      <div v-if="showReasoningBlock" class="reasoning-block">
+        <button class="reasoning-toggle" type="button" @click="manualToggleReasoning">
+          <span>{{ reasoningLabel }}</span>
+          <span v-if="message.phase === 'reasoning' && message.streaming" class="thinking-spinner" />
+          <span v-else>{{ showReasoning ? '▼' : '▶' }}</span>
         </button>
-        <div v-show="showReasoning" class="reasoning-text">{{ message.reasoning || '思考中…' }}</div>
+        <div v-show="showReasoning" class="reasoning-text">
+          <MarkdownView v-if="message.reasoning" :content="message.reasoning" />
+          <span v-else>思考中…</span>
+        </div>
       </div>
 
-      <MarkdownView v-if="message.content" :content="message.content" />
-      <div v-else-if="message.type === 'assistant' && (message.status === 'streaming' || message.status === 'background') && !message.reasoning" class="thinking-placeholder">
-        <span class="thinking-spinner"></span>
-        {{ message.status === 'background' ? '服务端仍在生成…' : '正在等待模型响应…' }}
+      <div v-if="message.content" class="answer-body">
+        <MarkdownView :content="message.content" />
+      </div>
+      <div
+        v-else-if="message.type === 'assistant' && message.streaming && message.phase === 'waiting'"
+        class="waiting-row"
+      >
+        <span class="thinking-spinner" />
+        <span>等待模型首个响应…</span>
       </div>
 
       <div v-if="message.error" class="error-text">{{ message.error }}</div>
 
       <div v-if="message.type === 'assistant' && message.usage" class="meta">
-        <span v-if="message.provider">{{ message.provider }} / </span>{{ message.model || 'unknown' }}
+        {{ message.model || 'unknown' }}
         · in {{ message.usage.prompt_tokens }}
         · think {{ message.usage.reasoning_tokens ?? 0 }}
         · out {{ message.usage.completion_tokens }}
@@ -35,7 +40,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { ChatMessage } from '../stores/chat'
 import MarkdownView from './MarkdownView.vue'
 
@@ -43,15 +48,42 @@ const props = defineProps<{
   message: ChatMessage
 }>()
 
-const showReasoning = ref(props.message.status === 'streaming')
+const showReasoning = ref(false)
+const manuallyChanged = ref(false)
 
-watch(() => props.message.status, (status) => {
-  if (status === 'streaming') showReasoning.value = true
+const showReasoningBlock = computed(() =>
+  props.message.type === 'assistant' && Boolean(props.message.reasoning || props.message.phase === 'reasoning')
+)
+
+const reasoningLabel = computed(() => {
+  if (props.message.phase === 'reasoning' && props.message.streaming) return '思考中'
+  return '思考'
 })
 
-watch(() => props.message.content, (content) => {
-  if (content && props.message.status === 'streaming') showReasoning.value = false
-})
+function manualToggleReasoning() {
+  manuallyChanged.value = true
+  showReasoning.value = !showReasoning.value
+}
+
+// 自动阶段切换：
+// 1) 收到 reasoning token -> 自动展开；
+// 2) 第一段 answer delta 到达 -> reasoning 阶段结束，自动折叠；
+// 3) 用户手动点过后，不在同一阶段反复抢用户控制权。
+watch(() => props.message.phase, (phase, previous) => {
+  if (phase === 'reasoning') {
+    manuallyChanged.value = false
+    showReasoning.value = true
+    return
+  }
+  if (phase === 'answer' && previous === 'reasoning') {
+    manuallyChanged.value = false
+    showReasoning.value = false
+    return
+  }
+  if ((phase === 'done' || phase === 'error') && !manuallyChanged.value) {
+    showReasoning.value = false
+  }
+}, { immediate: true })
 </script>
 
 <style scoped>
@@ -79,7 +111,7 @@ watch(() => props.message.content, (content) => {
 .message-item.user .message-content {
   background: var(--accent-soft);
   color: var(--text);
-  max-width: min(82%, 680px);
+  white-space: pre-wrap;
 }
 
 .message-item.assistant .message-content {
@@ -96,6 +128,8 @@ watch(() => props.message.content, (content) => {
 .reasoning-toggle {
   border: 0;
   background: transparent;
+  font: inherit;
+  font-size: 12px;
   color: var(--accent-text);
   cursor: pointer;
   user-select: none;
@@ -103,8 +137,6 @@ watch(() => props.message.content, (content) => {
   align-items: center;
   gap: 6px;
   padding: 2px 0;
-  font: inherit;
-  font-size: 12px;
 }
 
 .reasoning-text {
@@ -115,18 +147,26 @@ watch(() => props.message.content, (content) => {
   background: var(--bg-soft);
   border: 1px solid var(--border);
   border-radius: 10px;
-  white-space: pre-wrap;
   max-height: 320px;
   overflow-y: auto;
 }
 
-.thinking-placeholder {
+.reasoning-text :deep(.md) {
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.answer-body {
+  min-height: 1em;
+}
+
+.waiting-row {
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 8px 0;
-  color: var(--text-2);
+  min-height: 24px;
   font-size: 13px;
+  color: var(--text-2);
 }
 
 .thinking-spinner {
@@ -136,7 +176,8 @@ watch(() => props.message.content, (content) => {
   border: 2px solid var(--border-strong);
   border-top-color: var(--accent);
   border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+  animation: spin .75s linear infinite;
+  flex: 0 0 auto;
 }
 
 @keyframes spin {
@@ -147,7 +188,7 @@ watch(() => props.message.content, (content) => {
   margin-top: 8px;
   padding: 8px 10px;
   border-radius: 8px;
-  background: rgba(224, 69, 90, 0.07);
+  background: rgba(224, 69, 90, .07);
   color: var(--error);
   font-size: 12px;
   white-space: pre-wrap;
