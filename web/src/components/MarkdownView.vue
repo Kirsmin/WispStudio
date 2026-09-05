@@ -1,0 +1,3 @@
+<template><MdPreview :id="id" :model-value="content" preview-theme="github" code-theme="github" :sanitize="sanitize" :no-mermaid="false" :no-echarts="false" /></template>
+<script setup lang="ts">import { MdPreview } from 'md-editor-v3';import DOMPurify from 'dompurify';import 'md-editor-v3/lib/preview.css';defineProps<{content:string}>();const id='md-'+Math.random().toString(36).slice(2);const sanitize=(html:string)=>DOMPurify.sanitize(html)</script>
+<style scoped>:deep(.md-editor-preview-wrapper){padding:0}:deep(.md-editor-preview){font-size:14px;line-height:1.72;background:transparent}</style>

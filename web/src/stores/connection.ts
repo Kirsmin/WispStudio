@@ -1,0 +1,7 @@
+import { defineStore } from 'pinia';import { computed,ref } from 'vue'
+export interface ModelInfo{key:string;id:string;name:string;provider_id:string;provider_name:string;default:boolean;thinking_levels:string[];thinking_style:string}
+export const useConnectionStore=defineStore('connection',()=>{const serverUrl=ref(localStorage.getItem('serverUrl')||location.origin);const connected=ref(false);const latency=ref(0);const models=ref<ModelInfo[]>([]);let timer:number|undefined
+async function ping(){const start=performance.now();const r=await fetch(`${serverUrl.value}/api/health`,{cache:'no-store'});if(!r.ok)throw new Error('health');latency.value=Math.round(performance.now()-start);connected.value=true}
+async function refreshModels(){const r=await fetch(`${serverUrl.value}/api/models`,{cache:'no-store'});if(!r.ok)throw new Error(`获取模型失败 ${r.status}`);models.value=await r.json()}
+async function connect(url=serverUrl.value){serverUrl.value=url.replace(/\/+$/,'');localStorage.setItem('serverUrl',serverUrl.value);try{await ping();await refreshModels();if(timer)clearInterval(timer);timer=window.setInterval(()=>void ping().catch(()=>connected.value=false),3000);return true}catch{connected.value=false;return false}}
+const defaultModelKey=computed(()=>models.value.find(m=>m.default)?.key||models.value[0]?.key||'');return{serverUrl,connected,latency,models,defaultModelKey,connect,refreshModels}})

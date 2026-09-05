@@ -1,207 +1,346 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
-	"io/fs"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
 	"wisp/internal/config"
+	"wisp/internal/openai"
 	"wisp/internal/provider"
 	"wisp/internal/store"
-	webassets "wisp/web"
 )
 
 type Router struct {
 	cfg       *config.Config
 	mux       *http.ServeMux
-	sessions  *store.SessionStore
-	messages  *store.MessageStore
-	requests  *store.RequestStore
+	store     *store.Store
 	providers *provider.Client
-	chat      *ChatHandler
 	modelsMu  sync.RWMutex
 	models    []provider.ModelInfo
+	client    *openai.Client
+	runsMu    sync.Mutex
+	runs      map[string]context.CancelFunc
 }
 
 func NewRouter(cfg *config.Config) *Router {
-	sessions := store.NewSessionStore(cfg.Storage.DataDir)
-	messages := store.NewMessageStore(cfg.Storage.DataDir)
-	requests := store.NewRequestStore(cfg.Storage.DataDir)
-	providers := provider.NewClient()
-	models := providers.FetchModels(cfg.Providers, cfg.OpenAI, cfg.Models)
-	r := &Router{
-		cfg: cfg, mux: http.NewServeMux(), sessions: sessions, messages: messages,
-		requests: requests, providers: providers, models: models,
-	}
-	r.chat = NewChatHandler(cfg, sessions, messages, requests, models)
-	r.register()
+	pc := provider.NewClient()
+	models := pc.FetchModels(cfg.Providers, cfg.OpenAI, cfg.Models)
+	r := &Router{cfg: cfg, mux: http.NewServeMux(), store: store.New(cfg.Storage.DataDir), providers: pc, models: models, client: openai.NewClient(&cfg.OpenAI), runs: map[string]context.CancelFunc{}}
+	r.routes()
 	return r
 }
-
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) { r.mux.ServeHTTP(w, req) }
-
-func (r *Router) register() {
-	r.mux.HandleFunc("/api/health", cors(r.handleHealth))
-	r.mux.HandleFunc("/api/models", cors(r.handleModels))
-	r.mux.HandleFunc("/api/sessions", cors(r.handleSessions))
-	r.mux.HandleFunc("/api/sessions/{id}", cors(r.handleSession))
-	r.mux.HandleFunc("/api/sessions/{id}/messages", cors(r.handleMessages))
-	r.mux.HandleFunc("/api/sessions/{id}/chat", cors(r.chat.HandleChat))
-	r.mux.HandleFunc("/api/sessions/{id}/chat/status", cors(r.handleChatStatus))
-	r.mux.HandleFunc("/api/sessions/{id}/chat/cancel", cors(r.handleChatCancel))
-
-	staticFS, err := fs.Sub(webassets.Static, "static")
-	if err != nil {
-		panic(err)
-	}
-	files := http.FileServer(http.FS(staticFS))
-	r.mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		if strings.HasPrefix(req.URL.Path, "/api/") {
-			http.NotFound(w, req)
-			return
-		}
-		files.ServeHTTP(w, req)
-	})
+func (r *Router) routes() {
+	r.mux.HandleFunc("/api/health", r.health)
+	r.mux.HandleFunc("/api/models", r.handleModels)
+	r.mux.HandleFunc("/api/sessions", r.sessions)
+	r.mux.HandleFunc("/api/sessions/{id}", r.session)
+	r.mux.HandleFunc("/api/sessions/{id}/messages", r.messages)
+	r.mux.HandleFunc("/api/sessions/{id}/chat", r.chat)
+	r.mux.HandleFunc("/api/sessions/{id}/chat/status", r.status)
+	r.mux.HandleFunc("/api/sessions/{id}/chat/cancel", r.cancel)
+	r.mux.HandleFunc("/", r.web)
 }
-
-func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodGet {
+func jsonOut(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+func (r *Router) health(w http.ResponseWriter, q *http.Request) {
+	if q.Method != "GET" {
 		http.Error(w, "方法不允许", 405)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "ts": time.Now().UTC().Format(time.RFC3339)})
+	jsonOut(w, 200, map[string]any{"ok": true, "time": time.Now().UnixMilli()})
 }
-
-func (r *Router) handleModels(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodGet {
+func (r *Router) handleModels(w http.ResponseWriter, q *http.Request) {
+	if q.Method != "GET" {
 		http.Error(w, "方法不允许", 405)
 		return
 	}
-	fresh := r.providers.FetchModels(r.cfg.Providers, r.cfg.OpenAI, r.cfg.Models)
-	if len(fresh) > 0 {
+	m := r.providers.FetchModels(r.cfg.Providers, r.cfg.OpenAI, r.cfg.Models)
+	if len(m) > 0 {
 		r.modelsMu.Lock()
-		r.models = fresh
+		r.models = m
 		r.modelsMu.Unlock()
-		r.chat.SetModels(fresh)
 	}
 	r.modelsMu.RLock()
-	models := append([]provider.ModelInfo(nil), r.models...)
-	r.modelsMu.RUnlock()
-	writeJSON(w, 200, models)
+	defer r.modelsMu.RUnlock()
+	jsonOut(w, 200, r.models)
 }
-
-func (r *Router) handleSessions(w http.ResponseWriter, req *http.Request) {
-	switch req.Method {
-	case http.MethodGet:
-		list, err := r.sessions.List()
-		if err != nil {
-			writeJSONError(w, 500, err.Error())
+func (r *Router) sessions(w http.ResponseWriter, q *http.Request) {
+	switch q.Method {
+	case "GET":
+		v, e := r.store.ListSessions()
+		if e != nil {
+			http.Error(w, e.Error(), 500)
 			return
 		}
-		w.Header().Set("Cache-Control", "no-store")
-		writeJSON(w, 200, list)
-	case http.MethodPost:
-		var body struct {
+		jsonOut(w, 200, v)
+	case "POST":
+		var b struct {
 			Title string `json:"title"`
 		}
-		_ = json.NewDecoder(http.MaxBytesReader(w, req.Body, 128<<10)).Decode(&body)
-		session, err := r.sessions.Create(body.Title)
-		if err != nil {
-			writeJSONError(w, 500, err.Error())
+		_ = json.NewDecoder(q.Body).Decode(&b)
+		v, e := r.store.CreateSession(b.Title)
+		if e != nil {
+			http.Error(w, e.Error(), 500)
 			return
 		}
-		writeJSON(w, http.StatusCreated, session)
+		jsonOut(w, 201, v)
 	default:
 		http.Error(w, "方法不允许", 405)
 	}
 }
-
-func (r *Router) handleSession(w http.ResponseWriter, req *http.Request) {
-	id := req.PathValue("id")
-	switch req.Method {
-	case http.MethodPatch:
-		var body struct {
+func (r *Router) session(w http.ResponseWriter, q *http.Request) {
+	id := q.PathValue("id")
+	switch q.Method {
+	case "PATCH":
+		var b struct {
 			Title string `json:"title"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 128<<10)).Decode(&body); err != nil {
-			writeJSONError(w, 400, "请求体解析失败")
+		if json.NewDecoder(q.Body).Decode(&b) != nil {
+			http.Error(w, "请求错误", 400)
 			return
 		}
-		if strings.TrimSpace(body.Title) == "" {
-			writeJSONError(w, 400, "标题不能为空")
+		if e := r.store.Rename(id, b.Title); e != nil {
+			http.Error(w, e.Error(), 404)
 			return
 		}
-		if err := r.sessions.UpdateTitle(id, body.Title); err != nil {
-			writeJSONError(w, 404, err.Error())
+		w.WriteHeader(204)
+	case "DELETE":
+		if r.running(id) {
+			http.Error(w, "生成中不能删除", 409)
 			return
 		}
-		w.WriteHeader(http.StatusNoContent)
-	case http.MethodDelete:
-		if r.chat.IsRunning(id) {
-			writeJSONError(w, 409, "会话正在生成，请先停止")
+		if e := r.store.Delete(id); e != nil {
+			http.Error(w, e.Error(), 404)
 			return
 		}
-		if err := r.sessions.Delete(id); err != nil {
-			writeJSONError(w, 404, err.Error())
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
+		w.WriteHeader(204)
 	default:
 		http.Error(w, "方法不允许", 405)
 	}
 }
-
-func (r *Router) handleMessages(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodGet {
+func (r *Router) messages(w http.ResponseWriter, q *http.Request) {
+	if q.Method != "GET" {
 		http.Error(w, "方法不允许", 405)
 		return
 	}
-	if _, err := r.sessions.Get(req.PathValue("id")); err != nil {
-		writeJSONError(w, 404, "会话不存在")
-		return
-	}
-	messages, err := r.messages.List(req.PathValue("id"))
-	if err != nil {
-		writeJSONError(w, 500, err.Error())
+	v, e := r.store.Messages(q.PathValue("id"))
+	if e != nil {
+		http.Error(w, e.Error(), 500)
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, 200, messages)
+	jsonOut(w, 200, v)
 }
-
-func (r *Router) handleChatStatus(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodGet {
+func (r *Router) findModel(key string) *provider.ModelInfo {
+	r.modelsMu.RLock()
+	defer r.modelsMu.RUnlock()
+	return provider.FindByKey(r.models, key)
+}
+func (r *Router) chat(w http.ResponseWriter, q *http.Request) {
+	if q.Method != "POST" {
 		http.Error(w, "方法不允许", 405)
 		return
 	}
-	writeJSON(w, 200, map[string]bool{"active": r.chat.IsRunning(req.PathValue("id"))})
-}
-func (r *Router) handleChatCancel(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
-		http.Error(w, "方法不允许", 405)
+	id := q.PathValue("id")
+	var b struct {
+		Message  string `json:"message"`
+		ModelKey string `json:"model_key"`
+		Thinking string `json:"thinking"`
+	}
+	if json.NewDecoder(io.LimitReader(q.Body, 2<<20)).Decode(&b) != nil || strings.TrimSpace(b.Message) == "" {
+		http.Error(w, "消息不能为空", 400)
 		return
 	}
-	writeJSON(w, 200, map[string]bool{"cancelled": r.chat.Cancel(req.PathValue("id"))})
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
-}
-
-func cors(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept")
-		if req.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
+	m := r.findModel(b.ModelKey)
+	if m == nil {
+		http.Error(w, "模型不存在，请刷新模型列表", 400)
+		return
+	}
+	if e := provider.ValidateThinking(*m, b.Thinking); e != nil {
+		http.Error(w, e.Error(), 400)
+		return
+	}
+	if _, e := r.store.GetSession(id); e != nil {
+		http.Error(w, e.Error(), 404)
+		return
+	}
+	ctx, ok := r.begin(id)
+	if !ok {
+		http.Error(w, "该会话正在生成", 409)
+		return
+	}
+	defer r.end(id)
+	hist, e := r.store.Messages(id)
+	if e != nil {
+		http.Error(w, e.Error(), 500)
+		return
+	}
+	msgs := make([]openai.ChatMessage, 0, len(hist)+1)
+	for _, x := range hist {
+		role := "user"
+		if x.Type == "assistant" {
+			role = "assistant"
 		}
-		next(w, req)
+		msgs = append(msgs, openai.ChatMessage{Role: role, Content: x.Content})
 	}
+	msgs = append(msgs, openai.ChatMessage{Role: "user", Content: b.Message})
+	user, _ := r.store.AppendMessage(id, store.Message{Type: "user", Content: b.Message, Model: m.ID, Provider: m.ProviderName, Thinking: b.Thinking})
+	_ = r.store.Touch(id, store.Title(b.Message), m.Key)
+	sse, ok := NewSSE(w)
+	if !ok {
+		return
+	}
+	sse.Event("ack", must(map[string]any{"message": user}))
+	req, e := r.client.BuildRequest(m.BaseURL, m.APIKey, m.ID, m.ThinkingStyle, b.Thinking, msgs)
+	if e != nil {
+		r.finishError(id, m, b.Thinking, sse, e.Error(), 0)
+		return
+	}
+	if req.GetBody != nil {
+		if rc, er := req.GetBody(); er == nil {
+			raw, _ := io.ReadAll(rc)
+			_ = rc.Close()
+			r.store.WriteRequest(id, map[string]any{"type": "request", "ts": time.Now().UTC(), "provider": m.ProviderName, "url": req.URL.String(), "body": json.RawMessage(raw)})
+		}
+	}
+	start := time.Now()
+	resp, e := r.client.DoStream(ctx, req)
+	if e != nil {
+		r.finishError(id, m, b.Thinking, sse, e.Error(), int(time.Since(start).Milliseconds()))
+		return
+	}
+	defer resp.Body.Close()
+	events := make(chan openai.StreamEvent, 32)
+	go openai.NewStreamReader(resp.Body).ReadEvents(events)
+	var content, reasoning, finish, errText string
+	var usage *openai.Usage
+	ttft := 0
+	for ev := range events {
+		switch ev.Type {
+		case "delta":
+			if ttft == 0 {
+				ttft = int(time.Since(start).Milliseconds())
+				sse.Event("ttft", must(map[string]int{"ms": ttft}))
+			}
+			content += ev.Text
+			sse.Event("delta", must(map[string]string{"text": ev.Text}))
+		case "reasoning":
+			if ttft == 0 {
+				ttft = int(time.Since(start).Milliseconds())
+				sse.Event("ttft", must(map[string]int{"ms": ttft}))
+			}
+			reasoning += ev.Text
+			sse.Event("reasoning", must(map[string]string{"text": ev.Text}))
+		case "usage":
+			usage = ev.Usage
+			sse.Event("usage", must(ev.Usage))
+		case "error":
+			errText = ev.Error
+			finish = "error"
+			sse.Event("error", must(map[string]string{"message": ev.Error}))
+		case "done":
+			if finish == "" {
+				finish = ev.Finish
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		finish = "aborted"
+		errText = "生成已停止"
+	}
+	if finish == "" {
+		finish = "stop"
+	}
+	dur := int(time.Since(start).Milliseconds())
+	su := toStoreUsage(usage)
+	assistant, pe := r.store.AppendMessage(id, store.Message{Type: "assistant", Content: content, Reasoning: reasoning, Model: m.ID, Provider: m.ProviderName, Thinking: b.Thinking, Usage: su, DurationMs: dur, TTFTMs: ttft, Finish: finish, Error: errText})
+	_ = r.store.Touch(id, "", m.Key)
+	sse.Event("done", must(map[string]any{"finish": finish, "duration_ms": dur, "ttft_ms": ttft, "persisted": pe == nil, "message_id": func() string {
+		if assistant != nil {
+			return assistant.ID
+		}
+		return ""
+	}()}))
+}
+func (r *Router) finishError(id string, m *provider.ModelInfo, thinking string, s *SSE, msg string, dur int) {
+	a, e := r.store.AppendMessage(id, store.Message{Type: "assistant", Model: m.ID, Provider: m.ProviderName, Thinking: thinking, Finish: "error", Error: msg, DurationMs: dur})
+	s.Event("error", must(map[string]string{"message": msg}))
+	s.Event("done", must(map[string]any{"finish": "error", "persisted": e == nil, "message_id": func() string {
+		if a != nil {
+			return a.ID
+		}
+		return ""
+	}()}))
+}
+func toStoreUsage(u *openai.Usage) *store.Usage {
+	if u == nil {
+		return nil
+	}
+	return &store.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, CachedTokens: u.CachedTokens, ReasoningTokens: u.ReasoningTokens}
+}
+func must(v any) string { b, _ := json.Marshal(v); return string(b) }
+func (r *Router) begin(id string) (context.Context, bool) {
+	r.runsMu.Lock()
+	defer r.runsMu.Unlock()
+	if _, ok := r.runs[id]; ok {
+		return nil, false
+	}
+	ctx, c := context.WithCancel(context.Background())
+	r.runs[id] = c
+	return ctx, true
+}
+func (r *Router) end(id string) { r.runsMu.Lock(); delete(r.runs, id); r.runsMu.Unlock() }
+func (r *Router) running(id string) bool {
+	r.runsMu.Lock()
+	defer r.runsMu.Unlock()
+	_, ok := r.runs[id]
+	return ok
+}
+func (r *Router) status(w http.ResponseWriter, q *http.Request) {
+	jsonOut(w, 200, map[string]bool{"active": r.running(q.PathValue("id"))})
+}
+func (r *Router) cancel(w http.ResponseWriter, q *http.Request) {
+	if q.Method != "POST" {
+		http.Error(w, "方法不允许", 405)
+		return
+	}
+	id := q.PathValue("id")
+	r.runsMu.Lock()
+	c, ok := r.runs[id]
+	if ok {
+		c()
+	}
+	r.runsMu.Unlock()
+	jsonOut(w, 200, map[string]bool{"cancelled": ok})
+}
+func (r *Router) web(w http.ResponseWriter, q *http.Request) {
+	if strings.HasPrefix(q.URL.Path, "/api/") {
+		http.NotFound(w, q)
+		return
+	}
+	dist := "web/dist"
+	path := filepath.Join(dist, filepath.Clean(q.URL.Path))
+	if q.URL.Path == "/" {
+		path = filepath.Join(dist, "index.html")
+	}
+	if st, e := os.Stat(path); e == nil && !st.IsDir() {
+		http.ServeFile(w, q, path)
+		return
+	}
+	index := filepath.Join(dist, "index.html")
+	if _, e := os.Stat(index); e != nil {
+		http.Error(w, "前端尚未构建：请先执行 cd web && npm install && npm run build", 503)
+		return
+	}
+	http.ServeFile(w, q, index)
 }
