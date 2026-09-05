@@ -92,7 +92,7 @@ func (s *MessageStore) List(sessionID string) ([]Message, error) {
 	defer file.Close()
 	result := make([]Message, 0)
 	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
 	for scanner.Scan() {
 		if len(scanner.Bytes()) == 0 {
 			continue
@@ -109,11 +109,11 @@ func (s *MessageStore) List(sessionID string) ([]Message, error) {
 	return result, nil
 }
 
-func validateSessionID(sessionID string) error {
-	if sessionID == "" || strings.Contains(sessionID, "..") || strings.ContainsAny(sessionID, "/\\") {
+func (s *MessageStore) path(sessionID string) string { return filepath.Join(s.dir, sessionID+".jsonl") }
+
+func validateSessionID(id string) error {
+	if id == "" || strings.Contains(id, "..") || strings.ContainsAny(id, "/\\") {
 		return errors.New("非法会话ID")
 	}
 	return nil
 }
-
-func (s *MessageStore) path(sessionID string) string { return filepath.Join(s.dir, sessionID+".jsonl") }

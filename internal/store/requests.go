@@ -19,8 +19,11 @@ func NewRequestStore(dataDir string) *RequestStore {
 	return &RequestStore{dir: dir}
 }
 
-func (s *RequestStore) WriteRequest(sessionID, method, url, raw string) {
-	s.write(sessionID, map[string]any{"type": "request", "method": method, "url": url, "body": raw})
+func (s *RequestStore) WriteRequest(sessionID, method, url, body string) {
+	s.write(sessionID, map[string]any{"type": "request", "method": method, "url": url, "body": body})
+}
+func (s *RequestStore) WriteDone(sessionID, finish string, usage map[string]int) {
+	s.write(sessionID, map[string]any{"type": "done", "finish": finish, "usage": usage})
 }
 func (s *RequestStore) WriteError(sessionID, message string) {
 	s.write(sessionID, map[string]any{"type": "error", "error": message})
@@ -28,9 +31,7 @@ func (s *RequestStore) WriteError(sessionID, message string) {
 func (s *RequestStore) WriteAborted(sessionID string) {
 	s.write(sessionID, map[string]any{"type": "aborted"})
 }
-func (s *RequestStore) WriteDone(sessionID string, usage map[string]int, finish string) {
-	s.write(sessionID, map[string]any{"type": "done", "usage": usage, "finish": finish})
-}
+
 func (s *RequestStore) write(sessionID string, payload map[string]any) {
 	if validateSessionID(sessionID) != nil {
 		return

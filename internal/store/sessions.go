@@ -43,6 +43,9 @@ func (s *SessionStore) List() ([]Session, error) {
 }
 
 func (s *SessionStore) Get(id string) (*Session, error) {
+	if err := validateSessionID(id); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	list, err := s.readLocked()
@@ -97,11 +100,12 @@ func (s *SessionStore) UpdateModel(id, model string) error {
 	return s.update(id, func(session *Session) { session.Model = model })
 }
 
-func (s *SessionStore) Touch(id string) error {
-	return s.update(id, func(_ *Session) {})
-}
+func (s *SessionStore) Touch(id string) error { return s.update(id, func(*Session) {}) }
 
 func (s *SessionStore) update(id string, mutate func(*Session)) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	list, err := s.readLocked()
@@ -120,14 +124,17 @@ func (s *SessionStore) update(id string, mutate func(*Session)) error {
 }
 
 func (s *SessionStore) Delete(id string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	list, err := s.readLocked()
 	if err != nil {
 		return err
 	}
+	filtered := make([]Session, 0, len(list))
 	found := false
-	filtered := list[:0]
 	for _, session := range list {
 		if session.ID == id {
 			found = true
@@ -178,12 +185,12 @@ func (s *SessionStore) writeLocked(list []Session) error {
 
 func GenerateTitle(message string) string {
 	message = strings.TrimSpace(strings.Join(strings.Fields(message), " "))
+	if message == "" {
+		return "新会话"
+	}
 	runes := []rune(message)
 	if len(runes) > 28 {
 		return string(runes[:28]) + "…"
-	}
-	if message == "" {
-		return "新会话"
 	}
 	return message
 }

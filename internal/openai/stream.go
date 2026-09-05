@@ -8,6 +8,13 @@ import (
 	"strings"
 )
 
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	CachedTokens     int `json:"cached_tokens"`
+	ReasoningTokens  int `json:"reasoning_tokens"`
+}
+
 type StreamEvent struct {
 	Type   string
 	Text   string
@@ -16,23 +23,18 @@ type StreamEvent struct {
 	Error  string
 }
 
-type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	CachedTokens     int `json:"cached_tokens"`
-	ReasoningTokens  int `json:"reasoning_tokens"`
+type StreamReader struct {
+	scanner *bufio.Scanner
 }
-
-type StreamReader struct{ scanner *bufio.Scanner }
 
 func NewStreamReader(r io.Reader) *StreamReader {
 	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
 	return &StreamReader{scanner: scanner}
 }
 
-func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
-	defer close(ch)
+func (sr *StreamReader) ReadEvents(out chan<- StreamEvent) {
+	defer close(out)
 	finish := ""
 	for sr.scanner.Scan() {
 		line := strings.TrimSuffix(sr.scanner.Text(), "\r")
@@ -49,78 +51,79 @@ func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 
 		var chunk streamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			// 某些兼容网关会在 SSE 中返回 JSON 错误对象。
-			var upstreamErr struct {
-				Error   any    `json:"error"`
-				Message string `json:"message"`
-			}
-			if json.Unmarshal([]byte(data), &upstreamErr) == nil && (upstreamErr.Error != nil || upstreamErr.Message != "") {
-				ch <- StreamEvent{Type: "error", Error: firstNonEmpty(upstreamErr.Message, fmt.Sprint(upstreamErr.Error))}
-				finish = "error"
-			}
-			continue
-		}
-		if chunk.Error != nil {
-			ch <- StreamEvent{Type: "error", Error: errorMessage(chunk.Error)}
+			out <- StreamEvent{Type: "error", Error: "无法解析上游流数据: " + err.Error()}
 			finish = "error"
 			continue
 		}
+		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			out <- StreamEvent{Type: "error", Error: parseError(chunk.Error)}
+			finish = "error"
+			continue
+		}
+
 		for _, choice := range chunk.Choices {
 			if text := rawText(choice.Delta.Content); text != "" {
-				ch <- StreamEvent{Type: "delta", Text: text}
+				out <- StreamEvent{Type: "delta", Text: text}
 			}
-			reasoning := firstNonEmpty(choice.Delta.ReasoningContent, choice.Delta.Reasoning, choice.Delta.Thinking, choice.Delta.Analysis)
+			reasoning := firstNonEmpty(
+				rawText(choice.Delta.ReasoningContent),
+				rawText(choice.Delta.Reasoning),
+				rawText(choice.Delta.Thinking),
+				rawText(choice.Delta.Analysis),
+			)
 			if reasoning != "" {
-				ch <- StreamEvent{Type: "reasoning", Text: reasoning}
+				out <- StreamEvent{Type: "reasoning", Text: reasoning}
 			}
 			if choice.FinishReason != nil && *choice.FinishReason != "" {
 				finish = *choice.FinishReason
 			}
 		}
+
 		if chunk.Usage != nil {
-			u := &Usage{PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens, ReasoningTokens: chunk.Usage.ReasoningTokens}
+			u := &Usage{PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens}
+			u.ReasoningTokens = chunk.Usage.ReasoningTokens
 			if chunk.Usage.PromptTokensDetails != nil {
 				u.CachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
 			}
 			if chunk.Usage.CompletionTokensDetails != nil && chunk.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
 				u.ReasoningTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
 			}
-			ch <- StreamEvent{Type: "usage", Usage: u}
+			out <- StreamEvent{Type: "usage", Usage: u}
 		}
 	}
 	if err := sr.scanner.Err(); err != nil {
-		ch <- StreamEvent{Type: "error", Error: fmt.Sprintf("读取流失败: %v", err)}
+		out <- StreamEvent{Type: "error", Error: fmt.Sprintf("读取上游流失败: %v", err)}
 		return
 	}
 	if finish == "" {
 		finish = "stop"
 	}
-	ch <- StreamEvent{Type: "done", Finish: finish}
+	out <- StreamEvent{Type: "done", Finish: finish}
 }
 
 type streamChunk struct {
 	Choices []struct {
 		Delta struct {
 			Content          json.RawMessage `json:"content"`
-			ReasoningContent string          `json:"reasoning_content"`
-			Reasoning        string          `json:"reasoning"`
-			Thinking         string          `json:"thinking"`
-			Analysis         string          `json:"analysis"`
+			ReasoningContent json.RawMessage `json:"reasoning_content"`
+			Reasoning        json.RawMessage `json:"reasoning"`
+			Thinking         json.RawMessage `json:"thinking"`
+			Analysis         json.RawMessage `json:"analysis"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens            int `json:"prompt_tokens"`
-		CompletionTokens        int `json:"completion_tokens"`
-		ReasoningTokens         int `json:"reasoning_tokens"`
-		CompletionTokensDetails *struct {
-			ReasoningTokens int `json:"reasoning_tokens"`
-		} `json:"completion_tokens_details"`
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
+		ReasoningTokens     int `json:"reasoning_tokens"`
 		PromptTokensDetails *struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details"`
+		CompletionTokensDetails *struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
-	Error any `json:"error"`
+	Error json.RawMessage `json:"error"`
 }
 
 func rawText(raw json.RawMessage) string {
@@ -146,16 +149,23 @@ func rawText(raw json.RawMessage) string {
 	return ""
 }
 
-func errorMessage(value any) string {
-	if value == nil {
-		return "上游流返回错误"
-	}
-	if object, ok := value.(map[string]any); ok {
-		if message, ok := object["message"].(string); ok {
-			return message
+func parseError(raw json.RawMessage) string {
+	var object map[string]any
+	if json.Unmarshal(raw, &object) == nil {
+		if msg, ok := object["message"].(string); ok {
+			return msg
+		}
+		if inner, ok := object["error"].(map[string]any); ok {
+			if msg, ok := inner["message"].(string); ok {
+				return msg
+			}
 		}
 	}
-	return fmt.Sprint(value)
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	return strings.TrimSpace(string(raw))
 }
 
 func firstNonEmpty(values ...string) string {

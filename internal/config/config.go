@@ -12,12 +12,17 @@ type ServerConfig struct {
 	Host string
 	Port int
 }
-type StorageConfig struct{ DataDir string }
+
+type StorageConfig struct {
+	DataDir string
+}
+
 type OpenAIConfig struct {
 	BaseURL    string
 	APIKey     string
 	TimeoutSec int
 }
+
 type ModelConfig struct {
 	ID             string
 	Name           string
@@ -27,6 +32,7 @@ type ModelConfig struct {
 	BaseURL        string
 	APIKey         string
 }
+
 type ModelOverrideConfig struct {
 	ID             string
 	Name           string
@@ -34,6 +40,7 @@ type ModelOverrideConfig struct {
 	ThinkingLevels []string
 	ThinkingStyle  string
 }
+
 type ProviderConfig struct {
 	Name           string
 	BaseURL        string
@@ -43,6 +50,7 @@ type ProviderConfig struct {
 	ThinkingStyle  string
 	ModelOverrides []ModelOverrideConfig
 }
+
 type Config struct {
 	Server    ServerConfig
 	Storage   StorageConfig
@@ -57,12 +65,15 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)
 	}
 	defer file.Close()
+
 	cfg := &Config{}
 	section := ""
 	var currentModel *ModelConfig
 	var currentProvider *ProviderConfig
 	var currentOverride *ModelOverrideConfig
+
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
 	lineNo := 0
 	for scanner.Scan() {
 		lineNo++
@@ -70,48 +81,46 @@ func Load(path string) (*Config, error) {
 		if line == "" {
 			continue
 		}
+
 		switch line {
 		case "[server]", "[storage]", "[openai]":
 			section = strings.Trim(line, "[]")
-			currentModel = nil
-			currentProvider = nil
-			currentOverride = nil
+			currentModel, currentProvider, currentOverride = nil, nil, nil
 			continue
 		case "[[models]]":
 			cfg.Models = append(cfg.Models, ModelConfig{})
 			currentModel = &cfg.Models[len(cfg.Models)-1]
-			currentProvider = nil
-			currentOverride = nil
+			currentProvider, currentOverride = nil, nil
 			section = "model"
 			continue
 		case "[[providers]]":
 			cfg.Providers = append(cfg.Providers, ProviderConfig{})
 			currentProvider = &cfg.Providers[len(cfg.Providers)-1]
-			currentModel = nil
-			currentOverride = nil
+			currentModel, currentOverride = nil, nil
 			section = "provider"
 			continue
 		case "[[providers.model_overrides]]":
 			if currentProvider == nil {
-				return nil, fmt.Errorf("第 %d 行: model_overrides 必须位于某个 [[providers]] 之后", lineNo)
+				return nil, fmt.Errorf("第 %d 行: model_overrides 必须位于对应 [[providers]] 之后", lineNo)
 			}
 			currentProvider.ModelOverrides = append(currentProvider.ModelOverrides, ModelOverrideConfig{})
 			currentOverride = &currentProvider.ModelOverrides[len(currentProvider.ModelOverrides)-1]
 			section = "override"
 			continue
 		}
+
 		key, raw, ok := strings.Cut(line, "=")
 		if !ok {
 			return nil, fmt.Errorf("第 %d 行: 无法解析配置项", lineNo)
 		}
-		key, raw = strings.TrimSpace(key), strings.TrimSpace(raw)
-		if err := assign(cfg, section, currentModel, currentProvider, currentOverride, key, raw); err != nil {
+		if err := assign(cfg, section, currentModel, currentProvider, currentOverride, strings.TrimSpace(key), strings.TrimSpace(raw)); err != nil {
 			return nil, fmt.Errorf("第 %d 行: %w", lineNo, err)
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
+
 	if cfg.Server.Host == "" {
 		cfg.Server.Host = "127.0.0.1"
 	}
@@ -121,47 +130,48 @@ func Load(path string) (*Config, error) {
 	if cfg.Storage.DataDir == "" {
 		cfg.Storage.DataDir = "Data"
 	}
-	if cfg.OpenAI.TimeoutSec == 0 {
+	if cfg.OpenAI.TimeoutSec <= 0 {
 		cfg.OpenAI.TimeoutSec = 120
 	}
 	return cfg, nil
 }
 
 func assign(cfg *Config, section string, model *ModelConfig, provider *ProviderConfig, override *ModelOverrideConfig, key, raw string) error {
-	stringValue := func() (string, error) { return parseString(raw) }
-	boolValue := func() (bool, error) { return strconv.ParseBool(raw) }
-	intValue := func() (int, error) { return strconv.Atoi(raw) }
-	arrayValue := func() ([]string, error) { return parseStringArray(raw) }
+	str := func() (string, error) { return parseString(raw) }
+	boolean := func() (bool, error) { return strconv.ParseBool(raw) }
+	integer := func() (int, error) { return strconv.Atoi(raw) }
+	array := func() ([]string, error) { return parseStringArray(raw) }
+
 	switch section {
 	case "server":
 		switch key {
 		case "host":
-			v, e := stringValue()
+			v, e := str()
 			cfg.Server.Host = v
 			return e
 		case "port":
-			v, e := intValue()
+			v, e := integer()
 			cfg.Server.Port = v
 			return e
 		}
 	case "storage":
 		if key == "data_dir" {
-			v, e := stringValue()
+			v, e := str()
 			cfg.Storage.DataDir = v
 			return e
 		}
 	case "openai":
 		switch key {
 		case "base_url":
-			v, e := stringValue()
+			v, e := str()
 			cfg.OpenAI.BaseURL = v
 			return e
 		case "api_key":
-			v, e := stringValue()
+			v, e := str()
 			cfg.OpenAI.APIKey = v
 			return e
 		case "timeout_sec":
-			v, e := intValue()
+			v, e := integer()
 			cfg.OpenAI.TimeoutSec = v
 			return e
 		}
@@ -171,31 +181,31 @@ func assign(cfg *Config, section string, model *ModelConfig, provider *ProviderC
 		}
 		switch key {
 		case "id":
-			v, e := stringValue()
+			v, e := str()
 			model.ID = v
 			return e
 		case "name":
-			v, e := stringValue()
+			v, e := str()
 			model.Name = v
 			return e
 		case "default":
-			v, e := boolValue()
+			v, e := boolean()
 			model.Default = v
 			return e
 		case "thinking_levels":
-			v, e := arrayValue()
+			v, e := array()
 			model.ThinkingLevels = v
 			return e
 		case "thinking_style":
-			v, e := stringValue()
+			v, e := str()
 			model.ThinkingStyle = v
 			return e
 		case "base_url":
-			v, e := stringValue()
+			v, e := str()
 			model.BaseURL = v
 			return e
 		case "api_key":
-			v, e := stringValue()
+			v, e := str()
 			model.APIKey = v
 			return e
 		}
@@ -205,27 +215,27 @@ func assign(cfg *Config, section string, model *ModelConfig, provider *ProviderC
 		}
 		switch key {
 		case "name":
-			v, e := stringValue()
+			v, e := str()
 			provider.Name = v
 			return e
 		case "base_url":
-			v, e := stringValue()
+			v, e := str()
 			provider.BaseURL = v
 			return e
 		case "api_key":
-			v, e := stringValue()
+			v, e := str()
 			provider.APIKey = v
 			return e
 		case "default":
-			v, e := boolValue()
+			v, e := boolean()
 			provider.Default = v
 			return e
 		case "thinking_levels":
-			v, e := arrayValue()
+			v, e := array()
 			provider.ThinkingLevels = v
 			return e
 		case "thinking_style":
-			v, e := stringValue()
+			v, e := str()
 			provider.ThinkingStyle = v
 			return e
 		}
@@ -235,33 +245,34 @@ func assign(cfg *Config, section string, model *ModelConfig, provider *ProviderC
 		}
 		switch key {
 		case "id":
-			v, e := stringValue()
+			v, e := str()
 			override.ID = v
 			return e
 		case "name":
-			v, e := stringValue()
+			v, e := str()
 			override.Name = v
 			return e
 		case "default":
-			v, e := boolValue()
+			v, e := boolean()
 			override.Default = v
 			return e
 		case "thinking_levels":
-			v, e := arrayValue()
+			v, e := array()
 			override.ThinkingLevels = v
 			return e
 		case "thinking_style":
-			v, e := stringValue()
+			v, e := str()
 			override.ThinkingStyle = v
 			return e
 		}
 	}
-	// 向前兼容：忽略未知键，而不是因为新版本配置项导致旧程序无法启动。
+	// 未知键保持向前兼容，不阻止程序启动。
 	return nil
 }
 
 func stripComment(line string) string {
-	quoted, escaped := false, false
+	quoted := false
+	escaped := false
 	for i, r := range line {
 		if escaped {
 			escaped = false
@@ -281,9 +292,13 @@ func stripComment(line string) string {
 	}
 	return line
 }
+
 func parseString(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
-	if len(raw) >= 2 && raw[0] == '"' {
+	if raw == "" {
+		return "", nil
+	}
+	if raw[0] == '"' {
 		return strconv.Unquote(raw)
 	}
 	if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
@@ -291,6 +306,7 @@ func parseString(raw string) (string, error) {
 	}
 	return raw, nil
 }
+
 func parseStringArray(raw string) ([]string, error) {
 	raw = strings.TrimSpace(raw)
 	if len(raw) < 2 || raw[0] != '[' || raw[len(raw)-1] != ']' {
@@ -300,19 +316,43 @@ func parseStringArray(raw string) ([]string, error) {
 	if body == "" {
 		return []string{}, nil
 	}
-	parts := strings.Split(body, ",")
+
+	var parts []string
+	start := 0
+	quoted := false
+	escaped := false
+	for i, r := range body {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' && quoted {
+			escaped = true
+			continue
+		}
+		if r == '"' {
+			quoted = !quoted
+			continue
+		}
+		if r == ',' && !quoted {
+			parts = append(parts, strings.TrimSpace(body[start:i]))
+			start = i + 1
+		}
+	}
+	parts = append(parts, strings.TrimSpace(body[start:]))
+
 	result := make([]string, 0, len(parts))
 	for _, part := range parts {
-		value, err := parseString(strings.TrimSpace(part))
+		v, err := parseString(part)
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, value)
+		result = append(result, v)
 	}
 	return result, nil
 }
 
-const DefaultConfigTOML = `# Wisp 默认配置（首次运行自动生成，请勿提交到版本库）
+const DefaultConfigTOML = `# WispStudio 配置
 [server]
 host = "127.0.0.1"
 port = 7860
@@ -321,21 +361,38 @@ port = 7860
 data_dir = "Data"
 
 [openai]
-base_url = "https://api.deepseek.com/v1"
+# 旧版 [[models]] 没写 base_url/api_key 时的默认值
+base_url = "https://api.openai.com/v1"
 api_key = "sk-xxx"
 timeout_sec = 120
 
+# 推荐：Provider 自动拉取 /models
 [[providers]]
-name = "DeepSeek"
-base_url = "https://api.deepseek.com/v1"
+name = "My Provider"
+base_url = "https://api.example.com/v1"
 api_key = "sk-xxx"
 default = true
 
-# 如自动识别的思考档位不符合服务商，可覆盖：
-# [[providers.model_overrides]]
-# id = "your-reasoning-model"
+# 如果 Provider 的 /models 不提供思考能力元数据，可在这里统一指定：
 # thinking_levels = ["off", "low", "medium", "high"]
 # thinking_style = "reasoning_effort"
+# thinking_style 可选: none / reasoning_effort / enable_thinking / thinking_object
+
+# 也可只覆盖某个模型：
+# [[providers.model_overrides]]
+# id = "gpt-5"
+# thinking_levels = ["off", "minimal", "low", "medium", "high"]
+# thinking_style = "reasoning_effort"
+
+# 旧版手工模型配置仍兼容：
+# [[models]]
+# id = "deepseek-chat"
+# name = "DeepSeek Chat"
+# default = true
+# thinking_levels = ["off"]
+# thinking_style = "none"
 `
 
-func WriteDefault(path string) error { return os.WriteFile(path, []byte(DefaultConfigTOML), 0o644) }
+func WriteDefault(path string) error {
+	return os.WriteFile(path, []byte(DefaultConfigTOML), 0o644)
+}

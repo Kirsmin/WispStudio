@@ -3,9 +3,11 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"sync"
 )
 
 type SSEWriter struct {
+	mu      sync.Mutex
 	w       http.ResponseWriter
 	flusher http.Flusher
 	broken  bool
@@ -26,6 +28,8 @@ func NewSSEWriter(w http.ResponseWriter) (*SSEWriter, bool) {
 }
 
 func (s *SSEWriter) WriteEvent(event, data string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.broken {
 		return nil
 	}
