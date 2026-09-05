@@ -1,3 +1,50 @@
-<template><header><div class="brand"><i/>Wisp</div><div class="right"><span v-if="connected" class="latency">延迟 {{latency}}ms</span><span class="status"><i :class="{ok:connected}"/>{{connected?'已连接':'未连接'}}</span></div></header></template>
-<script setup lang="ts">import { storeToRefs } from 'pinia';import { useConnectionStore } from '../stores/connection';const c=useConnectionStore();const {connected,latency}=storeToRefs(c)</script>
-<style scoped>header{height:52px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 20px}.brand{font-weight:650;display:flex;align-items:center;gap:8px}.brand i,.status i{width:8px;height:8px;border-radius:50%;background:var(--pink);display:inline-block}.right,.status{display:flex;align-items:center;gap:9px}.latency{font-size:12px;color:var(--pink2);font-variant-numeric:tabular-nums}.status{font-size:12px;color:var(--muted);padding:5px 11px;border:1px solid var(--border);border-radius:999px}.status i{background:#bbb}.status i.ok{background:var(--pink)}</style>
+<template>
+  <div class="top-bar">
+    <div class="logo">
+      <span class="logo-dot"></span>Wisp
+    </div>
+    <div class="connection-status">
+      <ConnectDialog />
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import ConnectDialog from './ConnectDialog.vue'
+</script>
+
+<style scoped>
+.top-bar {
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: var(--text);
+}
+
+.logo-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.connection-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+</style>

@@ -5,27 +5,34 @@ import (
 	"net/http"
 )
 
-type SSE struct {
-	w http.ResponseWriter
-	f http.Flusher
+type SSEWriter struct {
+	w       http.ResponseWriter
+	flusher http.Flusher
+	broken  bool
 }
 
-func NewSSE(w http.ResponseWriter) (*SSE, bool) {
-	f, ok := w.(http.Flusher)
+func NewSSEWriter(w http.ResponseWriter) (*SSEWriter, bool) {
+	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return nil, false
 	}
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(200)
-	f.Flush()
-	return &SSE{w, f}, true
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+	return &SSEWriter{w: w, flusher: flusher}, true
 }
-func (s *SSE) Event(name, data string) error {
-	_, e := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", name, data)
-	if e == nil {
-		s.f.Flush()
+
+func (s *SSEWriter) WriteEvent(event, data string) error {
+	if s == nil || s.broken {
+		return nil
 	}
-	return e
+	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, data); err != nil {
+		s.broken = true
+		return err
+	}
+	s.flusher.Flush()
+	return nil
 }

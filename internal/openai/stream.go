@@ -8,31 +8,37 @@ import (
 	"strings"
 )
 
+type StreamEvent struct {
+	Type   string // delta | reasoning | usage | done | error
+	Text   string
+	Usage  *Usage
+	Finish string
+	Error  string
+}
+
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	CachedTokens     int `json:"cached_tokens"`
 	ReasoningTokens  int `json:"reasoning_tokens"`
 }
-type StreamEvent struct {
-	Type   string
-	Text   string
-	Usage  *Usage
-	Finish string
-	Error  string
+
+type StreamReader struct {
+	scan *bufio.Scanner
 }
-type StreamReader struct{ scanner *bufio.Scanner }
 
 func NewStreamReader(r io.Reader) *StreamReader {
-	s := bufio.NewScanner(r)
-	s.Buffer(make([]byte, 64*1024), 16*1024*1024)
-	return &StreamReader{s}
+	scan := bufio.NewScanner(r)
+	scan.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	return &StreamReader{scan: scan}
 }
+
 func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 	defer close(ch)
 	finish := ""
-	for sr.scanner.Scan() {
-		line := strings.TrimSuffix(sr.scanner.Text(), "\r")
+
+	for sr.scan.Scan() {
+		line := strings.TrimSuffix(sr.scan.Text(), "\r")
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
@@ -43,62 +49,60 @@ func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 		if data == "[DONE]" {
 			break
 		}
-		var c struct {
-			Choices []struct {
-				Delta struct {
-					Content          json.RawMessage `json:"content"`
-					ReasoningContent string          `json:"reasoning_content"`
-					Reasoning        string          `json:"reasoning"`
-					Thinking         string          `json:"thinking"`
-					Analysis         string          `json:"analysis"`
-				} `json:"delta"`
-				FinishReason *string `json:"finish_reason"`
-			} `json:"choices"`
-			Usage *struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-				PromptDetails    *struct {
-					CachedTokens int `json:"cached_tokens"`
-				} `json:"prompt_tokens_details"`
-				CompletionDetails *struct {
-					ReasoningTokens int `json:"reasoning_tokens"`
-				} `json:"completion_tokens_details"`
-			} `json:"usage"`
-			Error any `json:"error"`
-		}
-		if err := json.Unmarshal([]byte(data), &c); err != nil {
+
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			// 某些兼容网关在 SSE 中直接塞错误对象，尽量把可读错误透传出去。
+			var fallback map[string]any
+			if json.Unmarshal([]byte(data), &fallback) == nil {
+				if message := extractError(fallback); message != "" {
+					ch <- StreamEvent{Type: "error", Error: message}
+					finish = "error"
+				}
+			}
 			continue
 		}
-		if c.Error != nil {
-			ch <- StreamEvent{Type: "error", Error: fmt.Sprint(c.Error)}
+		if message := extractError(chunk.Error); message != "" {
+			ch <- StreamEvent{Type: "error", Error: message}
 			finish = "error"
-			continue
 		}
-		for _, choice := range c.Choices {
-			if t := rawText(choice.Delta.Content); t != "" {
-				ch <- StreamEvent{Type: "delta", Text: t}
+
+		for _, choice := range chunk.Choices {
+			if text := rawText(choice.Delta.Content); text != "" {
+				ch <- StreamEvent{Type: "delta", Text: text}
 			}
-			r := first(choice.Delta.ReasoningContent, choice.Delta.Reasoning, choice.Delta.Thinking, choice.Delta.Analysis)
-			if r != "" {
-				ch <- StreamEvent{Type: "reasoning", Text: r}
+			reasoning := firstNonEmpty(
+				choice.Delta.ReasoningContent,
+				choice.Delta.Reasoning,
+				choice.Delta.Thinking,
+				choice.Delta.Analysis,
+			)
+			if reasoning != "" {
+				ch <- StreamEvent{Type: "reasoning", Text: reasoning}
 			}
-			if choice.FinishReason != nil && *choice.FinishReason != "" {
+			if choice.FinishReason != nil && *choice.FinishReason != "" && finish == "" {
 				finish = *choice.FinishReason
 			}
 		}
-		if c.Usage != nil {
-			u := &Usage{PromptTokens: c.Usage.PromptTokens, CompletionTokens: c.Usage.CompletionTokens}
-			if c.Usage.PromptDetails != nil {
-				u.CachedTokens = c.Usage.PromptDetails.CachedTokens
+
+		if chunk.Usage != nil {
+			u := &Usage{
+				PromptTokens:     chunk.Usage.PromptTokens,
+				CompletionTokens: chunk.Usage.CompletionTokens,
+				ReasoningTokens:  chunk.Usage.ReasoningTokens,
 			}
-			if c.Usage.CompletionDetails != nil {
-				u.ReasoningTokens = c.Usage.CompletionDetails.ReasoningTokens
+			if details := chunk.Usage.PromptTokensDetails; details != nil {
+				u.CachedTokens = details.CachedTokens
+			}
+			if details := chunk.Usage.CompletionTokensDetails; details != nil && details.ReasoningTokens > 0 {
+				u.ReasoningTokens = details.ReasoningTokens
 			}
 			ch <- StreamEvent{Type: "usage", Usage: u}
 		}
 	}
-	if err := sr.scanner.Err(); err != nil {
-		ch <- StreamEvent{Type: "error", Error: "读取流失败: " + err.Error()}
+
+	if err := sr.scan.Err(); err != nil {
+		ch <- StreamEvent{Type: "error", Error: fmt.Sprintf("读取流失败: %v", err)}
 		return
 	}
 	if finish == "" {
@@ -106,31 +110,86 @@ func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 	}
 	ch <- StreamEvent{Type: "done", Finish: finish}
 }
+
+type streamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content          json.RawMessage `json:"content"`
+			ReasoningContent string          `json:"reasoning_content"`
+			Reasoning        string          `json:"reasoning"`
+			Thinking         string          `json:"thinking"`
+			Analysis         string          `json:"analysis"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *struct {
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
+		ReasoningTokens     int `json:"reasoning_tokens"`
+		PromptTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+		CompletionTokensDetails *struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
+	} `json:"usage"`
+	Error any `json:"error"`
+}
+
 func rawText(raw json.RawMessage) string {
 	if len(raw) == 0 || string(raw) == "null" {
 		return ""
 	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		return s
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text
 	}
 	var parts []struct {
 		Text    string `json:"text"`
 		Content string `json:"content"`
 	}
-	if json.Unmarshal(raw, &parts) == nil {
+	if err := json.Unmarshal(raw, &parts); err == nil {
 		var b strings.Builder
-		for _, p := range parts {
-			b.WriteString(first(p.Text, p.Content))
+		for _, part := range parts {
+			b.WriteString(firstNonEmpty(part.Text, part.Content))
 		}
 		return b.String()
 	}
 	return ""
 }
-func first(v ...string) string {
-	for _, s := range v {
-		if s != "" {
-			return s
+
+func extractError(value any) string {
+	if value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case map[string]any:
+		if nested, ok := typed["error"]; ok {
+			if message := extractError(nested); message != "" {
+				return message
+			}
+		}
+		for _, key := range []string{"message", "detail", "error_description"} {
+			if text, ok := typed[key].(string); ok && strings.TrimSpace(text) != "" {
+				return strings.TrimSpace(text)
+			}
+		}
+	case map[string]string:
+		for _, key := range []string{"message", "detail", "error"} {
+			if text := strings.TrimSpace(typed[key]); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
 		}
 	}
 	return ""

@@ -1,1 +1,94 @@
-:root{--bg:#fff;--soft:#fff7fb;--text:#241b24;--muted:#9f8e9a;--pink:#ec4899;--pink2:#db2777;--pinksoft:#fce7f3;--border:#f1dce8;--err:#dc435d}*{box-sizing:border-box}html,body,#app{width:100%;height:100%;margin:0}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:var(--bg)}::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:#ead2df;border-radius:6px}
+:root {
+  /* 统一粉色系调色板 */
+  --bg:            #ffffff;
+  --bg-soft:       #fdf6fa;
+  --text:          #2c2530;
+  --text-2:        #a394a3;
+  --accent:        #ec4899;
+  --accent-hover:  #db2777;
+  --accent-soft:   #fce8f2;
+  --accent-tint:   rgba(236, 72, 153, .07);
+  --accent-text:   #db2777;
+  --border:        #f6eaf1;
+  --border-strong: #efdcea;
+  --warn:          #f0a020;
+  --error:         #e0455a;
+  --dot:           #ec4899;
+}
+
+*, *::before, *::after {
+  box-shadow: none !important;
+}
+
+html, body, #app {
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 无抖动：只允许背景色/颜色/边框色/透明度过渡 */
+*, *::before, *::after {
+  transition-property: background-color, color, border-color, opacity;
+  transition-duration: 0.2s;
+}
+
+/* 关闭 NaiveUI 所有弹出/进场动画（模态框、下拉、消息等） */
+[class*="transition-enter-active"],
+[class*="transition-leave-active"],
+[class*="transition-enter-from"],
+[class*="transition-leave-to"] {
+  transition: none !important;
+  animation: none !important;
+}
+
+/* 按钮样式 */
+button, .n-button {
+  transform: none !important;
+}
+
+/* 滚动条细化 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-soft);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Markdown 细节（配合 md-editor-v3 的 github 主题） */
+.md li::marker {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.md a {
+  color: var(--accent-text);
+  text-decoration: none;
+}
+
+.md a:hover {
+  text-decoration: underline;
+}
+
+.md blockquote {
+  border-left: 3px solid var(--accent-soft);
+  color: var(--text-2);
+}
