@@ -47,6 +47,9 @@ func (sr *StreamReader) Close() error {
 // ReadEvents 读取所有事件，通过 channel 发送
 func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 	defer close(ch)
+
+	finish := "" // 累计的 finish_reason，流结束时统一发一次 done
+
 	for sr.scan.Scan() {
 		line := sr.scan.Text()
 		if line == "" {
@@ -55,11 +58,9 @@ func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
-		data := strings.TrimPrefix(line, "data: ")
-		data = strings.TrimSpace(data)
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
 		if data == "[DONE]" {
-			ch <- StreamEvent{Type: "done", Finish: "stop"}
-			return
+			break
 		}
 
 		var chunk struct {
@@ -73,6 +74,10 @@ func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 			Usage *struct {
 				PromptTokens     int `json:"prompt_tokens"`
 				CompletionTokens int `json:"completion_tokens"`
+				ReasoningTokens  int `json:"reasoning_tokens"`
+				CompletionTokensDetails *struct {
+					ReasoningTokens int `json:"reasoning_tokens"`
+				} `json:"completion_tokens_details"`
 				PromptTokensDetails *struct {
 					CachedTokens int `json:"cached_tokens"`
 				} `json:"prompt_tokens_details"`
@@ -92,13 +97,15 @@ func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 			if delta.ReasoningContent != "" {
 				ch <- StreamEvent{Type: "reasoning", Text: delta.ReasoningContent}
 			}
-			if chunk.Choices[0].FinishReason != nil {
-				ch <- StreamEvent{Type: "done", Finish: *chunk.Choices[0].FinishReason}
-				return
+			// 只记录 finish_reason，不能在这里 return：
+			// 有些兼容服务商把 finish_reason 和 usage 放在同一个 chunk，
+			// 直接跳出会导致 usage 永远收不到
+			if fr := chunk.Choices[0].FinishReason; fr != nil && finish == "" {
+				finish = *fr
 			}
 		}
 
-		// 处理 usage（最后一个带 usage 的 chunk）
+		// 处理 usage（可能出现在流末尾的独立 chunk，也可能与 finish_reason 同 chunk）
 		if chunk.Usage != nil {
 			u := &Usage{
 				PromptTokens:     chunk.Usage.PromptTokens,
@@ -106,6 +113,12 @@ func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 			}
 			if chunk.Usage.PromptTokensDetails != nil {
 				u.CachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+			}
+			// reasoning_tokens 各家放置位置不同：优先 completion_tokens_details，兼容顶层
+			if d := chunk.Usage.CompletionTokensDetails; d != nil && d.ReasoningTokens > 0 {
+				u.ReasoningTokens = d.ReasoningTokens
+			} else if chunk.Usage.ReasoningTokens > 0 {
+				u.ReasoningTokens = chunk.Usage.ReasoningTokens
 			}
 			ch <- StreamEvent{Type: "usage", Usage: u}
 		}
@@ -115,5 +128,8 @@ func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 		ch <- StreamEvent{Type: "error", Error: fmt.Sprintf("读取流失败: %v", err)}
 		return
 	}
-	ch <- StreamEvent{Type: "done", Finish: "stop"}
+	if finish == "" {
+		finish = "stop"
+	}
+	ch <- StreamEvent{Type: "done", Finish: finish}
 }
