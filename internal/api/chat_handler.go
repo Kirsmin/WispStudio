@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -12,14 +13,16 @@ import (
 	"wisp/internal/store"
 )
 
+// streamLockShards 会话流锁分片数。用定长数组而非 map，避免锁对象只增不减的内存泄漏
+const streamLockShards = 64
+
 type ChatHandler struct {
-	cfg           *config.Config
-	sessionStore  *store.SessionStore
-	messageStore  *store.MessageStore
-	requestStore  *store.RequestStore
-	openaiClient  *openai.Client
-	streamLocks   map[string]*sync.Mutex
-	streamMu      sync.Mutex
+	cfg          *config.Config
+	sessionStore *store.SessionStore
+	messageStore *store.MessageStore
+	requestStore *store.RequestStore
+	openaiClient *openai.Client
+	streamLocks  [streamLockShards]sync.Mutex
 }
 
 func NewChatHandler(cfg *config.Config, ss *store.SessionStore, ms *store.MessageStore, rs *store.RequestStore) *ChatHandler {
@@ -29,17 +32,17 @@ func NewChatHandler(cfg *config.Config, ss *store.SessionStore, ms *store.Messag
 		messageStore: ms,
 		requestStore: rs,
 		openaiClient: openai.NewClient(&cfg.OpenAI),
-		streamLocks:  make(map[string]*sync.Mutex),
 	}
 }
 
+// getStreamLock 按会话 ID 哈希取分片锁：同一会话始终命中同一把锁，锁数量恒定不泄漏
 func (h *ChatHandler) getStreamLock(sessionID string) *sync.Mutex {
-	h.streamMu.Lock()
-	defer h.streamMu.Unlock()
-	if h.streamLocks[sessionID] == nil {
-		h.streamLocks[sessionID] = &sync.Mutex{}
+	var h1 uint32 = 2166136261 // FNV-1a
+	for i := 0; i < len(sessionID); i++ {
+		h1 ^= uint32(sessionID[i])
+		h1 *= 16777619
 	}
-	return h.streamLocks[sessionID]
+	return &h.streamLocks[h1%streamLockShards]
 }
 
 type chatRequest struct {
@@ -146,20 +149,33 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 解析模型生效的网关与密钥：模型可单独覆盖 base_url / api_key，否则沿用全局
+	baseURL, apiKey := h.cfg.OpenAI.BaseURL, h.cfg.OpenAI.APIKey
+	if modelCfg.BaseURL != "" {
+		baseURL = modelCfg.BaseURL
+	}
+	if modelCfg.APIKey != "" {
+		apiKey = modelCfg.APIKey
+	}
+
 	// 构造上游请求
-	upReq, err := h.openaiClient.BuildRequest(req.Model, modelCfg.ThinkingStyle, req.Thinking, messages)
+	upReq, err := h.openaiClient.BuildRequest(baseURL, apiKey, req.Model, modelCfg.ThinkingStyle, req.Thinking, messages)
 	if err != nil {
 		http.Error(w, "构造请求失败", http.StatusInternalServerError)
 		return
 	}
 
-	// 留痕 request
-	var reqBody map[string]any
-	_ = json.Unmarshal([]byte(`{}`), &reqBody) // 占位
-	// 重新序列化请求体用于留痕
-	reqBodyRaw, _ := json.Marshal(messages)
-	_ = reqBodyRaw
-	h.requestStore.WriteRequest(sessionID, "POST", upReq.URL.String(), nil)
+	// 留痕：读取将要发送的原始请求体（字节级原文），随方法/URL 一起完整落盘
+	raw := ""
+	if upReq.GetBody != nil {
+		if rc, rerr := upReq.GetBody(); rerr == nil {
+			defer rc.Close()
+			if b, rerr2 := io.ReadAll(rc); rerr2 == nil {
+				raw = string(b)
+			}
+		}
+	}
+	h.requestStore.WriteRequest(sessionID, "POST", upReq.URL.String(), raw)
 
 	// 发送上游请求
 	ctx := r.Context()

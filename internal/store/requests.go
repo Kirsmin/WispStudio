@@ -65,27 +65,21 @@ func (s *RequestStore) Write(sessionID string, log RequestLog) error {
 	return err
 }
 
-func (s *RequestStore) WriteRequest(sessionID string, method, url string, body map[string]any) error {
-	// 脱敏 api_key
-	if body != nil {
-		body = deepCopyMap(body)
-		// 如果 body 里有 api_key 相关字段，替换
-		for k := range body {
-			if strings.Contains(strings.ToLower(k), "api_key") {
-				body[k] = "sk-***"
-			}
-		}
+// WriteRequest 记录一次完整的原始请求：方法、URL、完整请求体（raw 原文 + 结构化 body）
+func (s *RequestStore) WriteRequest(sessionID string, method, url, raw string) error {
+	var body map[string]any
+	if raw != "" {
+		// 解析出结构化 body 便于检索；raw 保留字节级原文实现"全量留痕"
+		_ = json.Unmarshal([]byte(raw), &body)
+		body = maskSensitive(body)
 	}
 	return s.Write(sessionID, RequestLog{
 		Kind:   "request",
 		Method: method,
 		URL:    url,
 		Body:   body,
+		Raw:    raw,
 	})
-}
-
-func (s *RequestStore) WriteUpstream(sessionID, raw string) error {
-	return s.Write(sessionID, RequestLog{Kind: "upstream", Raw: raw})
 }
 
 func (s *RequestStore) WriteDone(sessionID string, usage map[string]int, finish string) error {
@@ -100,9 +94,20 @@ func (s *RequestStore) WriteAborted(sessionID string) error {
 	return s.Write(sessionID, RequestLog{Kind: "aborted"})
 }
 
-func deepCopyMap(m map[string]any) map[string]any {
-	data, _ := json.Marshal(m)
-	var out map[string]any
-	json.Unmarshal(data, &out)
+// maskSensitive 递归脱敏：键名含 api_key / secret 等字段的值一律打码
+func maskSensitive(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		low := strings.ToLower(k)
+		if strings.Contains(low, "api_key") || strings.Contains(low, "apikey") || strings.Contains(low, "secret") {
+			out[k] = "sk-***"
+			continue
+		}
+		if nested, ok := v.(map[string]any); ok {
+			out[k] = maskSensitive(nested)
+			continue
+		}
+		out[k] = v
+	}
 	return out
 }
