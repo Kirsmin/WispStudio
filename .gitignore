@@ -25,5 +25,6 @@ config.toml.local
 Thumbs.db
 
 # Go 编译产物
-main
+/main
+/server
 *.exe
