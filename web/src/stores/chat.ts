@@ -333,12 +333,12 @@ export const useChatStore = defineStore('chat', () => {
     notice.value = ''
 
     let currentId = sessionsStore.currentSessionId
-    let currentAssistant: ChatMessage | null = null
+    const assistantRef = { value: null as ChatMessage | null }
     let gotSSE = false
     let finalError = ''
     const controller = new AbortController()
     abortController.value = controller
-    const batcher = createDeltaBatcher(() => currentAssistant)
+    const batcher = createDeltaBatcher(() => assistantRef.value)
 
     try {
       if (!currentId) {
@@ -360,64 +360,64 @@ export const useChatStore = defineStore('chat', () => {
           }
           case 'model.start':
             batcher.flush()
-            if (currentAssistant?.streaming) {
-              currentAssistant.streaming = false
-              currentAssistant.phase = 'done'
-              currentAssistant.status = 'complete'
+            if (assistantRef.value?.streaming) {
+              assistantRef.value.streaming = false
+              assistantRef.value.phase = 'done'
+              assistantRef.value.status = 'complete'
             }
-            currentAssistant = createAssistant(payload)
+            assistantRef.value = createAssistant(payload)
             break
           case 'ttft': {
-            if (!currentAssistant) currentAssistant = createAssistant({})
+            if (!assistantRef.value) assistantRef.value = createAssistant({})
             const value = Number(payload.ms)
-            if (Number.isFinite(value)) currentAssistant.ttft_ms = value
+            if (Number.isFinite(value)) assistantRef.value.ttft_ms = value
             break
           }
           case 'reasoning':
-            if (!currentAssistant) currentAssistant = createAssistant({})
+            if (!assistantRef.value) assistantRef.value = createAssistant({})
             batcher.reasoning(String(payload.text || ''))
             break
           case 'delta':
-            if (!currentAssistant) currentAssistant = createAssistant({})
+            if (!assistantRef.value) assistantRef.value = createAssistant({})
             batcher.content(String(payload.text || ''))
             break
           case 'usage':
-            if (currentAssistant) currentAssistant.usage = payload as ChatMessage['usage']
+            if (assistantRef.value) assistantRef.value.usage = payload as ChatMessage['usage']
             break
           case 'tool.detecting': {
             batcher.flush()
-            if (!currentAssistant) currentAssistant = createAssistant({})
-            currentAssistant.phase = currentAssistant.content ? 'answer' : 'done'
+            if (!assistantRef.value) assistantRef.value = createAssistant({})
+            assistantRef.value.phase = assistantRef.value.content ? 'answer' : 'done'
             const id = String(payload.call_id || `tc_${Date.now()}`)
-            if (!findTool(currentAssistant, id)) {
-              currentAssistant.tools ||= []
-              currentAssistant.tools.push(reactive<ToolView>({ id, name: '', status: 'detecting' }))
+            if (!findTool(assistantRef.value, id)) {
+              assistantRef.value.tools ||= []
+              assistantRef.value.tools.push(reactive<ToolView>({ id, name: '', status: 'detecting' }))
             }
             break
           }
           case 'tool.completed':
             batcher.flush()
-            finishToolAfterPaint(currentAssistant, payload, 'completed')
+            finishToolAfterPaint(assistantRef.value, payload, 'completed')
             break
           case 'tool.failed':
             batcher.flush()
-            finishToolAfterPaint(currentAssistant, payload, 'failed')
+            finishToolAfterPaint(assistantRef.value, payload, 'failed')
             break
           case 'model.done': {
             batcher.flush()
-            if (!currentAssistant) break
-            currentAssistant.streaming = false
-            currentAssistant.finish = String(payload.finish || 'stop')
-            currentAssistant.duration_ms = Number.isFinite(Number(payload.duration_ms)) ? Number(payload.duration_ms) : currentAssistant.duration_ms
-            currentAssistant.ttft_ms = Number.isFinite(Number(payload.ttft_ms)) ? Number(payload.ttft_ms) : currentAssistant.ttft_ms
-            if (payload.error) currentAssistant.error = String(payload.error)
-            currentAssistant.phase = currentAssistant.error ? 'error' : 'done'
-            currentAssistant.status = currentAssistant.error ? 'error' : (currentAssistant.finish === 'aborted' ? 'aborted' : 'complete')
+            if (!assistantRef.value) break
+            assistantRef.value.streaming = false
+            assistantRef.value.finish = String(payload.finish || 'stop')
+            assistantRef.value.duration_ms = Number.isFinite(Number(payload.duration_ms)) ? Number(payload.duration_ms) : assistantRef.value.duration_ms
+            assistantRef.value.ttft_ms = Number.isFinite(Number(payload.ttft_ms)) ? Number(payload.ttft_ms) : assistantRef.value.ttft_ms
+            if (payload.error) assistantRef.value.error = String(payload.error)
+            assistantRef.value.phase = assistantRef.value.error ? 'error' : 'done'
+            assistantRef.value.status = assistantRef.value.error ? 'error' : (assistantRef.value.finish === 'aborted' ? 'aborted' : 'complete')
             break
           }
           case 'error':
             finalError = String(payload.message || '生成失败')
-            if (currentAssistant) currentAssistant.error = finalError
+            if (assistantRef.value) assistantRef.value.error = finalError
             break
           case 'done':
             if (payload.error) finalError = String(payload.error)
@@ -448,11 +448,11 @@ export const useChatStore = defineStore('chat', () => {
       batcher.flush()
 
       if (run !== activeRun || sessionsStore.currentSessionId !== currentId) return
-      if (currentAssistant?.streaming) {
-        currentAssistant.streaming = false
-        currentAssistant.phase = finalError ? 'error' : 'done'
-        currentAssistant.status = finalError ? 'error' : 'complete'
-        currentAssistant.error = finalError || currentAssistant.error
+      if (assistantRef.value?.streaming) {
+        assistantRef.value.streaming = false
+        assistantRef.value.phase = finalError ? 'error' : 'done'
+        assistantRef.value.status = finalError ? 'error' : 'complete'
+        assistantRef.value.error = finalError || assistantRef.value.error
       }
       if (finalError) window.$message?.error(finalError)
       await sessionsStore.loadSessions().catch(() => undefined)
@@ -460,12 +460,12 @@ export const useChatStore = defineStore('chat', () => {
       batcher.flush()
       if (error?.name === 'AbortError' || run !== activeRun) return
       const message = error instanceof Error ? error.message : String(error)
-      if (currentAssistant) {
-        currentAssistant.streaming = false
-        currentAssistant.phase = 'error'
-        currentAssistant.status = 'error'
-        currentAssistant.finish = 'error'
-        currentAssistant.error = message
+      if (assistantRef.value) {
+        assistantRef.value.streaming = false
+        assistantRef.value.phase = 'error'
+        assistantRef.value.status = 'error'
+        assistantRef.value.finish = 'error'
+        assistantRef.value.error = message
       } else {
         messages.value.push(reactive<ChatMessage>({
           id: `error_${Date.now()}`, type: 'assistant', content: '', error: message,
