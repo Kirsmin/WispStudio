@@ -1,5 +1,5 @@
 <template>
-  <div class="message-item" :class="message.type">
+  <div class="message-item" :class="[message.type, { 'has-tool': hasToolEvent }]">
     <div class="message-content">
       <div v-if="message.type === 'user'" class="user-text">{{ message.content }}</div>
       <template v-else>
@@ -59,6 +59,7 @@ import MarkdownView from './MarkdownView.vue'
 const props = defineProps<{ message: ChatMessage }>()
 const showReasoning = ref(false)
 const manuallyChanged = ref(false)
+const hasToolEvent = computed(() => props.message.type === 'assistant' && Boolean(props.message.tools?.length))
 
 const showReasoningBlock = computed(() =>
   props.message.type === 'assistant' && Boolean(props.message.reasoning || props.message.phase === 'reasoning'),
@@ -95,12 +96,14 @@ watch(() => props.message.phase, (phase, previous) => {
 .message-item.user .message-content { background: var(--accent-soft); color: var(--text); padding: 10px 16px; }
 .user-text { white-space: pre-wrap; line-height: 1.55; margin: 0; padding: 0; }
 .message-item.assistant .message-content { background: transparent; padding-left: 2px; padding-right: 2px; width: 100%; }
+.message-item.assistant.has-tool { margin-bottom: 4px; }
+.message-item.assistant.has-tool .message-content { padding-bottom: 0; }
 .reasoning-block { margin-bottom: 8px; }
 .reasoning-toggle { border: 0; background: transparent; font: inherit; font-size: 12px; color: var(--accent-text); cursor: pointer; user-select: none; display: inline-flex; align-items: center; gap: 6px; padding: 2px 0; }
 .reasoning-text { font-size: 13px; color: var(--text-2); margin-top: 4px; padding: 10px 12px; background: var(--bg-soft); border: 1px solid var(--border); border-radius: 10px; max-height: 320px; overflow-y: auto; }
 .reasoning-text :deep(.md) { font-size: 13px; color: var(--text-2); }
 .answer-body { min-height: 1em; }
-.tool-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.tool-list { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 0; }
 .tool-row { display: inline-flex; width: fit-content; align-items: center; gap: 7px; padding: 5px 9px; border: 1px solid var(--border); border-radius: 9px; color: var(--text-2); background: var(--bg-soft); font-size: 12px; line-height: 1.4; }
 .tool-row.failed { color: #a84646; }
 .tool-icon { width: 1.2em; text-align: center; }

@@ -18,7 +18,7 @@ import (
 	"wisp/internal/toolcall"
 )
 
-const maxToolRounds = 8
+const maxToolRounds = 5
 
 type ChatHandler struct {
 	cfg          *config.Config
@@ -55,6 +55,15 @@ type callOutcome struct {
 	TTFTMs      int
 	Tool        *toolcall.Call
 	ToolEventID string
+}
+
+type toolResult struct {
+	Name   string
+	Input  string
+	Output string
+	Status string
+	Error  string
+	Reused bool
 }
 
 func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
@@ -154,7 +163,8 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	if provCfg.APIKey != "" {
 		apiKey = provCfg.APIKey
 	}
-	systemPrompt := buildSystemPrompt(h.cfg.SystemPrompt)
+	var pendingTool *toolResult
+	var lastTool *toolResult
 
 	for callIndex := 1; callIndex <= maxToolRounds; callIndex++ {
 		if runCtx.Err() != nil {
@@ -167,6 +177,7 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 			h.finishTurnError(sse, sessionID, turnID, "", "读取上下文失败: "+err.Error())
 			return
 		}
+		systemPrompt := buildSystemPrompt(h.cfg.SystemPrompt, pendingTool)
 		messages := make([]openai.ChatMessage, 0, len(history)+1)
 		messages = append(messages, openai.ChatMessage{Role: "system", Content: systemPrompt})
 		for _, msg := range history {
@@ -218,7 +229,12 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if outcome.Tool != nil {
-			if err := h.handleTool(sse, sessionID, turnID, modelCallID, outcome); err != nil {
+			var reuse *toolResult
+			if lastTool != nil && sameToolCall(lastTool, outcome.Tool) {
+				reuse = lastTool
+			}
+			result, err := h.handleTool(sse, sessionID, turnID, modelCallID, outcome, reuse)
+			if err != nil {
 				message := "保存工具结果失败: " + err.Error()
 				_ = h.store.AppendError(sessionID, turnID, modelCallID, message)
 				_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
@@ -232,6 +248,10 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 				Status: "completed", Finish: "tool_call", Usage: outcome.Usage,
 				DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs,
 			})
+			pendingTool = result
+			if !result.Reused {
+				lastTool = result
+			}
 			_ = sse.WriteEvent("model.done", mustJSON(map[string]any{
 				"call_id": modelCallID, "finish": "tool_call",
 				"duration_ms": outcome.DurationMs, "ttft_ms": outcome.TTFTMs,
@@ -360,7 +380,6 @@ func (h *ChatHandler) runModelCall(ctx context.Context, sse *SSEWriter, upReq *h
 		if last.Err != nil {
 			out.Error = "工具调用解析失败: " + last.Err.Error()
 			out.Finish = "error"
-			out.ToolParseErr = true
 			if out.ToolEventID != "" {
 				_ = sse.WriteEvent("tool.failed", mustJSON(map[string]any{"call_id": out.ToolEventID, "error": out.Error}))
 			}
@@ -390,37 +409,49 @@ func (h *ChatHandler) persistCallBody(sessionID, turnID, modelCallID string, out
 	_ = h.store.AppendAssistant(sessionID, turnID, modelCallID, out.Content)
 }
 
-func (h *ChatHandler) handleTool(sse *SSEWriter, sessionID, turnID, modelCallID string, out callOutcome) error {
+func (h *ChatHandler) handleTool(sse *SSEWriter, sessionID, turnID, modelCallID string, out callOutcome, reuse *toolResult) (*toolResult, error) {
 	call := out.Tool
 	toolID := out.ToolEventID
 	if toolID == "" {
 		toolID = "tc_" + strings.ReplaceAll(uuid.New().String(), "-", "")
 	}
 	if err := h.store.BeginToolCall(toolID, sessionID, turnID, modelCallID, call.Name, call.Raw, call.Body); err != nil {
-		return err
+		return nil, err
 	}
 	if err := h.store.AppendToolCallRecord(sessionID, turnID, modelCallID, toolID, call.Name, call.Raw); err != nil {
-		return err
+		return nil, err
 	}
 
-	status, output, toolErr := executeTool(call)
+	status, output, toolErr := "", "", ""
+	reused := reuse != nil
+	if reused {
+		status = reuse.Status
+		output = reuse.Output
+		toolErr = reuse.Error
+	} else {
+		status, output, toolErr = executeTool(call)
+	}
 	if err := h.store.FinishToolCall(toolID, status, output, toolErr); err != nil {
-		return err
+		return nil, err
 	}
 	if err := h.store.AppendToolOutputRecord(sessionID, turnID, modelCallID, toolID, output); err != nil {
-		return err
+		return nil, err
 	}
 
 	if status == "completed" {
 		_ = sse.WriteEvent("tool.completed", mustJSON(map[string]any{
-			"call_id": toolID, "name": call.Name, "output": output,
+			"call_id": toolID, "name": call.Name, "output": output, "reused": reused,
 		}))
 	} else {
 		_ = sse.WriteEvent("tool.failed", mustJSON(map[string]any{
-			"call_id": toolID, "name": call.Name, "output": output, "error": toolErr,
+			"call_id": toolID, "name": call.Name, "output": output, "error": toolErr, "reused": reused,
 		}))
 	}
-	return nil
+	return &toolResult{Name: call.Name, Input: call.Body, Output: output, Status: status, Error: toolErr, Reused: reused}, nil
+}
+
+func sameToolCall(previous *toolResult, call *toolcall.Call) bool {
+	return previous != nil && call != nil && previous.Name == call.Name && previous.Input == call.Body
 }
 
 func executeTool(call *toolcall.Call) (status, output, message string) {
@@ -437,21 +468,45 @@ func executeTool(call *toolcall.Call) (status, output, message string) {
 	}
 }
 
-func buildSystemPrompt(userPrompt string) string {
+func buildSystemPrompt(userPrompt string, pending *toolResult) string {
 	userPrompt = strings.TrimSpace(userPrompt)
 	if userPrompt == "" {
 		userPrompt = config.DefaultSystemPrompt
 	}
-	return fmt.Sprintf(`<System>
-%s
 
-你可以在输出时使用 <tc:ToolName /> XML格式来调用工具。
-目前可用：
-<tc:Time />
+	var b strings.Builder
+	b.WriteString("<System>\n")
+	b.WriteString(userPrompt)
+	b.WriteString(`
 
-一次模型响应最多调用一个工具。
-工具调用代表当前模型响应结束。
-</System>`, userPrompt)
+可用工具：
+Time：获取 Wisp 后端当前本地时间。
+
+只有回答需要当前时间，或用户明确要求调用/测试 Time 时才调用 Time；其他情况直接回答。
+需要调用时，在回复末尾输出 <tc:Time />。
+不要解释、讨论、模拟或展示工具调用语法。`)
+
+	if pending != nil {
+		b.WriteString("\n\n")
+		if pending.Reused {
+			b.WriteString("你刚刚重复请求了同一个工具，Wisp 没有再次执行。请直接使用已有结果完成回答。\n")
+		} else if pending.Status == "completed" {
+			b.WriteString("上一工具 ")
+			b.WriteString(pending.Name)
+			b.WriteString(" 已成功执行，结果如下：\n")
+		} else {
+			b.WriteString("上一工具 ")
+			b.WriteString(pending.Name)
+			b.WriteString(" 执行失败，结果如下：\n")
+		}
+		b.WriteString("<Output>")
+		b.WriteString(pending.Output)
+		b.WriteString("</Output>\n")
+		b.WriteString("直接根据结果继续上一轮回答；不要等待工具结果，不要再次调用刚刚完成的工具，也不要重复已经输出过的正文。")
+	}
+
+	b.WriteString("\n</System>")
+	return b.String()
 }
 
 func (h *ChatHandler) finishCancelled(sse *SSEWriter, sessionID, turnID, modelCallID string) {

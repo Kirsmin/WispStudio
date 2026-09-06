@@ -173,45 +173,26 @@ func (s *Store) appendRecord(record Record) (Record, error) {
 }
 
 func (s *Store) ContextMessages(sessionID string) ([]ContextMessage, error) {
-	rows, err := s.db.Query(`SELECT kind,content,COALESCE(model_call_id,''),COALESCE(tool_call_id,''),data_json FROM records WHERE session_id=? ORDER BY seq`, sessionID)
+	rows, err := s.db.Query(`SELECT kind,content FROM records WHERE session_id=? ORDER BY seq`, sessionID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+
+	// 模型上下文只回放用户与可见助手正文。Thinking、ToolCall、ToolOutput
+	// 都是运行时语义记录：Thinking 仅用于 UI/debug，工具结果由下一次 ModelCall
+	// 的首条 System Prompt 动态注入，避免在历史中出现中途 system message。
 	var out []ContextMessage
-	lastAssistantCall := ""
 	for rows.Next() {
-		var kind, content, modelCallID, toolCallID, rawData string
-		if err := rows.Scan(&kind, &content, &modelCallID, &toolCallID, &rawData); err != nil {
+		var kind, content string
+		if err := rows.Scan(&kind, &content); err != nil {
 			return nil, err
 		}
 		switch kind {
 		case RecordUser:
 			out = append(out, ContextMessage{Role: "user", Content: content})
-			lastAssistantCall = ""
 		case RecordAssistant:
 			out = append(out, ContextMessage{Role: "assistant", Content: content})
-			lastAssistantCall = modelCallID
-		case RecordToolCall:
-			var data struct {
-				RawCall string `json:"raw_call"`
-			}
-			_ = json.Unmarshal([]byte(rawData), &data)
-			if data.RawCall == "" {
-				continue
-			}
-			if len(out) > 0 && out[len(out)-1].Role == "assistant" && lastAssistantCall == modelCallID {
-				if strings.TrimSpace(out[len(out)-1].Content) != "" {
-					out[len(out)-1].Content += "\n\n"
-				}
-				out[len(out)-1].Content += data.RawCall
-			} else {
-				out = append(out, ContextMessage{Role: "assistant", Content: data.RawCall})
-			}
-			lastAssistantCall = modelCallID
-		case RecordToolOutput:
-			out = append(out, ContextMessage{Role: "system", Content: "<Output>" + content + "</Output>"})
-			lastAssistantCall = ""
 		}
 	}
 	return out, rows.Err()
