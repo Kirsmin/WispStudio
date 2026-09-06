@@ -1,13 +1,9 @@
 package store
 
 import (
-	"encoding/json"
+	"database/sql"
 	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,201 +19,124 @@ type Session struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-type SessionsFile struct {
-	Version  int       `json:"version"`
-	Sessions []Session `json:"sessions"`
-}
-
-type SessionStore struct {
-	dataDir string
-	mu      sync.RWMutex
-}
-
-func NewSessionStore(dataDir string) *SessionStore {
-	_ = os.MkdirAll(dataDir, 0755)
-	return &SessionStore{dataDir: dataDir}
-}
-
-func (s *SessionStore) sessionsPath() string {
-	return filepath.Join(s.dataDir, "sessions.json")
-}
-
-func (s *SessionStore) readSessions() (*SessionsFile, error) {
-	data, err := os.ReadFile(s.sessionsPath())
+func (s *Store) ListSessions() ([]Session, error) {
+	rows, err := s.db.Query(`SELECT id,title,renamed,provider,model,created_at,updated_at FROM sessions ORDER BY updated_at DESC, id`)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return &SessionsFile{Version: 2, Sessions: []Session{}}, nil
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Session
+	for rows.Next() {
+		item, err := scanSession(rows)
+		if err != nil {
+			return nil, err
 		}
-		return nil, err
+		out = append(out, item)
 	}
-	var file SessionsFile
-	if err := json.Unmarshal(data, &file); err != nil {
-		return nil, err
-	}
-	if file.Version < 2 {
-		file.Version = 2
-	}
-	if file.Sessions == nil {
-		file.Sessions = []Session{}
-	}
-	return &file, nil
+	return out, rows.Err()
 }
 
-func (s *SessionStore) writeSessions(file *SessionsFile) error {
-	file.Version = 2
-	data, err := json.MarshalIndent(file, "", "  ")
-	if err != nil {
-		return err
-	}
-	path := s.sessionsPath()
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func (s *SessionStore) List() ([]Session, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	file, err := s.readSessions()
-	if err != nil {
-		return nil, err
-	}
-	result := append([]Session(nil), file.Sessions...)
-	sort.SliceStable(result, func(i, j int) bool {
-		return result[i].UpdatedAt.After(result[j].UpdatedAt)
-	})
-	return result, nil
-}
-
-func (s *SessionStore) Get(id string) (*Session, error) {
+func (s *Store) GetSession(id string) (*Session, error) {
 	if err := validateSessionID(id); err != nil {
 		return nil, err
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	file, err := s.readSessions()
+	row := s.db.QueryRow(`SELECT id,title,renamed,provider,model,created_at,updated_at FROM sessions WHERE id=?`, id)
+	item, err := scanSession(row)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("会话不存在")
+	}
 	if err != nil {
 		return nil, err
 	}
-	for i := range file.Sessions {
-		if file.Sessions[i].ID == id {
-			copy := file.Sessions[i]
-			return &copy, nil
-		}
-	}
-	return nil, fmt.Errorf("会话不存在")
+	return &item, nil
 }
 
-func (s *SessionStore) Create(title string) (*Session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	file, err := s.readSessions()
-	if err != nil {
-		return nil, err
-	}
+func (s *Store) CreateSession(title string) (*Session, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		title = "新会话"
 	}
 	now := time.Now().UTC()
-	session := Session{
+	item := Session{
 		ID:        "s_" + strings.ReplaceAll(uuid.New().String(), "-", ""),
 		Title:     title,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	file.Sessions = append(file.Sessions, session)
-	if err := s.writeSessions(file); err != nil {
+	_, err := s.db.Exec(`INSERT INTO sessions(id,title,renamed,provider,model,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`,
+		item.ID, item.Title, 0, "", "", stamp(now), stamp(now))
+	if err != nil {
 		return nil, err
 	}
-	return &session, nil
+	return &item, nil
 }
 
-func (s *SessionStore) UpdateTitle(id, title string) error {
+func (s *Store) UpdateTitle(id, title string) error {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return fmt.Errorf("标题不能为空")
 	}
-	return s.update(id, func(session *Session) {
-		session.Title = title
-		session.Renamed = true
-	})
+	return s.updateSession(id, `title=?, renamed=1`, title)
 }
 
-func (s *SessionStore) UpdateAutoTitle(id, title string) error {
+func (s *Store) UpdateAutoTitle(id, title string) error {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return nil
 	}
-	return s.update(id, func(session *Session) {
-		if !session.Renamed {
-			session.Title = title
-		}
-	})
-}
-
-func (s *SessionStore) UpdateSelection(id, provider, model string) error {
-	return s.update(id, func(session *Session) {
-		session.Provider = provider
-		session.Model = model
-	})
-}
-
-func (s *SessionStore) Touch(id string) error {
-	return s.update(id, func(*Session) {})
-}
-
-func (s *SessionStore) update(id string, mutate func(*Session)) error {
-	if err := validateSessionID(id); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	file, err := s.readSessions()
+	res, err := s.db.Exec(`UPDATE sessions SET title=?, updated_at=? WHERE id=? AND renamed=0`, title, stamp(time.Now().UTC()), id)
 	if err != nil {
 		return err
 	}
-	for i := range file.Sessions {
-		if file.Sessions[i].ID != id {
-			continue
+	if n, _ := res.RowsAffected(); n == 0 {
+		if _, err := s.GetSession(id); err != nil {
+			return err
 		}
-		mutate(&file.Sessions[i])
-		file.Sessions[i].UpdatedAt = time.Now().UTC()
-		return s.writeSessions(file)
 	}
-	return fmt.Errorf("会话不存在")
+	return nil
 }
 
-func (s *SessionStore) Delete(id string) error {
-	if err := validateSessionID(id); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	file, err := s.readSessions()
+func (s *Store) UpdateSelection(id, provider, model string) error {
+	return s.updateSession(id, `provider=?, model=?`, provider, model)
+}
+
+func (s *Store) Touch(id string) error {
+	res, err := s.db.Exec(`UPDATE sessions SET updated_at=? WHERE id=?`, stamp(time.Now().UTC()), id)
 	if err != nil {
 		return err
 	}
-	found := false
-	filtered := file.Sessions[:0]
-	for _, session := range file.Sessions {
-		if session.ID == id {
-			found = true
-			continue
-		}
-		filtered = append(filtered, session)
-	}
-	if !found {
+	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("会话不存在")
 	}
-	file.Sessions = filtered
-	if err := s.writeSessions(file); err != nil {
+	return nil
+}
+
+func (s *Store) updateSession(id, fields string, args ...any) error {
+	if err := validateSessionID(id); err != nil {
 		return err
 	}
-	_ = os.Remove(filepath.Join(s.dataDir, "Sessions", id+".jsonl"))
-	_ = os.Remove(filepath.Join(s.dataDir, "Requests", id+".jsonl"))
+	args = append(args, stamp(time.Now().UTC()), id)
+	res, err := s.db.Exec(`UPDATE sessions SET `+fields+`, updated_at=? WHERE id=?`, args...)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("会话不存在")
+	}
+	return nil
+}
+
+func (s *Store) DeleteSession(id string) error {
+	if err := validateSessionID(id); err != nil {
+		return err
+	}
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("会话不存在")
+	}
 	return nil
 }
 
@@ -239,3 +158,21 @@ func validateSessionID(id string) error {
 	}
 	return nil
 }
+
+type rowScanner interface{ Scan(...any) error }
+
+func scanSession(row rowScanner) (Session, error) {
+	var item Session
+	var renamed int
+	var created, updated string
+	err := row.Scan(&item.ID, &item.Title, &renamed, &item.Provider, &item.Model, &created, &updated)
+	if err != nil {
+		return item, err
+	}
+	item.Renamed = renamed != 0
+	item.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	item.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	return item, nil
+}
+
+func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }

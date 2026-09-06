@@ -14,35 +14,34 @@ import (
 )
 
 type Router struct {
-	cfg          *config.Config
-	mux          *http.ServeMux
-	catalog      *provider.Catalog
-	runs         *RunRegistry
-	sessionStore *store.SessionStore
-	messageStore *store.MessageStore
-	requestStore *store.RequestStore
-	chatHandler  *ChatHandler
+	cfg         *config.Config
+	mux         *http.ServeMux
+	catalog     *provider.Catalog
+	runs        *RunRegistry
+	store       *store.Store
+	chatHandler *ChatHandler
 }
 
-func NewRouter(cfg *config.Config) *Router {
-	ss := store.NewSessionStore(cfg.Storage.DataDir)
-	ms := store.NewMessageStore(cfg.Storage.DataDir)
-	rs := store.NewRequestStore(cfg.Storage.DataDir)
+func NewRouter(cfg *config.Config) (*Router, error) {
+	st, err := store.Open(cfg.Storage.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	catalog := provider.NewCatalog(cfg)
 	runs := NewRunRegistry()
 	router := &Router{
-		cfg:          cfg,
-		mux:          http.NewServeMux(),
-		catalog:      catalog,
-		runs:         runs,
-		sessionStore: ss,
-		messageStore: ms,
-		requestStore: rs,
+		cfg:     cfg,
+		mux:     http.NewServeMux(),
+		catalog: catalog,
+		runs:    runs,
+		store:   st,
 	}
-	router.chatHandler = NewChatHandler(cfg, catalog, ss, ms, rs)
+	router.chatHandler = NewChatHandler(cfg, catalog, st, runs)
 	router.registerRoutes()
-	return router
+	return router, nil
 }
+
+func (r *Router) Close() error { return r.store.Close() }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.mux.ServeHTTP(w, req)
@@ -59,9 +58,7 @@ func (r *Router) registerRoutes() {
 	r.mux.HandleFunc("/api/sessions/{id}/chat", cors(r.chatHandler.HandleChat))
 	r.mux.HandleFunc("/api/sessions/{id}/chat/status", cors(r.handleChatStatus))
 	r.mux.HandleFunc("/api/sessions/{id}/chat/cancel", cors(r.handleChatCancel))
-	// 未定义 API 不应该回退到 Vue index。
 	r.mux.HandleFunc("/api/", cors(func(w http.ResponseWriter, req *http.Request) { http.NotFound(w, req) }))
-	// Vue build 由 Go 直接托管。
 	r.mux.Handle("/", webui.Handler())
 }
 
@@ -110,7 +107,7 @@ func (r *Router) handleModels(w http.ResponseWriter, req *http.Request) {
 func (r *Router) handleSessions(w http.ResponseWriter, req *http.Request) {
 	switch req.Method {
 	case http.MethodGet:
-		sessions, err := r.sessionStore.List()
+		sessions, err := r.store.ListSessions()
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -124,7 +121,7 @@ func (r *Router) handleSessions(w http.ResponseWriter, req *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "请求体解析失败")
 			return
 		}
-		session, err := r.sessionStore.Create(body.Title)
+		session, err := r.store.CreateSession(body.Title)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -150,7 +147,7 @@ func (r *Router) handleSession(w http.ResponseWriter, req *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "请求体解析失败")
 			return
 		}
-		if err := r.sessionStore.UpdateTitle(id, body.Title); err != nil {
+		if err := r.store.UpdateTitle(id, body.Title); err != nil {
 			writeJSONError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -160,7 +157,7 @@ func (r *Router) handleSession(w http.ResponseWriter, req *http.Request) {
 			writeJSONError(w, http.StatusConflict, "会话正在生成，请先停止生成")
 			return
 		}
-		if err := r.sessionStore.Delete(id); err != nil {
+		if err := r.store.DeleteSession(id); err != nil {
 			writeJSONError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -176,12 +173,15 @@ func (r *Router) handleMessages(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	id := req.PathValue("id")
-	messages, err := r.messageStore.List(id)
+	if _, err := r.store.GetSession(id); err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	messages, err := r.store.ListMessages(id)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, messages)
 }
 

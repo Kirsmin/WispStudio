@@ -8,6 +8,8 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+const DefaultSystemPrompt = "你是先进的 Wisp Alpha 模型，具有长文本对话/角色扮演/答疑能力。"
+
 type ServerConfig struct {
 	Host string `toml:"host"`
 	Port int    `toml:"port"`
@@ -56,11 +58,12 @@ type ProviderConfig struct {
 }
 
 type Config struct {
-	Server    ServerConfig     `toml:"server"`
-	Storage   StorageConfig    `toml:"storage"`
-	OpenAI    OpenAIConfig     `toml:"openai"`
-	Models    []ModelConfig    `toml:"models"`
-	Providers []ProviderConfig `toml:"providers"`
+	SystemPrompt string           `toml:"system_prompt"`
+	Server       ServerConfig     `toml:"server"`
+	Storage      StorageConfig    `toml:"storage"`
+	OpenAI       OpenAIConfig     `toml:"openai"`
+	Models       []ModelConfig    `toml:"models"`
+	Providers    []ProviderConfig `toml:"providers"`
 }
 
 func Load(path string) (*Config, error) {
@@ -80,6 +83,9 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	if strings.TrimSpace(c.SystemPrompt) == "" {
+		c.SystemPrompt = DefaultSystemPrompt
+	}
 	if strings.TrimSpace(c.Server.Host) == "" {
 		c.Server.Host = "127.0.0.1"
 	}
@@ -210,6 +216,8 @@ func normalizeThinkingStyle(style string) string {
 // DefaultConfigTOML 首次运行自动生成的默认配置模板。
 const DefaultConfigTOML = `# Wisp 默认配置（首次运行自动生成，请勿提交到版本库）
 # 修改 api_key 等配置后保存，再重新启动服务器。
+
+system_prompt = """你是先进的 Wisp Alpha 模型，具有长文本对话/角色扮演/答疑能力。"""
 
 [server]
 host = "127.0.0.1"
