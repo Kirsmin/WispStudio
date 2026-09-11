@@ -9,16 +9,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"wisp/internal/config"
 	"wisp/internal/openai"
 	"wisp/internal/provider"
 	"wisp/internal/store"
-	"wisp/internal/toolcall"
 )
-
-const maxToolRounds = 5
 
 type ChatHandler struct {
 	cfg          *config.Config
@@ -46,24 +41,13 @@ type chatRequest struct {
 }
 
 type callOutcome struct {
-	Content     string
-	Reasoning   string
-	Usage       *store.Usage
-	Finish      string
-	Error       string
-	DurationMs  int
-	TTFTMs      int
-	Tool        *toolcall.Call
-	ToolEventID string
-}
-
-type toolResult struct {
-	Name   string
-	Input  string
-	Output string
-	Status string
-	Error  string
-	Reused bool
+	Content    string
+	Reasoning  string
+	Usage      *store.Usage
+	Finish     string
+	Error      string
+	DurationMs int
+	TTFTMs     int
 }
 
 func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
@@ -163,135 +147,93 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	if provCfg.APIKey != "" {
 		apiKey = provCfg.APIKey
 	}
-	var pendingTool *toolResult
-	var lastTool *toolResult
 
-	for callIndex := 1; callIndex <= maxToolRounds; callIndex++ {
-		if runCtx.Err() != nil {
-			h.finishCancelled(sse, sessionID, turnID, "")
-			return
-		}
-
-		history, err := h.store.ContextMessages(sessionID)
-		if err != nil {
-			h.finishTurnError(sse, sessionID, turnID, "", "读取上下文失败: "+err.Error())
-			return
-		}
-		systemPrompt := buildSystemPrompt(h.cfg.SystemPrompt, pendingTool)
-		messages := make([]openai.ChatMessage, 0, len(history)+1)
-		messages = append(messages, openai.ChatMessage{Role: "system", Content: systemPrompt})
-		for _, msg := range history {
-			messages = append(messages, openai.ChatMessage{Role: msg.Role, Content: msg.Content})
-		}
-
-		modelCallID, err := h.store.BeginModelCall(sessionID, turnID, callIndex, req.Provider, req.Model, req.Thinking, systemPrompt)
-		if err != nil {
-			h.finishTurnError(sse, sessionID, turnID, "", "创建 ModelCall 失败: "+err.Error())
-			return
-		}
-		_ = sse.WriteEvent("model.start", mustJSON(map[string]any{
-			"call_id":  modelCallID,
-			"index":    callIndex,
-			"provider": req.Provider,
-			"model":    req.Model,
-			"thinking": req.Thinking,
-		}))
-
-		upReq, err := h.openaiClient.BuildRequest(baseURL, apiKey, req.Model, modelInfo.ThinkingStyle, req.Thinking, messages)
-		if err != nil {
-			message := "构造请求失败: " + err.Error()
-			_ = h.store.AppendError(sessionID, turnID, modelCallID, message)
-			_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{Status: "failed", Finish: "error", Error: message})
-			h.finishTurnError(sse, sessionID, turnID, modelCallID, message)
-			return
-		}
-
-		outcome := h.runModelCall(runCtx, sse, upReq)
-		if runCtx.Err() != nil {
-			h.persistCallBody(sessionID, turnID, modelCallID, outcome)
-			_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
-				Status: "cancelled", Finish: "aborted", Usage: outcome.Usage,
-				DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs, Error: "生成已停止",
-			})
-			h.finishCancelled(sse, sessionID, turnID, modelCallID)
-			return
-		}
-
-		h.persistCallBody(sessionID, turnID, modelCallID, outcome)
-		if outcome.Error != "" {
-			_ = h.store.AppendError(sessionID, turnID, modelCallID, outcome.Error)
-			_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
-				Status: "failed", Finish: "error", Usage: outcome.Usage,
-				DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs, Error: outcome.Error,
-			})
-			h.finishTurnError(sse, sessionID, turnID, modelCallID, outcome.Error)
-			return
-		}
-
-		if outcome.Tool != nil {
-			var reuse *toolResult
-			if lastTool != nil && sameToolCall(lastTool, outcome.Tool) {
-				reuse = lastTool
-			}
-			result, err := h.handleTool(sse, sessionID, turnID, modelCallID, outcome, reuse)
-			if err != nil {
-				message := "保存工具结果失败: " + err.Error()
-				_ = h.store.AppendError(sessionID, turnID, modelCallID, message)
-				_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
-					Status: "failed", Finish: "error", Usage: outcome.Usage,
-					DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs, Error: message,
-				})
-				h.finishTurnError(sse, sessionID, turnID, modelCallID, message)
-				return
-			}
-			_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
-				Status: "completed", Finish: "tool_call", Usage: outcome.Usage,
-				DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs,
-			})
-			pendingTool = result
-			if !result.Reused {
-				lastTool = result
-			}
-			_ = sse.WriteEvent("model.done", mustJSON(map[string]any{
-				"call_id": modelCallID, "finish": "tool_call",
-				"duration_ms": outcome.DurationMs, "ttft_ms": outcome.TTFTMs,
-			}))
-			continue
-		}
-
-		finish := outcome.Finish
-		if finish == "" {
-			finish = "stop"
-		}
-		if outcome.Content == "" && outcome.Reasoning == "" {
-			message := "模型没有返回可显示的内容"
-			_ = h.store.AppendError(sessionID, turnID, modelCallID, message)
-			_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
-				Status: "failed", Finish: "error", Usage: outcome.Usage,
-				DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs, Error: message,
-			})
-			h.finishTurnError(sse, sessionID, turnID, modelCallID, message)
-			return
-		}
-		_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
-			Status: "completed", Finish: finish, Usage: outcome.Usage,
-			DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs,
-		})
-		_ = h.store.CompleteTurn(turnID, "completed")
-		_ = h.store.Touch(sessionID)
-		_ = sse.WriteEvent("model.done", mustJSON(map[string]any{
-			"call_id": modelCallID, "finish": finish,
-			"duration_ms": outcome.DurationMs, "ttft_ms": outcome.TTFTMs,
-		}))
-		_ = sse.WriteEvent("done", mustJSON(map[string]any{"finish": finish, "turn_id": turnID}))
+	if runCtx.Err() != nil {
+		h.finishCancelled(sse, sessionID, turnID, "")
 		return
 	}
 
-	message := fmt.Sprintf("工具调用超过上限 (%d)", maxToolRounds)
-	_ = h.store.AppendError(sessionID, turnID, "", message)
-	_ = h.store.CompleteTurn(turnID, "failed")
-	_ = sse.WriteEvent("error", mustJSON(map[string]any{"message": message}))
-	_ = sse.WriteEvent("done", mustJSON(map[string]any{"finish": "error", "error": message, "turn_id": turnID}))
+	history, err := h.store.ContextMessages(sessionID)
+	if err != nil {
+		h.finishTurnError(sse, sessionID, turnID, "", "读取上下文失败: "+err.Error())
+		return
+	}
+	systemPrompt := buildSystemPrompt(h.cfg.SystemPrompt)
+	messages := make([]openai.ChatMessage, 0, len(history)+1)
+	messages = append(messages, openai.ChatMessage{Role: "system", Content: systemPrompt})
+	for _, msg := range history {
+		messages = append(messages, openai.ChatMessage{Role: msg.Role, Content: msg.Content})
+	}
+
+	modelCallID, err := h.store.BeginModelCall(sessionID, turnID, 1, req.Provider, req.Model, req.Thinking, systemPrompt)
+	if err != nil {
+		h.finishTurnError(sse, sessionID, turnID, "", "创建 ModelCall 失败: "+err.Error())
+		return
+	}
+	_ = sse.WriteEvent("model.start", mustJSON(map[string]any{
+		"call_id":  modelCallID,
+		"index":    1,
+		"provider": req.Provider,
+		"model":    req.Model,
+		"thinking": req.Thinking,
+	}))
+
+	upReq, err := h.openaiClient.BuildRequest(baseURL, apiKey, req.Model, modelInfo.ThinkingStyle, req.Thinking, messages)
+	if err != nil {
+		message := "构造请求失败: " + err.Error()
+		_ = h.store.AppendError(sessionID, turnID, modelCallID, message)
+		_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{Status: "failed", Finish: "error", Error: message})
+		h.finishTurnError(sse, sessionID, turnID, modelCallID, message)
+		return
+	}
+
+	outcome := h.runModelCall(runCtx, sse, upReq)
+	if runCtx.Err() != nil {
+		h.persistCallBody(sessionID, turnID, modelCallID, outcome)
+		_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
+			Status: "cancelled", Finish: "aborted", Usage: outcome.Usage,
+			DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs, Error: "生成已停止",
+		})
+		h.finishCancelled(sse, sessionID, turnID, modelCallID)
+		return
+	}
+
+	h.persistCallBody(sessionID, turnID, modelCallID, outcome)
+	if outcome.Error != "" {
+		_ = h.store.AppendError(sessionID, turnID, modelCallID, outcome.Error)
+		_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
+			Status: "failed", Finish: "error", Usage: outcome.Usage,
+			DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs, Error: outcome.Error,
+		})
+		h.finishTurnError(sse, sessionID, turnID, modelCallID, outcome.Error)
+		return
+	}
+
+	finish := outcome.Finish
+	if finish == "" {
+		finish = "stop"
+	}
+	if outcome.Content == "" && outcome.Reasoning == "" {
+		message := "模型没有返回可显示的内容"
+		_ = h.store.AppendError(sessionID, turnID, modelCallID, message)
+		_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
+			Status: "failed", Finish: "error", Usage: outcome.Usage,
+			DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs, Error: message,
+		})
+		h.finishTurnError(sse, sessionID, turnID, modelCallID, message)
+		return
+	}
+	_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
+		Status: "completed", Finish: finish, Usage: outcome.Usage,
+		DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs,
+	})
+	_ = h.store.CompleteTurn(turnID, "completed")
+	_ = h.store.Touch(sessionID)
+	_ = sse.WriteEvent("model.done", mustJSON(map[string]any{
+		"call_id": modelCallID, "finish": finish,
+		"duration_ms": outcome.DurationMs, "ttft_ms": outcome.TTFTMs,
+	}))
+	_ = sse.WriteEvent("done", mustJSON(map[string]any{"finish": finish, "turn_id": turnID}))
 }
 
 func (h *ChatHandler) runModelCall(ctx context.Context, sse *SSEWriter, upReq *http.Request) callOutcome {
@@ -309,13 +251,8 @@ func (h *ChatHandler) runModelCall(ctx context.Context, sse *SSEWriter, upReq *h
 	var out callOutcome
 	var finalUsage *openai.Usage
 	var firstToken time.Time
-	framer := &toolcall.Framer{}
-	streamStoppedForTool := false
 
 	for evt := range ch {
-		if streamStoppedForTool {
-			continue
-		}
 		switch evt.Type {
 		case "reasoning":
 			if firstToken.IsZero() {
@@ -329,35 +266,8 @@ func (h *ChatHandler) runModelCall(ctx context.Context, sse *SSEWriter, upReq *h
 				firstToken = time.Now()
 				_ = sse.WriteEvent("ttft", mustJSON(map[string]any{"ms": firstToken.Sub(startTime).Milliseconds()}))
 			}
-			parsed := framer.Feed(evt.Text)
-			if parsed.Text != "" {
-				out.Content += parsed.Text
-				_ = sse.WriteEvent("delta", mustJSON(map[string]any{"text": parsed.Text}))
-			}
-			if parsed.Detected && out.ToolEventID == "" {
-				out.ToolEventID = "tc_" + strings.ReplaceAll(uuid.New().String(), "-", "")
-				_ = sse.WriteEvent("tool.detecting", mustJSON(map[string]any{"call_id": out.ToolEventID}))
-			}
-			if parsed.Err != nil {
-				out.Error = "工具调用解析失败: " + parsed.Err.Error()
-				out.Finish = "error"
-				if out.ToolEventID != "" {
-					_ = sse.WriteEvent("tool.failed", mustJSON(map[string]any{"call_id": out.ToolEventID, "error": out.Error}))
-				}
-				_ = reader.Close()
-				streamStoppedForTool = true
-				continue
-			}
-			if parsed.Call != nil {
-				out.Tool = parsed.Call
-				if out.ToolEventID == "" {
-					out.ToolEventID = "tc_" + strings.ReplaceAll(uuid.New().String(), "-", "")
-					_ = sse.WriteEvent("tool.detecting", mustJSON(map[string]any{"call_id": out.ToolEventID}))
-				}
-				out.Finish = "tool_call"
-				_ = reader.Close()
-				streamStoppedForTool = true
-			}
+			out.Content += evt.Text
+			_ = sse.WriteEvent("delta", mustJSON(map[string]any{"text": evt.Text}))
 		case "usage":
 			finalUsage = evt.Usage
 			_ = sse.WriteEvent("usage", mustJSON(evt.Usage))
@@ -368,21 +278,6 @@ func (h *ChatHandler) runModelCall(ctx context.Context, sse *SSEWriter, upReq *h
 		case "error":
 			out.Error = evt.Error
 			out.Finish = "error"
-		}
-	}
-
-	if !streamStoppedForTool && out.Error == "" {
-		last := framer.Finalize()
-		if last.Text != "" {
-			out.Content += last.Text
-			_ = sse.WriteEvent("delta", mustJSON(map[string]any{"text": last.Text}))
-		}
-		if last.Err != nil {
-			out.Error = "工具调用解析失败: " + last.Err.Error()
-			out.Finish = "error"
-			if out.ToolEventID != "" {
-				_ = sse.WriteEvent("tool.failed", mustJSON(map[string]any{"call_id": out.ToolEventID, "error": out.Error}))
-			}
 		}
 	}
 
@@ -409,104 +304,12 @@ func (h *ChatHandler) persistCallBody(sessionID, turnID, modelCallID string, out
 	_ = h.store.AppendAssistant(sessionID, turnID, modelCallID, out.Content)
 }
 
-func (h *ChatHandler) handleTool(sse *SSEWriter, sessionID, turnID, modelCallID string, out callOutcome, reuse *toolResult) (*toolResult, error) {
-	call := out.Tool
-	toolID := out.ToolEventID
-	if toolID == "" {
-		toolID = "tc_" + strings.ReplaceAll(uuid.New().String(), "-", "")
-	}
-	if err := h.store.BeginToolCall(toolID, sessionID, turnID, modelCallID, call.Name, call.Raw, call.Body); err != nil {
-		return nil, err
-	}
-	if err := h.store.AppendToolCallRecord(sessionID, turnID, modelCallID, toolID, call.Name, call.Raw); err != nil {
-		return nil, err
-	}
-
-	status, output, toolErr := "", "", ""
-	reused := reuse != nil
-	if reused {
-		status = reuse.Status
-		output = reuse.Output
-		toolErr = reuse.Error
-	} else {
-		status, output, toolErr = executeTool(call)
-	}
-	if err := h.store.FinishToolCall(toolID, status, output, toolErr); err != nil {
-		return nil, err
-	}
-	if err := h.store.AppendToolOutputRecord(sessionID, turnID, modelCallID, toolID, output); err != nil {
-		return nil, err
-	}
-
-	if status == "completed" {
-		_ = sse.WriteEvent("tool.completed", mustJSON(map[string]any{
-			"call_id": toolID, "name": call.Name, "output": output, "reused": reused,
-		}))
-	} else {
-		_ = sse.WriteEvent("tool.failed", mustJSON(map[string]any{
-			"call_id": toolID, "name": call.Name, "output": output, "error": toolErr, "reused": reused,
-		}))
-	}
-	return &toolResult{Name: call.Name, Input: call.Body, Output: output, Status: status, Error: toolErr, Reused: reused}, nil
-}
-
-func sameToolCall(previous *toolResult, call *toolcall.Call) bool {
-	return previous != nil && call != nil && previous.Name == call.Name && previous.Input == call.Body
-}
-
-func executeTool(call *toolcall.Call) (status, output, message string) {
-	switch call.Name {
-	case "Time":
-		if strings.TrimSpace(call.Body) != "" {
-			message = "Time 不接受参数"
-			return "failed", "ToolError: " + message, message
-		}
-		return "completed", time.Now().Format("2006-1-2 15:04"), ""
-	default:
-		message = fmt.Sprintf("unknown tool %q", call.Name)
-		return "failed", "ToolError: " + message, message
-	}
-}
-
-func buildSystemPrompt(userPrompt string, pending *toolResult) string {
+func buildSystemPrompt(userPrompt string) string {
 	userPrompt = strings.TrimSpace(userPrompt)
 	if userPrompt == "" {
 		userPrompt = config.DefaultSystemPrompt
 	}
-
-	var b strings.Builder
-	b.WriteString("<System>\n")
-	b.WriteString(userPrompt)
-	b.WriteString(`
-
-可用工具：
-Time：获取 Wisp 后端当前本地时间。
-
-只有回答需要当前时间，或用户明确要求调用/测试 Time 时才调用 Time；其他情况直接回答。
-需要调用时，在回复末尾输出 <tc:Time />。
-不要解释、讨论、模拟或展示工具调用语法。`)
-
-	if pending != nil {
-		b.WriteString("\n\n")
-		if pending.Reused {
-			b.WriteString("你刚刚重复请求了同一个工具，Wisp 没有再次执行。请直接使用已有结果完成回答。\n")
-		} else if pending.Status == "completed" {
-			b.WriteString("上一工具 ")
-			b.WriteString(pending.Name)
-			b.WriteString(" 已成功执行，结果如下：\n")
-		} else {
-			b.WriteString("上一工具 ")
-			b.WriteString(pending.Name)
-			b.WriteString(" 执行失败，结果如下：\n")
-		}
-		b.WriteString("<Output>")
-		b.WriteString(pending.Output)
-		b.WriteString("</Output>\n")
-		b.WriteString("直接根据结果继续上一轮回答；不要等待工具结果，不要再次调用刚刚完成的工具，也不要重复已经输出过的正文。")
-	}
-
-	b.WriteString("\n</System>")
-	return b.String()
+	return "<System>\n" + userPrompt + "\n</System>"
 }
 
 func (h *ChatHandler) finishCancelled(sse *SSEWriter, sessionID, turnID, modelCallID string) {
@@ -522,7 +325,7 @@ func (h *ChatHandler) finishTurnError(sse *SSEWriter, sessionID, turnID, modelCa
 	_ = h.store.CompleteTurn(turnID, "failed")
 	_ = h.store.Touch(sessionID)
 	_ = sse.WriteEvent("error", mustJSON(map[string]any{"call_id": modelCallID, "message": message}))
-	_ = sse.WriteEvent("done", mustJSON(map[string]any{"finish": "error", "turn_id": turnID, "error": message}))
+	_ = sse.WriteEvent("done", mustJSON(map[string]any{"finish": "error", "error": message, "turn_id": turnID}))
 }
 
 func mustJSON(value any) string {

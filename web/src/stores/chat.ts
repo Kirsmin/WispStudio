@@ -6,14 +6,6 @@ import { useSessionsStore } from './sessions'
 export type StreamPhase = 'idle' | 'waiting' | 'reasoning' | 'answer' | 'done' | 'error'
 export type MessageStatus = 'complete' | 'streaming' | 'background' | 'aborted' | 'error'
 
-export interface ToolView {
-  id: string
-  name: string
-  status: 'detecting' | 'completed' | 'failed'
-  output?: string
-  error?: string
-}
-
 export interface ChatMessage {
   id: string
   type: 'user' | 'assistant'
@@ -22,7 +14,6 @@ export interface ChatMessage {
   provider?: string
   model?: string
   thinking?: string
-  tools?: ToolView[]
   usage?: {
     prompt_tokens: number
     completion_tokens: number
@@ -186,13 +177,6 @@ export const useChatStore = defineStore('chat', () => {
       provider: m.provider,
       model: m.model,
       thinking: m.thinking,
-      tools: Array.isArray(m.tools) ? m.tools.map((tool: any) => ({
-        id: String(tool.id || ''),
-        name: String(tool.name || ''),
-        status: tool.status === 'failed' ? 'failed' : (tool.status === 'running' ? 'detecting' : 'completed'),
-        output: tool.output ? String(tool.output) : undefined,
-        error: tool.error ? String(tool.error) : undefined,
-      })) : [],
       usage: m.usage,
       duration_ms: m.duration_ms,
       ttft_ms: m.ttft_ms,
@@ -271,40 +255,12 @@ export const useChatStore = defineStore('chat', () => {
       provider: String(payload.provider || selectedProvider.value),
       model: String(payload.model || selectedModel.value),
       thinking: String(payload.thinking || selectedThinking.value),
-      tools: [],
       streaming: true,
       phase: 'waiting',
       status: 'streaming',
     })
     messages.value.push(message)
     return message
-  }
-
-  function findTool(message: ChatMessage | null, id: string): ToolView | undefined {
-    return message?.tools?.find(tool => tool.id === id)
-  }
-
-  function finishToolAfterPaint(message: ChatMessage | null, payload: Record<string, any>, status: 'completed' | 'failed') {
-    if (!message) return
-    const id = String(payload.call_id || '')
-    const apply = () => {
-      let tool = findTool(message, id)
-      if (!tool) {
-        message.tools ||= []
-        tool = reactive<ToolView>({ id, name: '', status })
-        message.tools.push(tool)
-      }
-      tool.name = String(payload.name || tool.name || '')
-      tool.status = status
-      tool.output = payload.output ? String(payload.output) : undefined
-      tool.error = payload.error ? String(payload.error) : undefined
-    }
-    const tool = findTool(message, id)
-    if (!tool || tool.status !== 'detecting') {
-      apply()
-      return
-    }
-    window.setTimeout(apply, 80)
   }
 
   async function sendMessage() {
@@ -383,25 +339,6 @@ export const useChatStore = defineStore('chat', () => {
             break
           case 'usage':
             if (assistantRef.value) assistantRef.value.usage = payload as ChatMessage['usage']
-            break
-          case 'tool.detecting': {
-            batcher.flush()
-            if (!assistantRef.value) assistantRef.value = createAssistant({})
-            assistantRef.value.phase = assistantRef.value.content ? 'answer' : 'done'
-            const id = String(payload.call_id || `tc_${Date.now()}`)
-            if (!findTool(assistantRef.value, id)) {
-              assistantRef.value.tools ||= []
-              assistantRef.value.tools.push(reactive<ToolView>({ id, name: '', status: 'detecting' }))
-            }
-            break
-          }
-          case 'tool.completed':
-            batcher.flush()
-            finishToolAfterPaint(assistantRef.value, payload, 'completed')
-            break
-          case 'tool.failed':
-            batcher.flush()
-            finishToolAfterPaint(assistantRef.value, payload, 'failed')
             break
           case 'model.done': {
             batcher.flush()

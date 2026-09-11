@@ -19,9 +19,6 @@ func (s *Store) SyncJSONL() error {
 	if err := os.MkdirAll(filepath.Join(tmp, "Requests"), 0755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Join(tmp, "Tools"), 0755); err != nil {
-		return err
-	}
 
 	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
 	if err != nil {
@@ -79,11 +76,11 @@ func exportSessionFiles(tx *sql.Tx, root, sessionID string) error {
 	if err := exportModelCalls(tx, filepath.Join(root, "Requests", sessionID+".jsonl"), sessionID); err != nil {
 		return err
 	}
-	return exportToolCalls(tx, filepath.Join(root, "Tools", sessionID+".jsonl"), sessionID)
+	return nil
 }
 
 func exportRecords(tx *sql.Tx, path, sessionID string) error {
-	rows, err := tx.Query(`SELECT id,session_id,COALESCE(turn_id,''),seq,COALESCE(model_call_id,''),COALESCE(tool_call_id,''),kind,content,data_json,created_at FROM records WHERE session_id=? ORDER BY seq`, sessionID)
+	rows, err := tx.Query(`SELECT id,session_id,COALESCE(turn_id,''),seq,COALESCE(model_call_id,''),kind,content,data_json,created_at FROM records WHERE session_id=? ORDER BY seq`, sessionID)
 	if err != nil {
 		return err
 	}
@@ -91,7 +88,7 @@ func exportRecords(tx *sql.Tx, path, sessionID string) error {
 	return writeRows(path, rows, func() (any, error) {
 		var r Record
 		var raw string
-		if err := rows.Scan(&r.ID, &r.SessionID, &r.TurnID, &r.Seq, &r.ModelCallID, &r.ToolCallID, &r.Kind, &r.Content, &raw, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.SessionID, &r.TurnID, &r.Seq, &r.ModelCallID, &r.Kind, &r.Content, &raw, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		r.Data = json.RawMessage(raw)
@@ -130,34 +127,6 @@ func exportModelCalls(tx *sql.Tx, path, sessionID string) error {
 	return writeRows(path, rows, func() (any, error) {
 		var v modelCallExport
 		err := rows.Scan(&v.ID, &v.SessionID, &v.TurnID, &v.CallIndex, &v.Provider, &v.Model, &v.Thinking, &v.Status, &v.FinishReason, &v.SystemPromptSnapshot, &v.PromptTokens, &v.CompletionTokens, &v.CachedTokens, &v.ReasoningTokens, &v.DurationMs, &v.TTFTMs, &v.Error, &v.CreatedAt, &v.CompletedAt)
-		return v, err
-	})
-}
-
-type toolCallExport struct {
-	ID          string `json:"id"`
-	SessionID   string `json:"session_id"`
-	TurnID      string `json:"turn_id"`
-	ModelCallID string `json:"model_call_id"`
-	ToolName    string `json:"tool_name"`
-	RawCall     string `json:"raw_call"`
-	Input       string `json:"input,omitempty"`
-	Output      string `json:"output,omitempty"`
-	Status      string `json:"status"`
-	Error       string `json:"error,omitempty"`
-	CreatedAt   string `json:"created_at"`
-	CompletedAt string `json:"completed_at,omitempty"`
-}
-
-func exportToolCalls(tx *sql.Tx, path, sessionID string) error {
-	rows, err := tx.Query(`SELECT id,session_id,turn_id,model_call_id,tool_name,raw_call,input,output,status,error,created_at,COALESCE(completed_at,'') FROM tool_calls WHERE session_id=? ORDER BY created_at,id`, sessionID)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	return writeRows(path, rows, func() (any, error) {
-		var v toolCallExport
-		err := rows.Scan(&v.ID, &v.SessionID, &v.TurnID, &v.ModelCallID, &v.ToolName, &v.RawCall, &v.Input, &v.Output, &v.Status, &v.Error, &v.CreatedAt, &v.CompletedAt)
 		return v, err
 	})
 }

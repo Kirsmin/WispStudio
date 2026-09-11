@@ -9,12 +9,10 @@ import (
 )
 
 const (
-	RecordUser       = "user"
-	RecordAssistant  = "assistant"
-	RecordThinking   = "thinking"
-	RecordToolCall   = "tool_call"
-	RecordToolOutput = "tool_output"
-	RecordError      = "error"
+	RecordUser      = "user"
+	RecordAssistant = "assistant"
+	RecordThinking  = "thinking"
+	RecordError     = "error"
 )
 
 type Usage struct {
@@ -24,29 +22,20 @@ type Usage struct {
 	ReasoningTokens  int `json:"reasoning_tokens"`
 }
 
-type ToolView struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	Output string `json:"output,omitempty"`
-	Error  string `json:"error,omitempty"`
-}
-
 type Message struct {
-	ID         string     `json:"id"`
-	Type       string     `json:"type"`
-	TS         string     `json:"ts,omitempty"`
-	Content    string     `json:"content"`
-	Provider   string     `json:"provider,omitempty"`
-	Model      string     `json:"model,omitempty"`
-	Thinking   string     `json:"thinking,omitempty"`
-	Reasoning  string     `json:"reasoning,omitempty"`
-	Tools      []ToolView `json:"tools,omitempty"`
-	Usage      *Usage     `json:"usage,omitempty"`
-	DurationMs int        `json:"duration_ms,omitempty"`
-	TTFTMs     int        `json:"ttft_ms,omitempty"`
-	Finish     string     `json:"finish,omitempty"`
-	Error      string     `json:"error,omitempty"`
+	ID         string  `json:"id"`
+	Type       string  `json:"type"`
+	TS         string  `json:"ts,omitempty"`
+	Content    string  `json:"content"`
+	Provider   string  `json:"provider,omitempty"`
+	Model      string  `json:"model,omitempty"`
+	Thinking   string  `json:"thinking,omitempty"`
+	Reasoning  string  `json:"reasoning,omitempty"`
+	Usage      *Usage  `json:"usage,omitempty"`
+	DurationMs int     `json:"duration_ms,omitempty"`
+	TTFTMs     int     `json:"ttft_ms,omitempty"`
+	Finish     string  `json:"finish,omitempty"`
+	Error      string  `json:"error,omitempty"`
 }
 
 type ContextMessage struct {
@@ -60,7 +49,6 @@ type Record struct {
 	TurnID      string          `json:"turn_id,omitempty"`
 	Seq         int64           `json:"seq"`
 	ModelCallID string          `json:"model_call_id,omitempty"`
-	ToolCallID  string          `json:"tool_call_id,omitempty"`
 	Kind        string          `json:"kind"`
 	Content     string          `json:"content,omitempty"`
 	Data        json.RawMessage `json:"data,omitempty"`
@@ -125,23 +113,6 @@ func (s *Store) AppendError(sessionID, turnID, modelCallID, message string) erro
 	return err
 }
 
-func (s *Store) AppendToolCallRecord(sessionID, turnID, modelCallID, toolCallID, name, raw string) error {
-	data, _ := json.Marshal(map[string]string{"name": name, "raw_call": raw})
-	_, err := s.appendRecord(Record{
-		SessionID: sessionID, TurnID: turnID, ModelCallID: modelCallID, ToolCallID: toolCallID,
-		Kind: RecordToolCall, Data: data,
-	})
-	return err
-}
-
-func (s *Store) AppendToolOutputRecord(sessionID, turnID, modelCallID, toolCallID, output string) error {
-	_, err := s.appendRecord(Record{
-		SessionID: sessionID, TurnID: turnID, ModelCallID: modelCallID, ToolCallID: toolCallID,
-		Kind: RecordToolOutput, Content: output,
-	})
-	return err
-}
-
 func (s *Store) appendRecord(record Record) (Record, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -156,10 +127,10 @@ func (s *Store) appendRecord(record Record) (Record, error) {
 	if len(record.Data) == 0 {
 		record.Data = json.RawMessage(`{}`)
 	}
-	_, err = tx.Exec(`INSERT INTO records(id,session_id,turn_id,seq,model_call_id,tool_call_id,kind,content,data_json,created_at)
-		VALUES(?,?,?,?,NULLIF(?,''),NULLIF(?,''),?,?,?,?)`,
+	_, err = tx.Exec(`INSERT INTO records(id,session_id,turn_id,seq,model_call_id,kind,content,data_json,created_at)
+		VALUES(?,?,?,?,NULLIF(?,''),?,?,?,?)`,
 		record.ID, record.SessionID, nullString(record.TurnID), record.Seq,
-		record.ModelCallID, record.ToolCallID, record.Kind, record.Content, string(record.Data), record.CreatedAt)
+		record.ModelCallID, record.Kind, record.Content, string(record.Data), record.CreatedAt)
 	if err != nil {
 		return record, err
 	}
@@ -179,9 +150,7 @@ func (s *Store) ContextMessages(sessionID string) ([]ContextMessage, error) {
 	}
 	defer rows.Close()
 
-	// 模型上下文只回放用户与可见助手正文。Thinking、ToolCall、ToolOutput
-	// 都是运行时语义记录：Thinking 仅用于 UI/debug，工具结果由下一次 ModelCall
-	// 的首条 System Prompt 动态注入，避免在历史中出现中途 system message。
+	// 模型上下文只回放用户与可见助手正文。Thinking 仅用于 UI/debug。
 	var out []ContextMessage
 	for rows.Next() {
 		var kind, content string
@@ -203,11 +172,7 @@ func (s *Store) ListMessages(sessionID string) ([]Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	tools, err := s.loadToolViews(sessionID)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := s.db.Query(`SELECT id,kind,content,COALESCE(model_call_id,''),COALESCE(tool_call_id,''),data_json,created_at FROM records WHERE session_id=? ORDER BY seq`, sessionID)
+	rows, err := s.db.Query(`SELECT id,kind,content,COALESCE(model_call_id,''),data_json,created_at FROM records WHERE session_id=? ORDER BY seq`, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -216,8 +181,8 @@ func (s *Store) ListMessages(sessionID string) ([]Message, error) {
 	var out []Message
 	assistantIndex := map[string]int{}
 	for rows.Next() {
-		var recordID, kind, content, modelCallID, toolCallID, rawData, created string
-		if err := rows.Scan(&recordID, &kind, &content, &modelCallID, &toolCallID, &rawData, &created); err != nil {
+		var recordID, kind, content, modelCallID, rawData, created string
+		if err := rows.Scan(&recordID, &kind, &content, &modelCallID, &rawData, &created); err != nil {
 			return nil, err
 		}
 		if kind == RecordUser {
@@ -230,7 +195,7 @@ func (s *Store) ListMessages(sessionID string) ([]Message, error) {
 			out = append(out, Message{ID: recordID, Type: "user", TS: created, Content: content, Provider: data.Provider, Model: data.Model, Thinking: data.Thinking})
 			continue
 		}
-		if modelCallID == "" || (kind != RecordThinking && kind != RecordAssistant && kind != RecordToolCall && kind != RecordError) {
+		if modelCallID == "" || (kind != RecordThinking && kind != RecordAssistant && kind != RecordError) {
 			continue
 		}
 		idx, exists := assistantIndex[modelCallID]
@@ -251,10 +216,6 @@ func (s *Store) ListMessages(sessionID string) ([]Message, error) {
 			out[idx].Reasoning += content
 		case RecordAssistant:
 			out[idx].Content += content
-		case RecordToolCall:
-			if tool, ok := tools[toolCallID]; ok {
-				out[idx].Tools = append(out[idx].Tools, tool)
-			}
 		case RecordError:
 			if out[idx].Error == "" {
 				out[idx].Error = content
@@ -288,23 +249,6 @@ func (s *Store) loadModelCalls(sessionID string) (map[string]modelCallView, erro
 			v.Usage = &u
 		}
 		out[id] = v
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) loadToolViews(sessionID string) (map[string]ToolView, error) {
-	rows, err := s.db.Query(`SELECT id,tool_name,status,output,error FROM tool_calls WHERE session_id=?`, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]ToolView{}
-	for rows.Next() {
-		var v ToolView
-		if err := rows.Scan(&v.ID, &v.Name, &v.Status, &v.Output, &v.Error); err != nil {
-			return nil, err
-		}
-		out[v.ID] = v
 	}
 	return out, rows.Err()
 }

@@ -97,27 +97,12 @@ CREATE TABLE IF NOT EXISTS model_calls (
     completed_at TEXT,
     UNIQUE(turn_id, call_index)
 );
-CREATE TABLE IF NOT EXISTS tool_calls (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
-    model_call_id TEXT NOT NULL REFERENCES model_calls(id) ON DELETE CASCADE,
-    tool_name TEXT NOT NULL DEFAULT '',
-    raw_call TEXT NOT NULL DEFAULT '',
-    input TEXT NOT NULL DEFAULT '',
-    output TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL,
-    error TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    completed_at TEXT
-);
 CREATE TABLE IF NOT EXISTS records (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     turn_id TEXT REFERENCES turns(id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
     model_call_id TEXT REFERENCES model_calls(id) ON DELETE CASCADE,
-    tool_call_id TEXT REFERENCES tool_calls(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
     content TEXT NOT NULL DEFAULT '',
     data_json TEXT NOT NULL DEFAULT '{}',
@@ -126,7 +111,6 @@ CREATE TABLE IF NOT EXISTS records (
 );
 CREATE INDEX IF NOT EXISTS idx_records_session_seq ON records(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_model_calls_session ON model_calls(session_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id, created_at);
 INSERT INTO meta(key, value) VALUES ('schema_version', '1')
 ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 `
