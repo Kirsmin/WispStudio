@@ -248,7 +248,7 @@ export const useChatStore = defineStore('chat', () => {
         const record = payload.record
         if (record?.id) upsertRecord(normalizeRecord(record))
       } else if (event.event === 'model.start') {
-        streamingModel.value = reactive({ callId: String(payload.call_id || ''), agentRunId: payload.agent_run_id, profileId: payload.profile_id, model: payload.model, reasoning: '', content: '', phase: 'waiting' })
+        streamingModel.value = reactive<StreamingModel>({ callId: String(payload.call_id || ''), agentRunId: payload.agent_run_id, profileId: payload.profile_id, model: payload.model, reasoning: '', content: '', phase: 'waiting' })
         runtimeState.value.execution = { active: true, turn_id: String(payload.turn_id || runtimeState.value.turn?.id || '') }
       } else if (event.event === 'reasoning') {
         if (streamingModel.value) { streamingModel.value.reasoning += String(payload.text || ''); if (!streamingModel.value.content) streamingModel.value.phase = 'reasoning' }
