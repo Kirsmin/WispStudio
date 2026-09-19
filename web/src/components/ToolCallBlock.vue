@@ -1,5 +1,5 @@
 <template>
-  <div class="tool-block" :class="statusClass">
+  <div class="tool-block" :class="[statusClass, { compact }]">
     <div class="tool-shell">
       <div class="tool-status-icon" aria-hidden="true">
         <span v-if="status === 'running'" class="running-dot" />
@@ -51,7 +51,8 @@
 import { computed, ref } from 'vue'
 import type { TimelineRecord } from '../stores/chat'
 
-const props = defineProps<{ records: TimelineRecord[] }>()
+const props = withDefaults(defineProps<{ records: TimelineRecord[]; compact?: boolean }>(), { compact: false })
+const compact = computed(() => props.compact)
 const detailsOpen = ref(false)
 type ToolStatus = 'completed' | 'failed' | 'rejected' | 'cancelled' | 'running' | 'queued'
 
@@ -359,6 +360,14 @@ function prettyLimited(value: unknown, max: number): string {
 }
 .detail-output { margin-top: 10px; }
 .detail-output pre { white-space: pre; word-break: normal; }
+.tool-block.compact { margin-bottom: 6px; border-radius: 9px; background: rgba(255, 255, 255, .72); }
+.tool-block.compact .tool-shell { grid-template-columns: 24px minmax(0, 1fr) auto; gap: 8px; padding: 7px 9px; }
+.tool-block.compact .tool-status-icon { width: 23px; height: 23px; border-radius: 7px; font-size: 12px; }
+.tool-block.compact .tool-title { font-size: 12px; }
+.tool-block.compact .tool-summary { font-size: 11px; margin-top: 2px; }
+.tool-block.compact .tool-result { margin: -1px 9px 7px 41px; padding: 6px 8px; }
+.tool-block.compact .result-preview { max-height: 110px; }
+.tool-block.compact .tool-details { padding: 8px 9px 9px 41px; }
 @media (max-width: 680px) {
   .tool-shell { grid-template-columns: 28px minmax(0, 1fr); }
   .details-button { grid-column: 2; justify-self: start; padding-left: 0; }

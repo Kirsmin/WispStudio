@@ -56,9 +56,10 @@ func NewCoordinator(cfg *config.Config, catalog *provider.Catalog, st *store.Sto
 	}
 }
 
-func (c *Coordinator) Profiles() []AgentProfile { return c.profiles.List() }
-func (c *Coordinator) Hub() *EventHub           { return c.hub }
-func (c *Coordinator) Runs() *RunRegistry       { return c.runs }
+func (c *Coordinator) Profiles() []AgentProfile            { return c.profiles.List() }
+func (c *Coordinator) Hub() *EventHub                      { return c.hub }
+func (c *Coordinator) Runs() *RunRegistry                  { return c.runs }
+func (c *Coordinator) CurrentPhaseID(turnID string) string { return c.tools.currentPhaseID(turnID) }
 
 func (c *Coordinator) Capabilities(turn *store.Turn, executionActive, hasApproval, hasPlan bool) map[string]bool {
 	caps := c.store.TurnCapabilities(turn, executionActive, hasApproval, hasPlan)
@@ -83,7 +84,7 @@ func (c *Coordinator) ArtifactVersionMutable(turn *store.Turn, artifact *store.A
 	if turn.Status == store.TurnCompleted || turn.Status == store.TurnStopped || turn.Status == store.TurnCancelled || turn.Status == store.TurnFailed {
 		return false
 	}
-	// Transition target profile（例如 Build）会冻结作为输入契约的 Artifact。
+	// 迁移目标 Profile（例如 Build）会冻结作为输入契约的 Artifact。
 	return !c.profiles.ArtifactFrozenByProfile(turn.ActiveAgent, artifact.Type, artifact.Name)
 }
 
@@ -131,6 +132,7 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 		turn.RootAgentRunID = run.ID
 	}
 
+	nextTrigger := initialCallTrigger(turn)
 	for action := 0; action < 96; action++ {
 		if c.handleCancellation(ctx, turn.ID) {
 			return
@@ -152,6 +154,11 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 			if !c.applyResolvedApproval(ctx, turn, resolved) {
 				return
 			}
+			if resolved.Status == "rejected" {
+				nextTrigger = "用户拒绝 Approval，已写入 Tool Result：" + resolved.ToolName
+			} else {
+				nextTrigger = "Approval 已处理并获得 Tool Result：" + resolved.ToolName
+			}
 			continue
 		}
 		pending, err := c.store.PendingApproval(turn.ID)
@@ -170,7 +177,12 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 			c.failTurn(turn, "未知 AgentProfile: "+turn.ActiveAgent)
 			return
 		}
-		compiled, err := c.compiler.Compile(CompileInput{Turn: turn, Profile: profile, AgentRunID: turn.ActiveAgentRunID})
+		profile = effectiveProfile(profile, turn.TaskComplexity, turn.AllowReconnaissance)
+		trigger := nextTrigger
+		if steering, steeringErr := c.store.PendingSteering(turn.ID, turn.SteeringCursor); steeringErr == nil && len(steering) > 0 {
+			trigger = fmt.Sprintf("用户 Steering 到达安全点：%d 条新指令", len(steering))
+		}
+		compiled, err := c.compiler.Compile(CompileInput{Turn: turn, Profile: profile, AgentRunID: turn.ActiveAgentRunID, Trigger: trigger})
 		if err != nil {
 			c.failTurn(turn, "Context Compile 失败: "+err.Error())
 			return
@@ -195,6 +207,13 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 				_ = c.store.SetTurnStatus(turn.ID, store.TurnWaitingUser)
 				c.publish("runtime.status", turn, map[string]any{"status": store.TurnWaitingUser, "reason": "agent_waiting", "profile_id": profile.ID})
 			case "complete_turn":
+				if profile.ID == "build" && turn.TaskComplexity == "complex" {
+					if phaseID := c.tools.currentPhaseID(turn.ID); phaseID != "" {
+						nextTrigger = "Runtime 状态约束：当前 " + phaseID + " 尚未关闭；阶段工作完成后先调用 done_phase，否则继续执行"
+						_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, Kind: store.EventRuntimeHint, Content: "复杂任务仍有进行中的 Phase，Runtime 暂不允许提前完成 Turn。"})
+						continue
+					}
+				}
 				c.completeTurn(turn, out.Content)
 			default:
 				c.failTurn(turn, "Root Agent 不支持 IdlePolicy: "+profile.IdlePolicy)
@@ -202,40 +221,113 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 			return
 		}
 
-		// Runtime 是严格串行 Action Loop：一次模型响应只采纳第一个 ToolCall。
-		// 历史实现会先记录全部 ToolCall、再拒绝后续调用，导致重建上下文时出现
-		// assistant.tool_calls 与 tool 结果交错，从而被 OpenAI 兼容接口以 HTTP 400 拒绝。
-		// 未采纳的调用不进入 Timeline/上下文，模型会在拿到首个 ToolResult 后重新规划。
-		call := out.ToolCalls[0]
-		c.recordToolRequested(turn, turn.ActiveAgentRunID, callID, out.Reasoning, call)
-		decision := c.permissions.Evaluate(profile, call.Name, c.tools)
-		switch decision.Action {
-		case "deny":
-			c.recordToolResult(turn, call, ToolResult{Status: "rejected", Error: decision.Risk})
-			continue
-		case "ask_user":
-			approval, err := c.store.CreateApproval(turn.SessionID, turn.ID, turn.ActiveAgentRunID, call.ID, call.Name, call.Arguments, decision.Risk)
-			if err != nil {
-				c.failTurn(turn, err.Error())
+		calls := acceptedToolBatch(out.ToolCalls)
+		for _, call := range calls {
+			c.recordToolRequested(turn, turn.ActiveAgentRunID, callID, out.Reasoning, call)
+		}
+		for _, call := range calls {
+			decision := c.permissions.Evaluate(profile, call, c.tools)
+			switch decision.Action {
+			case "deny":
+				c.recordToolResult(turn, call, ToolResult{Status: "rejected", Error: decision.Risk})
+				continue
+			case "ask_user":
+				phaseID := c.tools.currentPhaseID(turn.ID)
+				granted, grantErr := c.store.ApprovalGrantAllows(turn.ID, call.Name, decision.RiskClass, phaseID)
+				if grantErr != nil {
+					c.failTurn(turn, "读取授权作用域失败: "+grantErr.Error())
+					return
+				}
+				if !granted {
+					approval, err := c.store.CreateApproval(turn.SessionID, turn.ID, turn.ActiveAgentRunID, call.ID, call.Name, call.Arguments, decision.Risk, decision.RiskClass)
+					if err != nil {
+						c.failTurn(turn, err.Error())
+						return
+					}
+					_ = c.store.SetTurnStatus(turn.ID, store.TurnWaitingUser)
+					c.publish("approval.requested", turn, approval)
+					return
+				}
+			}
+
+			result := c.executeTool(ctx, turn, selection, call)
+			c.recordToolResult(turn, call, result)
+			if call.Name == "done_phase" && result.Status == "success" {
+				if err := c.compactPhase(turn, call, result); err != nil {
+					_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, Kind: store.EventRuntimeHint, Content: "Phase 已完成，但创建 Checkpoint 失败: " + err.Error()})
+				}
+			}
+			if (call.Name == "new_plan" || call.Name == "edit_plan") && result.Status == "success" && profile.ID == "plan" {
+				c.finishPlanAfterSave(turn, result)
 				return
 			}
-			_ = c.store.SetTurnStatus(turn.ID, store.TurnWaitingUser)
-			c.publish("approval.requested", turn, approval)
-			return
 		}
+		toolNames := make([]string, 0, len(calls))
+		for _, call := range calls {
+			toolNames = append(toolNames, call.Name)
+		}
+		nextTrigger = "Tool Result 已返回：" + strings.Join(toolNames, ", ")
 
-		result := c.executeTool(ctx, turn, selection, call)
-		c.recordToolResult(turn, call, result)
-		if call.Name == "done_phase" && result.Status == "success" {
-			if err := c.compactPhase(turn, call, result); err != nil {
-				_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, Kind: store.EventRuntimeHint, Content: "Phase 已完成，但创建 Checkpoint 失败: " + err.Error()})
-			}
-		}
+		// 批量 assistant tool_calls 在下一次模型回放前，必须为每个已接纳调用写入终态 Tool Result；因此 Safe Point 只在整批只读调用完成后检查。
 		if c.safePointAfterReload(turn.ID) {
 			return
 		}
 	}
 	c.failTurn(turn, "Action Loop 超过安全上限（96）")
+}
+
+func initialCallTrigger(turn *store.Turn) string {
+	if turn == nil {
+		return "开始 Agent Action Loop"
+	}
+	switch turn.ActiveAgent {
+	case "build":
+		return "开始 Build：执行当前有效 Plan 与用户决定"
+	case "plan":
+		if len(turn.UserDecisions) > 0 {
+			return "用户追加或修改要求：生成/修订当前 Plan"
+		}
+		return "用户提交新目标：生成最小充分 Plan"
+	default:
+		return "开始 " + turn.ActiveAgent + " Agent"
+	}
+}
+
+func acceptedToolBatch(calls []ToolCall) []ToolCall {
+	if len(calls) <= 1 {
+		return calls
+	}
+	if len(calls) > 6 {
+		return calls[:1]
+	}
+	for _, call := range calls {
+		if !isIndependentReadOnlyCall(call) {
+			return calls[:1]
+		}
+	}
+	return calls
+}
+
+func isIndependentReadOnlyCall(call ToolCall) bool {
+	switch call.Name {
+	case "list_files", "read_file", "search_text":
+		return true
+	case "run_command":
+		command, ok := readCommandArg(call.Arguments)
+		return ok && isReadOnlyCommand(command)
+	default:
+		return false
+	}
+}
+
+func (c *Coordinator) finishPlanAfterSave(turn *store.Turn, result ToolResult) {
+	summary := "计划已准备好。你可以修改计划，或点击“开始执行”。"
+	if value, ok := result.Data["user_summary"].(string); ok && strings.TrimSpace(value) != "" {
+		summary = strings.TrimSpace(value)
+	}
+	_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, Kind: store.EventAssistantMessage, Content: summary, Data: eventJSON(map[string]any{"agent_run_id": turn.ActiveAgentRunID, "runtime_generated": true})})
+	_ = c.store.SetTurnStatus(turn.ID, store.TurnWaitingUser)
+	c.publish("runtime.status", turn, map[string]any{"status": store.TurnWaitingUser, "reason": "plan_ready", "profile_id": "plan"})
 }
 
 func (c *Coordinator) callModel(ctx context.Context, turn *store.Turn, profile AgentProfile, agentRunID string, selection Selection, compiled CompiledContext, child bool) (callOutcome, string) {
@@ -454,7 +546,8 @@ func (c *Coordinator) applyResolvedApproval(ctx context.Context, turn *store.Tur
 	if !ok {
 		return false
 	}
-	decision := c.permissions.Evaluate(profile, call.Name, c.tools)
+	profile = effectiveProfile(profile, turn.TaskComplexity, turn.AllowReconnaissance)
+	decision := c.permissions.Evaluate(profile, call, c.tools)
 	if decision.Action == "deny" {
 		c.recordToolResult(turn, call, ToolResult{Status: "rejected", Error: "批准后权限策略已变化: " + decision.Risk})
 		return true
@@ -570,12 +663,12 @@ func (c *Coordinator) runChild(ctx context.Context, turn *store.Turn, child *sto
 	if err != nil {
 		return "", err
 	}
-	for i := 0; i < 16; i++ {
+	for i := 0; i < 8; i++ {
 		fresh, err := c.store.GetTurn(turn.ID)
 		if err != nil {
 			return "", err
 		}
-		compiled, err := c.compiler.Compile(CompileInput{Turn: fresh, Profile: profile, AgentRunID: child.ID, ExtraUser: objective})
+		compiled, err := c.compiler.Compile(CompileInput{Turn: fresh, Profile: profile, AgentRunID: child.ID, ExtraUser: objective, Trigger: "SubAgent 定向调查"})
 		if err != nil {
 			return "", err
 		}
@@ -589,17 +682,21 @@ func (c *Coordinator) runChild(ctx context.Context, turn *store.Turn, child *sto
 		if len(out.ToolCalls) == 0 {
 			return strings.TrimSpace(out.Content), nil
 		}
-		call := out.ToolCalls[0]
-		c.recordToolRequested(fresh, child.ID, callID, out.Reasoning, call)
-		decision := c.permissions.Evaluate(profile, call.Name, c.tools)
-		if decision.Action != "allow" {
-			c.recordToolResult(fresh, call, ToolResult{Status: "rejected", Error: decision.Risk})
-			continue
+		calls := acceptedToolBatch(out.ToolCalls)
+		for _, call := range calls {
+			c.recordToolRequested(fresh, child.ID, callID, out.Reasoning, call)
 		}
-		result := c.tools.Execute(ToolContext{Context: ctx, SessionID: fresh.SessionID, TurnID: fresh.ID, AgentRunID: child.ID}, call)
-		c.recordToolResult(fresh, call, result)
+		for _, call := range calls {
+			decision := c.permissions.Evaluate(profile, call, c.tools)
+			if decision.Action != "allow" {
+				c.recordToolResult(fresh, call, ToolResult{Status: "rejected", Error: decision.Risk})
+				continue
+			}
+			result := c.tools.Execute(ToolContext{Context: ctx, SessionID: fresh.SessionID, TurnID: fresh.ID, AgentRunID: child.ID}, call)
+			c.recordToolResult(fresh, call, result)
+		}
 	}
-	return "", fmt.Errorf("Child Agent 超过 Action 上限")
+	return "", fmt.Errorf("Child Agent 超过定向调查上限（8）")
 }
 
 func (c *Coordinator) collectDeterministicFacts(turn *store.Turn, after int64) (map[string]any, error) {
@@ -674,13 +771,15 @@ func (c *Coordinator) collectDeterministicFacts(turn *store.Turn, after int64) (
 	for _, record := range pending {
 		steering = append(steering, map[string]any{"seq": record.Seq, "content": record.Content})
 	}
-	hard, scoped := c.compiler.resolver.Resolve()
+	session, _ := c.store.GetSession(turn.SessionID)
+	injectAgents := session != nil && session.InjectAgents
+	project, scoped := c.compiler.resolver.Resolve(injectAgents)
 	constraintSnapshot := map[string]any{
-		"hard": hard, "scoped": scoped,
+		"agents_md_injected": injectAgents && len(project) > 0, "project": project, "scoped": scoped,
 		"hash": hashValue(struct {
-			Hard   []string `json:"hard"`
-			Scoped []string `json:"scoped"`
-		}{hard, scoped}),
+			Project []string `json:"project"`
+			Scoped  []string `json:"scoped"`
+		}{project, scoped}),
 	}
 	return map[string]any{
 		"modified_files":           fileList,
@@ -771,13 +870,24 @@ func (c *Coordinator) StartBuild(turnID string, selection Selection) error {
 	if version == nil {
 		return fmt.Errorf("没有 Active Plan")
 	}
-	_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, Kind: store.EventRuntimeCommand, Content: "start_build", Data: eventJSON(map[string]any{"artifact_id": artifact.ID, "plan_version": version.Version})})
-	cp, err := c.store.CreateCheckpoint(turn.SessionID, turn.ID, transition.CheckpointKind, "Planning 已完成，Build 从固定的 Active Plan 开始。", map[string]any{"plan_artifact_id": artifact.ID, "plan_version": version.Version})
-	if err != nil {
-		return err
+	plan := decodePlanState(version.Data)
+	if plan.Complexity == "" {
+		plan.Complexity = turn.TaskComplexity
 	}
-	if _, err = c.store.AdvanceContextEpoch(turn.ID, transition.Reason, cp.ID, ""); err != nil {
-		return err
+	_ = c.store.SetTurnTaskPolicy(turn.ID, plan.Complexity, plan.Complexity == "complex")
+	_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, Kind: store.EventRuntimeCommand, Content: "start_build", Data: eventJSON(map[string]any{"artifact_id": artifact.ID, "plan_version": version.Version, "complexity": plan.Complexity})})
+	if plan.Complexity == "complex" {
+		cp, cpErr := c.store.CreateCheckpoint(turn.SessionID, turn.ID, transition.CheckpointKind, "Planning 已完成，Build 从固定的 Active Plan 开始。", map[string]any{"plan_artifact_id": artifact.ID, "plan_version": version.Version})
+		if cpErr != nil {
+			return cpErr
+		}
+		if _, err = c.store.AdvanceContextEpoch(turn.ID, transition.Reason, cp.ID, ""); err != nil {
+			return err
+		}
+	} else {
+		if _, err = c.store.AdvanceContextEpoch(turn.ID, transition.Reason+".fast_path", "", ""); err != nil {
+			return err
+		}
 	}
 	if turn.ActiveAgentRunID != "" {
 		_ = c.store.FinishAgentRun(turn.ActiveAgentRunID, "completed", map[string]any{"transition": "build", "plan_version": version.Version})
@@ -787,6 +897,9 @@ func (c *Coordinator) StartBuild(turnID string, selection Selection) error {
 		return err
 	}
 	if err := c.store.SetTurnAgent(turn.ID, transition.TargetProfile, buildRun.ID); err != nil {
+		return err
+	}
+	if err := c.tools.initializeBuildTodo(ToolContext{Context: context.Background(), SessionID: turn.SessionID, TurnID: turn.ID, AgentRunID: buildRun.ID}, plan); err != nil {
 		return err
 	}
 	_ = c.store.SetTurnStatus(turn.ID, store.TurnRunning)

@@ -49,7 +49,8 @@ func NewProfileRegistry() *ProfileRegistry {
 		profiles: map[string]AgentProfile{},
 		toolPolicies: map[string][]string{
 			"planning": {"list_files", "read_file", "search_text", "spawn_explorer", "new_plan", "edit_plan"},
-			"build":    {"list_files", "read_file", "search_text", "write_file", "run_command", "create_phase", "update_phase", "done_phase"},
+			// Phase 的创建与更新由 Runtime 接管；只有复杂任务需要压缩上下文时，模型才负责关闭当前 Runtime Phase。
+			"build":    {"list_files", "read_file", "search_text", "write_file", "run_command", "done_phase"},
 			"readonly": {"list_files", "read_file", "search_text"},
 			"none":     {},
 		},
@@ -76,15 +77,20 @@ func NewProfileRegistry() *ProfileRegistry {
 	}
 	r.Register(AgentProfile{
 		ID: "plan", DisplayName: "Plan", ToolPolicy: "planning", ContextPolicy: "planning", PermissionPolicy: "readonly", TransitionPolicy: "plan_to_build", IdlePolicy: "wait_user",
-		Prompt: `你是 Wisp Plan Agent。先理解目标和约束，必要时调用 Explorer 调研。把可执行计划保存为 Plan Artifact，而不是只写在聊天里。计划可以多次修订。没有更多工具动作时，向用户简洁说明当前计划并等待用户修改或点击开始执行。`,
+		Prompt: `你是 Wisp Plan Agent。目标是用最少调查得到足够可靠的可执行计划。
+侦察门槛：Runtime 会按任务复杂度裁剪工具。若任务是独立新增文件、无需理解现有实现即可正确完成，禁止为了“熟悉项目”而调查工作区。若 AGENTS.md 已由 Runtime 注入，不要再次 read_file AGENTS.md。
+澄清门槛：只有会显著改变核心结果、成本、破坏性、安全性或不可逆性的歧义才阻塞用户；低风险、易修改细节采用合理默认值并写进计划。
+把计划保存为 Plan Artifact。new_plan/edit_plan 同时给出 complexity；只有 complex 任务才给出 phases。保存成功后不要再做例行调查，向用户用其语言简洁说明关键默认值并等待修改或点击开始执行。`,
 	})
 	r.Register(AgentProfile{
 		ID: "build", DisplayName: "Build", ToolPolicy: "build", ContextPolicy: "build", PermissionPolicy: "build", IdlePolicy: "complete_turn",
-		Prompt: `你是 Wisp Build Agent。严格依据 Active Plan 和当前 Todo/Checkpoint 执行。用工具产生真实副作用，不要把“我会修改”当成已经修改。把较长工作拆成 Phase；完成 Phase 时调用 done_phase 生成检查点。发现遗漏时可以把已完成 Phase 重新设为 processing。任务真正完成后直接给出最终总结；Runtime 会保存 Final Summary。`,
+		Prompt: `你是 Wisp Build Agent。Current Objective、用户后续决定和 Active Plan 是当前执行契约；旧历史不得覆盖它们。用工具产生真实副作用，不要把“我会修改”当成已经修改。
+Phase 由 Runtime 从 complex Plan 初始化，你不创建/更新 Phase；仅在当前 complex Phase 实际完成后调用 done_phase。trivial/standard 任务直接执行，不为流程完整性制造 Phase。
+可批量提出互不依赖的只读工具调用；有副作用或存在依赖的操作按顺序执行。不要在每个工具前发送“现在开始/接下来”等例行旁白。任务真正完成后用用户语言给出简洁结果、验证和重要路径；Runtime 会保存 Final Summary。`,
 	})
 	r.Register(AgentProfile{
 		ID: "explore", DisplayName: "Explore", ToolPolicy: "readonly", ContextPolicy: "isolated", PermissionPolicy: "readonly", IdlePolicy: "return_result",
-		Prompt: `你是只读 Explorer SubAgent。围绕给定问题快速调查项目，只使用只读工具。最终返回结构化、可执行的发现摘要，包含关键文件/位置、风险和对父 Agent 有用的结论。`,
+		Prompt: `你是只读 Explorer SubAgent。只调查父 Agent 明确提出的问题，不做“顺便看看”的全仓巡游。优先 search_text/定向 read_file；不要读取 .git、构建产物、依赖目录或已注入的 AGENTS.md。最多使用少量高信息量动作，足够回答后立即返回结构化发现：关键文件/位置、证据、风险和父 Agent 可直接采用的结论。`,
 	})
 	r.Register(AgentProfile{
 		ID: "explain", DisplayName: "Explain", ToolPolicy: "none", ContextPolicy: "approval", PermissionPolicy: "readonly", IdlePolicy: "return_result",

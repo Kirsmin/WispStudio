@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"wisp/internal/openai"
 	"wisp/internal/store"
@@ -72,9 +73,7 @@ func NewToolRuntime(st *store.Store, workspaceRoot string) *ToolRuntime {
 }
 
 func objectSchema(properties string, required ...string) json.RawMessage {
-	// OpenAI function schemas require `required` to always be an array.
-	// A nil variadic slice marshals to JSON null, which makes the schema invalid
-	// for tools that have no required parameters (for example list_files).
+	// OpenAI function schema 要求 `required` 始终是数组；空可变参数必须序列化成 []，不能变成 JSON null。
 	if required == nil {
 		required = []string{}
 	}
@@ -118,9 +117,10 @@ func (t *ToolRuntime) registerBuiltins() {
 	t.add(ToolSpec{Definition: toolDef("read_file", "读取 UTF-8 文本文件，可指定行范围。只读。", objectSchema(`"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}`, "path")), Risk: "只读文件", Execute: t.readFile})
 	t.add(ToolSpec{Definition: toolDef("search_text", "在工作区文本文件中搜索字符串。只读。", objectSchema(`"query":{"type":"string"},"path":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":200}`, "query")), Risk: "只读搜索", Execute: t.searchText})
 	t.add(ToolSpec{Definition: toolDef("write_file", "写入完整文件内容。会产生工作区副作用，执行前需要用户批准。", objectSchema(`"path":{"type":"string"},"content":{"type":"string"}`, "path", "content")), Risk: "会创建或覆盖工作区文件", Execute: t.writeFile})
-	t.add(ToolSpec{Definition: toolDef("run_command", "在工作区执行 shell 命令。可能产生副作用，执行前需要用户批准。", objectSchema(`"command":{"type":"string"},"cwd":{"type":"string"}`, "command")), Risk: "执行本地 shell 命令，可能修改文件或调用外部程序", Execute: t.runCommand})
-	t.add(ToolSpec{Definition: toolDef("new_plan", "创建 Plan Artifact 的新版本；如果还没有 Plan 则创建 V1。", objectSchema(`"content":{"type":"string"}`, "content")), Risk: "只写 Wisp 内部 Artifact", Execute: t.newPlan})
-	t.add(ToolSpec{Definition: toolDef("edit_plan", "基于当前 Plan 保存一个新版本，不覆盖历史版本。", objectSchema(`"content":{"type":"string"}`, "content")), Risk: "只写 Wisp 内部 Artifact", Execute: t.newPlan})
+	t.add(ToolSpec{Definition: toolDef("run_command", "在工作区执行 shell 命令。确定性识别出的只读检查可直接执行；其他命令需要用户批准。", objectSchema(`"command":{"type":"string"},"cwd":{"type":"string"}`, "command")), Risk: "执行本地 shell 命令，可能修改文件或调用外部程序", Execute: t.runCommand})
+	planSchema := objectSchema(`"content":{"type":"string"},"summary":{"type":"string","description":"给用户看的1-3句计划摘要"},"complexity":{"type":"string","enum":["trivial","standard","complex"]},"phases":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"details":{"type":"string"}},"required":["title"],"additionalProperties":false}}`, "content", "summary", "complexity")
+	t.add(ToolSpec{Definition: toolDef("new_plan", "保存 Active Plan。trivial/standard 不创建 phases；仅 complex 任务提供 phases。保存成功后 Runtime 会直接进入等待用户开始执行。", planSchema), Risk: "只写 Wisp 内部 Artifact", Execute: t.newPlan})
+	t.add(ToolSpec{Definition: toolDef("edit_plan", "保存 Active Plan 的新版本。使用与 new_plan 相同的结构。", planSchema), Risk: "只写 Wisp 内部 Artifact", Execute: t.newPlan})
 	t.add(ToolSpec{Definition: toolDef("create_phase", "创建 Build Todo Phase。", objectSchema(`"title":{"type":"string"},"details":{"type":"string"}`, "title")), Risk: "只写 Wisp 内部 Todo", Execute: t.createPhase})
 	t.add(ToolSpec{Definition: toolDef("update_phase", "更新或重开一个 Phase。status 可为 pending/processing/completed。", objectSchema(`"phase_id":{"type":"string"},"status":{"type":"string","enum":["pending","processing","completed"]},"details":{"type":"string"}`, "phase_id", "status")), Risk: "只写 Wisp 内部 Todo", Execute: t.updatePhase})
 	t.add(ToolSpec{Definition: toolDef("done_phase", "完成 Phase，并提供语义总结。Runtime 会同时记录确定性事实并创建 Checkpoint/新 Context Epoch。", objectSchema(`"phase_id":{"type":"string"},"summary":{"type":"string"}`, "phase_id", "summary")), Risk: "只写 Wisp 内部 Todo/Checkpoint", Execute: t.donePhase})
@@ -183,7 +183,7 @@ func decodeArgs(raw json.RawMessage, target any) error {
 
 func skipWorkspaceNoiseDir(name string) bool {
 	switch name {
-	case ".git", "node_modules", ".gocache", ".gopath", ".npm-cache":
+	case ".git", "node_modules", ".gocache", ".gopath", ".npm-cache", "dist", "build", ".next", "coverage", "Data", "__pycache__", "target", ".cache", ".venv", "venv":
 		return true
 	default:
 		return false
@@ -232,7 +232,7 @@ func (t *ToolRuntime) listFiles(_ ToolContext, raw json.RawMessage) ToolResult {
 	return ToolResult{Status: "success", Output: strings.Join(items, "\n"), Data: map[string]any{"count": len(items)}}
 }
 
-func (t *ToolRuntime) readFile(_ ToolContext, raw json.RawMessage) ToolResult {
+func (t *ToolRuntime) readFile(ctx ToolContext, raw json.RawMessage) ToolResult {
 	var args struct {
 		Path  string `json:"path"`
 		Start int    `json:"start_line"`
@@ -240,6 +240,15 @@ func (t *ToolRuntime) readFile(_ ToolContext, raw json.RawMessage) ToolResult {
 	}
 	if err := decodeArgs(raw, &args); err != nil {
 		return failure(err)
+	}
+	clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(args.Path)))
+	if clean == "AGENTS.md" && ctx.SessionID != "" {
+		if session, err := t.store.GetSession(ctx.SessionID); err == nil && session.InjectAgents {
+			agentsPath := filepath.Join(t.workspaceRoot, "AGENTS.md")
+			if info, statErr := os.Stat(agentsPath); statErr == nil && !info.IsDir() && info.Size() <= 128*1024 {
+				return ToolResult{Status: "success", Output: "AGENTS.md 已由 Runtime 注入当前上下文；为避免重复 token，本次不再回传全文。", Data: map[string]any{"path": "AGENTS.md", "already_injected": true}}
+			}
+		}
 	}
 	path, err := t.securePath(args.Path)
 	if err != nil {
@@ -250,6 +259,15 @@ func (t *ToolRuntime) readFile(_ ToolContext, raw json.RawMessage) ToolResult {
 		return failure(err)
 	}
 	defer file.Close()
+	probe := make([]byte, 8192)
+	n, _ := file.Read(probe)
+	probe = probe[:n]
+	if bytes.IndexByte(probe, 0) >= 0 || (len(probe) > 0 && !utf8.Valid(probe)) {
+		return failure(fmt.Errorf("检测到二进制文件，read_file 只读取 UTF-8 文本: %s", filepath.ToSlash(args.Path)))
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return failure(err)
+	}
 	if args.Start <= 0 {
 		args.Start = 1
 	}
@@ -310,7 +328,7 @@ func (t *ToolRuntime) searchText(_ ToolContext, raw json.RawMessage) ToolResult 
 			return io.EOF
 		}
 		info, err := d.Info()
-		if err != nil || info.Size() > 2*1024*1024 {
+		if err != nil || info.Size() > 2*1024*1024 || likelyBinaryFile(path) {
 			return nil
 		}
 		file, err := os.Open(path)
@@ -424,16 +442,50 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 
 func (t *ToolRuntime) newPlan(ctx ToolContext, raw json.RawMessage) ToolResult {
 	var args struct {
-		Content string `json:"content"`
+		Content    string          `json:"content"`
+		Summary    string          `json:"summary"`
+		Complexity string          `json:"complexity"`
+		Phases     []planPhaseSpec `json:"phases"`
 	}
 	if err := decodeArgs(raw, &args); err != nil {
 		return failure(err)
 	}
-	artifact, version, err := t.store.CreateArtifactVersion(ctx.SessionID, ctx.TurnID, "plan", "active", args.Content, nil, ctx.AgentRunID)
+	if args.Complexity != "trivial" && args.Complexity != "standard" && args.Complexity != "complex" {
+		args.Complexity = "standard"
+	}
+	if args.Complexity != "complex" {
+		args.Phases = nil
+	}
+	data, _ := json.Marshal(planState{Complexity: args.Complexity, Phases: args.Phases})
+	artifact, version, err := t.store.CreateArtifactVersion(ctx.SessionID, ctx.TurnID, "plan", "active", args.Content, data, ctx.AgentRunID)
 	if err != nil {
 		return failure(err)
 	}
-	return ToolResult{Status: "success", Output: fmt.Sprintf("Plan V%d 已保存", version.Version), Data: map[string]any{"artifact_id": artifact.ID, "version": version.Version}}
+	turn, _ := t.store.GetTurn(ctx.TurnID)
+	allowRecon := args.Complexity == "complex"
+	if turn != nil && turn.AllowReconnaissance && args.Complexity == "standard" {
+		allowRecon = true
+	}
+	_ = t.store.SetTurnTaskPolicy(ctx.TurnID, args.Complexity, allowRecon)
+	return ToolResult{Status: "success", Output: fmt.Sprintf("Plan V%d 已保存", version.Version), Data: map[string]any{"artifact_id": artifact.ID, "version": version.Version, "complexity": args.Complexity, "phase_count": len(args.Phases), "user_summary": strings.TrimSpace(args.Summary)}}
+}
+
+type planPhaseSpec struct {
+	Title   string `json:"title"`
+	Details string `json:"details,omitempty"`
+}
+type planState struct {
+	Complexity string          `json:"complexity"`
+	Phases     []planPhaseSpec `json:"phases,omitempty"`
+}
+
+func decodePlanState(raw json.RawMessage) planState {
+	var state planState
+	_ = json.Unmarshal(raw, &state)
+	if state.Complexity == "" {
+		state.Complexity = "standard"
+	}
+	return state
 }
 
 type phase struct {
@@ -533,17 +585,80 @@ func (t *ToolRuntime) donePhase(ctx ToolContext, raw json.RawMessage) ToolResult
 	if err := decodeArgs(raw, &args); err != nil {
 		return failure(err)
 	}
-	update, _ := json.Marshal(map[string]any{"phase_id": args.PhaseID, "status": "completed"})
-	result := t.updatePhase(ctx, update)
-	if result.Status != "success" {
-		return result
+	state, err := t.loadTodo(ctx.TurnID)
+	if err != nil {
+		return failure(err)
 	}
-	if result.Data == nil {
-		result.Data = map[string]any{}
+	found := -1
+	for i := range state.Phases {
+		if state.Phases[i].ID == args.PhaseID {
+			found = i
+			break
+		}
 	}
-	result.Data["summary"] = args.Summary
-	result.Output = "Phase 已完成"
-	return result
+	if found < 0 {
+		return failure(fmt.Errorf("Phase 不存在: %s", args.PhaseID))
+	}
+	state.Phases[found].Status = "completed"
+	nextID := ""
+	for i := found + 1; i < len(state.Phases); i++ {
+		if state.Phases[i].Status == "pending" {
+			state.Phases[i].Status = "processing"
+			nextID = state.Phases[i].ID
+			break
+		}
+	}
+	v, err := t.saveTodo(ctx, state)
+	if err != nil {
+		return failure(err)
+	}
+	return ToolResult{Status: "success", Output: "Phase 已完成", Data: map[string]any{"phase_id": args.PhaseID, "summary": args.Summary, "next_phase_id": nextID, "todo_version": v.Version}}
+}
+
+func (t *ToolRuntime) initializeBuildTodo(ctx ToolContext, plan planState) error {
+	if plan.Complexity != "complex" {
+		return nil
+	}
+	phases := plan.Phases
+	if len(phases) == 0 {
+		// complex Plan 即使漏给 phases，也由 Runtime 建立一个兜底 Phase，保证 Build 完成状态仍有明确不变量。
+		phases = []planPhaseSpec{{Title: "执行 Active Plan", Details: "Runtime 自动生成的复杂任务兜底 Phase"}}
+	}
+	state := todoState{Phases: make([]phase, 0, len(phases))}
+	for i, item := range phases {
+		status := "pending"
+		if i == 0 {
+			status = "processing"
+		}
+		state.Phases = append(state.Phases, phase{ID: "phase_" + strconv.Itoa(i+1), Title: strings.TrimSpace(item.Title), Details: strings.TrimSpace(item.Details), Status: status})
+	}
+	_, err := t.saveTodo(ctx, state)
+	return err
+}
+
+func (t *ToolRuntime) currentPhaseID(turnID string) string {
+	state, err := t.loadTodo(turnID)
+	if err != nil {
+		return ""
+	}
+	for _, item := range state.Phases {
+		if item.Status == "processing" {
+			return item.ID
+		}
+	}
+	return ""
+}
+
+func likelyBinaryFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 8192)
+	n, _ := f.Read(buf)
+	buf = buf[:n]
+	return bytes.IndexByte(buf, 0) >= 0 || (len(buf) > 0 && !utf8.Valid(buf))
 }
 
 func failure(err error) ToolResult { return ToolResult{Status: "failure", Error: err.Error()} }
@@ -564,37 +679,231 @@ func minInt(a, b int) int {
 // PermissionEngine 在执行前做确定性裁决，Prompt 无权绕过。
 type PermissionEngine struct{ profiles *ProfileRegistry }
 type PermissionDecision struct {
-	Action string
-	Risk   string
+	Action    string
+	Risk      string
+	RiskClass string
 }
 
 func NewPermissionEngine(profiles *ProfileRegistry) PermissionEngine {
 	return PermissionEngine{profiles: profiles}
 }
 
-func (e PermissionEngine) Evaluate(profile AgentProfile, toolName string, tools *ToolRuntime) PermissionDecision {
+func (e PermissionEngine) Evaluate(profile AgentProfile, call ToolCall, tools *ToolRuntime) PermissionDecision {
 	allowed := false
 	for _, name := range profile.Tools {
-		if name == toolName {
+		if name == call.Name {
 			allowed = true
 			break
 		}
 	}
 	if !allowed {
-		return PermissionDecision{Action: "deny", Risk: "当前 AgentProfile 不允许该工具"}
+		return PermissionDecision{Action: "deny", Risk: "当前 AgentProfile 不允许该工具", RiskClass: "policy.denied"}
 	}
 	policy, ok := e.profiles.PermissionPolicy(profile.PermissionPolicy)
 	if !ok {
-		return PermissionDecision{Action: "deny", Risk: "未知 PermissionPolicy: " + profile.PermissionPolicy}
+		return PermissionDecision{Action: "deny", Risk: "未知 PermissionPolicy: " + profile.PermissionPolicy, RiskClass: "policy.denied"}
 	}
-	if risk, denied := policy.DenyTools[toolName]; denied {
-		return PermissionDecision{Action: "deny", Risk: risk}
+	if risk, denied := policy.DenyTools[call.Name]; denied {
+		return PermissionDecision{Action: "deny", Risk: risk, RiskClass: "policy.denied"}
 	}
-	if risk, ask := policy.AskUser[toolName]; ask {
-		if risk == "" {
-			risk = tools.Risk(toolName)
+	if call.Name == "run_command" {
+		if command, ok := readCommandArg(call.Arguments); ok {
+			risk := classifyCommandRisk(command)
+			if risk.ReadOnly {
+				return PermissionDecision{Action: "allow", Risk: risk.Description, RiskClass: risk.Class}
+			}
+			if _, ask := policy.AskUser[call.Name]; ask {
+				return PermissionDecision{Action: "ask_user", Risk: risk.Description, RiskClass: risk.Class}
+			}
 		}
-		return PermissionDecision{Action: "ask_user", Risk: risk}
 	}
-	return PermissionDecision{Action: "allow", Risk: tools.Risk(toolName)}
+	if risk, ask := policy.AskUser[call.Name]; ask {
+		if risk == "" {
+			risk = tools.Risk(call.Name)
+		}
+		return PermissionDecision{Action: "ask_user", Risk: risk, RiskClass: "workspace.write"}
+	}
+	class := "runtime.metadata"
+	if call.Name == "list_files" || call.Name == "read_file" || call.Name == "search_text" || call.Name == "spawn_explorer" {
+		class = "workspace.read"
+	}
+	return PermissionDecision{Action: "allow", Risk: tools.Risk(call.Name), RiskClass: class}
+}
+
+type commandRisk struct {
+	Class       string
+	Description string
+	ReadOnly    bool
+}
+
+func classifyCommandRisk(command string) commandRisk {
+	if isReadOnlyCommand(command) {
+		return commandRisk{Class: "shell.readonly", Description: "只读检查命令，不修改工作区", ReadOnly: true}
+	}
+
+	type rankedRisk struct {
+		rank int
+		risk commandRisk
+	}
+	best := rankedRisk{rank: 1, risk: commandRisk{Class: "shell.execute.dynamic", Description: "执行本地 shell 命令；行为取决于命令与脚本内容"}}
+	normalized := strings.NewReplacer("&&", ";", "||", ";", "|", ";", "\n", ";").Replace(command)
+	for _, part := range strings.Split(normalized, ";") {
+		fields := strings.Fields(strings.TrimSpace(part))
+		if len(fields) == 0 {
+			continue
+		}
+		name := strings.ToLower(filepath.Base(strings.Trim(fields[0], "'\"")))
+		candidate := commandRisk{Class: "shell.execute." + safeRiskToken(name), Description: "执行本地程序 " + name + "；程序可能修改工作区或访问外部资源"}
+		rank := 1
+
+		if isDangerousCommand(name, fields[1:]) {
+			rank = 4
+			candidate = commandRisk{Class: "shell.dangerous." + safeRiskToken(name), Description: "危险命令 " + name + "；可能删除、覆盖或改变系统/工作区状态"}
+		} else if isExternalCommand(name, fields[1:]) {
+			rank = 3
+			candidate = commandRisk{Class: "shell.external." + safeRiskToken(name), Description: "外部/网络命令 " + name + "；可能访问网络、远端服务或安装依赖"}
+		} else if isWorkspaceMutationCommand(name, fields[1:]) {
+			rank = 2
+			candidate = commandRisk{Class: "shell.workspace." + safeRiskToken(name), Description: "工作区变更命令 " + name + "；会创建、移动或修改本地文件/版本状态"}
+		}
+		if rank > best.rank {
+			best = rankedRisk{rank: rank, risk: candidate}
+		} else if rank == best.rank && best.risk.Class == "shell.execute.dynamic" {
+			best.risk = candidate
+		}
+	}
+	if strings.ContainsAny(command, "<>`$(){}&") && best.rank <= 1 {
+		return commandRisk{Class: "shell.execute.dynamic", Description: "动态 shell 命令；包含展开、重定向或后台语法，实际行为需用户确认"}
+	}
+	return best.risk
+}
+
+func safeRiskToken(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return "unknown"
+	}
+	var b strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
+}
+
+func isDangerousCommand(name string, args []string) bool {
+	switch name {
+	case "rm", "rmdir", "shred", "truncate", "dd", "mkfs", "chmod", "chown", "kill", "pkill", "killall", "shutdown", "reboot", "sudo", "su":
+		return true
+	case "git":
+		joined := strings.ToLower(strings.Join(args, " "))
+		return strings.Contains(joined, "reset --hard") || strings.HasPrefix(joined, "clean ") || joined == "clean" || strings.HasPrefix(joined, "restore ") || strings.HasPrefix(joined, "checkout --")
+	case "find":
+		joined := strings.ToLower(strings.Join(args, " "))
+		return strings.Contains(joined, " -delete") || strings.Contains(joined, " -exec rm")
+	}
+	return false
+}
+
+func isExternalCommand(name string, args []string) bool {
+	switch name {
+	case "curl", "wget", "ssh", "scp", "sftp", "ftp", "telnet", "nc", "netcat", "rsync", "aws", "gcloud", "az":
+		return true
+	case "git":
+		if len(args) == 0 {
+			return false
+		}
+		switch strings.ToLower(strings.Trim(args[0], "'\"")) {
+		case "clone", "fetch", "pull", "push", "remote", "submodule":
+			return true
+		}
+	case "npm", "pnpm", "yarn", "pip", "pip3", "uv", "cargo", "go", "apt", "apt-get", "brew":
+		joined := strings.ToLower(strings.Join(args, " "))
+		for _, marker := range []string{" install", " add", " get", " update", " upgrade", " publish", " login", " download"} {
+			if strings.Contains(" "+joined, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isWorkspaceMutationCommand(name string, args []string) bool {
+	switch name {
+	case "mkdir", "touch", "cp", "mv", "install", "ln", "patch":
+		return true
+	case "sed":
+		for _, arg := range args {
+			plain := strings.ToLower(strings.Trim(arg, "'\""))
+			if plain == "-i" || strings.HasPrefix(plain, "-i") || plain == "--in-place" || strings.HasPrefix(plain, "--in-place=") {
+				return true
+			}
+		}
+	case "git":
+		if len(args) == 0 {
+			return false
+		}
+		switch strings.ToLower(strings.Trim(args[0], "'\"")) {
+		case "add", "commit", "merge", "rebase", "cherry-pick", "tag", "branch", "switch":
+			return true
+		}
+	}
+	return false
+}
+
+func readCommandArg(raw json.RawMessage) (string, bool) {
+	var args struct {
+		Command string `json:"command"`
+	}
+	if json.Unmarshal(raw, &args) != nil || strings.TrimSpace(args.Command) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(args.Command), true
+}
+
+// isReadOnlyCommand 故意采用保守策略：只允许已知检查命令，不允许重定向/替换，且管道或命令序列中的每一段都必须只读。
+func isReadOnlyCommand(command string) bool {
+	// 这里仅用于判断能否跳过 Approval，并不是 shell 沙箱；凡是包含展开、后台执行、越出工作区路径或已知写入/执行参数，都回到正常审批。
+	if strings.ContainsAny(command, "<>`$(){}&") {
+		return false
+	}
+	normalized := strings.NewReplacer("&&", ";", "||", ";", "|", ";", "\n", ";").Replace(command)
+	for _, part := range strings.Split(normalized, ";") {
+		fields := strings.Fields(strings.TrimSpace(part))
+		if len(fields) == 0 {
+			continue
+		}
+		for _, arg := range fields[1:] {
+			plain := strings.Trim(arg, "'\"")
+			if strings.HasPrefix(plain, "/") || strings.HasPrefix(plain, "~/") || plain == ".." || strings.HasPrefix(plain, "../") || strings.Contains(plain, "/../") {
+				return false
+			}
+			lower := strings.ToLower(plain)
+			if lower == "-o" || strings.HasPrefix(lower, "-o=") || (strings.HasPrefix(lower, "-o") && len(lower) > 2) || lower == "--output" || strings.HasPrefix(lower, "--output=") || lower == "--replace" || strings.HasPrefix(lower, "--compress-program=") {
+				return false
+			}
+		}
+		name := filepath.Base(strings.Trim(fields[0], "'\""))
+		switch name {
+		case "pwd", "ls", "cat", "head", "tail", "wc", "grep", "rg", "stat", "file", "od", "sort", "uniq", "cut", "diff":
+			// 通用参数检查已覆盖这些命令。
+		case "git":
+			if len(fields) < 2 {
+				return false
+			}
+			subcommand := strings.Trim(fields[1], "'\"")
+			switch subcommand {
+			case "status", "diff", "log", "show", "rev-parse", "ls-files":
+			default:
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }

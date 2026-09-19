@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -18,21 +19,25 @@ const (
 )
 
 type Turn struct {
-	ID               string `json:"id"`
-	SessionID        string `json:"session_id"`
-	TurnIndex        int    `json:"turn_index"`
-	Status           string `json:"status"`
-	Objective        string `json:"objective"`
-	ActiveAgent      string `json:"active_agent"`
-	ContextEpoch     int    `json:"context_epoch"`
-	SteeringCursor   int64  `json:"steering_cursor"`
-	RootAgentRunID   string `json:"root_agent_run_id,omitempty"`
-	ActiveAgentRunID string `json:"active_agent_run_id,omitempty"`
-	ActiveCheckpoint string `json:"active_checkpoint_id,omitempty"`
-	PauseRequested   bool   `json:"pause_requested"`
-	StopRequested    bool   `json:"stop_requested"`
-	CreatedAt        string `json:"created_at"`
-	CompletedAt      string `json:"completed_at,omitempty"`
+	ID                  string   `json:"id"`
+	SessionID           string   `json:"session_id"`
+	TurnIndex           int      `json:"turn_index"`
+	Status              string   `json:"status"`
+	Objective           string   `json:"objective"`
+	CurrentObjective    string   `json:"current_objective"`
+	UserDecisions       []string `json:"user_decisions"`
+	TaskComplexity      string   `json:"task_complexity"`
+	AllowReconnaissance bool     `json:"allow_reconnaissance"`
+	ActiveAgent         string   `json:"active_agent"`
+	ContextEpoch        int      `json:"context_epoch"`
+	SteeringCursor      int64    `json:"steering_cursor"`
+	RootAgentRunID      string   `json:"root_agent_run_id,omitempty"`
+	ActiveAgentRunID    string   `json:"active_agent_run_id,omitempty"`
+	ActiveCheckpoint    string   `json:"active_checkpoint_id,omitempty"`
+	PauseRequested      bool     `json:"pause_requested"`
+	StopRequested       bool     `json:"stop_requested"`
+	CreatedAt           string   `json:"created_at"`
+	CompletedAt         string   `json:"completed_at,omitempty"`
 }
 
 func (s *Store) BeginTurn(sessionID string) (string, error) {
@@ -57,18 +62,21 @@ func (s *Store) BeginTaskTurn(sessionID, objective string) (*Turn, error) {
 		return nil, err
 	}
 	turn := &Turn{
-		ID:           "t_" + compactUUID(),
-		SessionID:    sessionID,
-		TurnIndex:    index,
-		Status:       TurnRunning,
-		Objective:    objective,
-		ActiveAgent:  "plan",
-		ContextEpoch: 1,
-		CreatedAt:    stamp(time.Now().UTC()),
+		ID:                  "t_" + compactUUID(),
+		SessionID:           sessionID,
+		TurnIndex:           index,
+		Status:              TurnRunning,
+		Objective:           objective,
+		CurrentObjective:    objective,
+		TaskComplexity:      "standard",
+		AllowReconnaissance: true,
+		ActiveAgent:         "plan",
+		ContextEpoch:        1,
+		CreatedAt:           stamp(time.Now().UTC()),
 	}
 	if _, err := tx.Exec(`INSERT INTO turns(
-		id,session_id,turn_index,status,created_at,objective,active_agent,context_epoch
-	) VALUES(?,?,?,?,?,?,?,?)`, turn.ID, sessionID, index, turn.Status, turn.CreatedAt, objective, turn.ActiveAgent, turn.ContextEpoch); err != nil {
+		id,session_id,turn_index,status,created_at,objective,current_objective,decisions_json,task_complexity,allow_reconnaissance,active_agent,context_epoch
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, turn.ID, sessionID, index, turn.Status, turn.CreatedAt, objective, objective, `[]`, turn.TaskComplexity, 1, turn.ActiveAgent, turn.ContextEpoch); err != nil {
 		return nil, err
 	}
 	if _, err := tx.Exec(`INSERT INTO context_epochs(id,session_id,turn_id,epoch_index,reason,created_at) VALUES(?,?,?,?,?,?)`,
@@ -82,7 +90,7 @@ func (s *Store) BeginTaskTurn(sessionID, objective string) (*Turn, error) {
 }
 
 func (s *Store) GetTurn(turnID string) (*Turn, error) {
-	row := s.db.QueryRow(`SELECT id,session_id,turn_index,status,objective,active_agent,context_epoch,steering_cursor,
+	row := s.db.QueryRow(`SELECT id,session_id,turn_index,status,objective,current_objective,decisions_json,task_complexity,allow_reconnaissance,active_agent,context_epoch,steering_cursor,
 		root_agent_run_id,active_agent_run_id,active_checkpoint_id,pause_requested,stop_requested,created_at,COALESCE(completed_at,'')
 		FROM turns WHERE id=?`, turnID)
 	turn, err := scanTurn(row)
@@ -96,7 +104,7 @@ func (s *Store) GetTurn(turnID string) (*Turn, error) {
 }
 
 func (s *Store) GetOpenTurn(sessionID string) (*Turn, error) {
-	row := s.db.QueryRow(`SELECT id,session_id,turn_index,status,objective,active_agent,context_epoch,steering_cursor,
+	row := s.db.QueryRow(`SELECT id,session_id,turn_index,status,objective,current_objective,decisions_json,task_complexity,allow_reconnaissance,active_agent,context_epoch,steering_cursor,
 		root_agent_run_id,active_agent_run_id,active_checkpoint_id,pause_requested,stop_requested,created_at,COALESCE(completed_at,'')
 		FROM turns WHERE session_id=? AND status IN ('running','waiting_user','paused') ORDER BY turn_index DESC LIMIT 1`, sessionID)
 	turn, err := scanTurn(row)
@@ -110,7 +118,7 @@ func (s *Store) GetOpenTurn(sessionID string) (*Turn, error) {
 }
 
 func (s *Store) ListTurns(sessionID string) ([]Turn, error) {
-	rows, err := s.db.Query(`SELECT id,session_id,turn_index,status,objective,active_agent,context_epoch,steering_cursor,
+	rows, err := s.db.Query(`SELECT id,session_id,turn_index,status,objective,current_objective,decisions_json,task_complexity,allow_reconnaissance,active_agent,context_epoch,steering_cursor,
 		root_agent_run_id,active_agent_run_id,active_checkpoint_id,pause_requested,stop_requested,created_at,COALESCE(completed_at,'')
 		FROM turns WHERE session_id=? ORDER BY turn_index`, sessionID)
 	if err != nil {
@@ -130,13 +138,67 @@ func (s *Store) ListTurns(sessionID string) ([]Turn, error) {
 
 func scanTurn(row rowScanner) (Turn, error) {
 	var turn Turn
-	var pause, stop int
-	err := row.Scan(&turn.ID, &turn.SessionID, &turn.TurnIndex, &turn.Status, &turn.Objective, &turn.ActiveAgent,
+	var pause, stop, allowRecon int
+	var decisions string
+	err := row.Scan(&turn.ID, &turn.SessionID, &turn.TurnIndex, &turn.Status, &turn.Objective, &turn.CurrentObjective, &decisions, &turn.TaskComplexity, &allowRecon, &turn.ActiveAgent,
 		&turn.ContextEpoch, &turn.SteeringCursor, &turn.RootAgentRunID, &turn.ActiveAgentRunID,
 		&turn.ActiveCheckpoint, &pause, &stop, &turn.CreatedAt, &turn.CompletedAt)
 	turn.PauseRequested = pause != 0
 	turn.StopRequested = stop != 0
+	turn.AllowReconnaissance = allowRecon != 0
+	if turn.CurrentObjective == "" {
+		turn.CurrentObjective = turn.Objective
+	}
+	if turn.TaskComplexity == "" {
+		turn.TaskComplexity = "standard"
+	}
+	_ = json.Unmarshal([]byte(decisions), &turn.UserDecisions)
+	if turn.UserDecisions == nil {
+		turn.UserDecisions = []string{}
+	}
 	return turn, err
+}
+
+func (s *Store) SetTurnTaskPolicy(turnID, complexity string, allowReconnaissance bool) error {
+	switch complexity {
+	case "trivial", "standard", "complex":
+	default:
+		complexity = "standard"
+	}
+	allow := 0
+	if allowReconnaissance {
+		allow = 1
+	}
+	_, err := s.db.Exec(`UPDATE turns SET task_complexity=?,allow_reconnaissance=? WHERE id=?`, complexity, allow, turnID)
+	return err
+}
+
+func (s *Store) AppendTurnDecision(turnID, decision string) error {
+	decision = strings.TrimSpace(decision)
+	if decision == "" {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var raw string
+	if err := tx.QueryRow(`SELECT decisions_json FROM turns WHERE id=?`, turnID).Scan(&raw); err != nil {
+		return err
+	}
+	var decisions []string
+	_ = json.Unmarshal([]byte(raw), &decisions)
+	if len(decisions) > 0 && decisions[len(decisions)-1] == decision {
+		return nil
+	}
+	decisions = append(decisions, decision)
+	encoded, _ := json.Marshal(decisions)
+	// CurrentObjective 只保存最新明确指令；完整演进由 UserDecisions 与 Active Plan 承担，避免旧 Objective 再次占据高优先级。
+	if _, err := tx.Exec(`UPDATE turns SET current_objective=?,decisions_json=? WHERE id=?`, decision, string(encoded), turnID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CompleteTurn(turnID, status string) error {

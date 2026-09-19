@@ -88,6 +88,10 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, "创建 Turn 失败: "+err.Error())
 			return
 		}
+		policy := agentruntime.ClassifyTask(req.Message)
+		_ = h.store.SetTurnTaskPolicy(turn.ID, policy.Complexity, policy.AllowReconnaissance)
+		turn.TaskComplexity = policy.Complexity
+		turn.AllowReconnaissance = policy.AllowReconnaissance
 	}
 
 	var userRecord store.Record
@@ -103,6 +107,19 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSONError(w, http.StatusInternalServerError, "保存消息失败: "+err.Error())
 		return
+	}
+	if !isNew {
+		_ = h.store.AppendTurnDecision(turn.ID, req.Message)
+		if fresh, loadErr := h.store.GetTurn(turn.ID); loadErr == nil {
+			// 只在 Planning 阶段重新分级。Build 中到达的 Steering 可以修订目标，但不能在执行途中静默降级既定策略或移除 Build 工具。
+			if fresh.ActiveAgent == "plan" {
+				policy := agentruntime.ClassifyTask(fresh.CurrentObjective)
+				_ = h.store.SetTurnTaskPolicy(turn.ID, policy.Complexity, policy.AllowReconnaissance)
+				fresh.TaskComplexity = policy.Complexity
+				fresh.AllowReconnaissance = policy.AllowReconnaissance
+			}
+			turn = fresh
+		}
 	}
 	if isNew && !sess.Renamed {
 		_ = h.store.UpdateAutoTitle(sessionID, store.GenerateTitle(req.Message))

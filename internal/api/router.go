@@ -57,6 +57,7 @@ func (r *Router) registerRoutes() {
 	r.mux.HandleFunc("/api/sessions/{id}/timeline", cors(r.handleTimeline))
 	r.mux.HandleFunc("/api/sessions/{id}/runtime", cors(r.handleRuntimeState))
 	r.mux.HandleFunc("/api/sessions/{id}/debug", cors(r.handleSessionDebug))
+	r.mux.HandleFunc("/api/sessions/{id}/debug/calls/{call}", cors(r.handleModelCallDebug))
 	r.mux.HandleFunc("/api/sessions/{id}/export", cors(r.handleSessionExport))
 	r.mux.HandleFunc("/api/sessions/{id}/chat", cors(r.chatHandler.HandleChat))
 	r.mux.HandleFunc("/api/sessions/{id}/chat/status", cors(r.handleChatStatus))
@@ -131,13 +132,18 @@ func (r *Router) handleSessions(w http.ResponseWriter, req *http.Request) {
 		writeJSON(w, 200, list)
 	case http.MethodPost:
 		var body struct {
-			Title string `json:"title"`
+			Title        string `json:"title"`
+			InjectAgents *bool  `json:"inject_agents"`
 		}
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			writeJSONError(w, 400, "请求体解析失败")
 			return
 		}
-		item, err := r.store.CreateSession(body.Title)
+		injectAgents := true
+		if body.InjectAgents != nil {
+			injectAgents = *body.InjectAgents
+		}
+		item, err := r.store.CreateSession(body.Title, injectAgents)
 		if err != nil {
 			writeJSONError(w, 500, err.Error())
 			return
@@ -156,17 +162,39 @@ func (r *Router) handleSession(w http.ResponseWriter, req *http.Request) {
 	switch req.Method {
 	case http.MethodPatch:
 		var body struct {
-			Title string `json:"title"`
+			Title        *string `json:"title"`
+			InjectAgents *bool   `json:"inject_agents"`
 		}
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			writeJSONError(w, 400, "请求体解析失败")
 			return
 		}
-		if err := r.store.UpdateTitle(id, body.Title); err != nil {
+		if body.Title == nil && body.InjectAgents == nil {
+			writeJSONError(w, 400, "没有可更新字段")
+			return
+		}
+		if body.InjectAgents != nil && r.runs.Status(id).Active {
+			writeJSONError(w, http.StatusConflict, "当前 Session 正在执行；请在完成、暂停或等待用户时切换 AGENTS.md 注入")
+			return
+		}
+		if body.Title != nil {
+			if err := r.store.UpdateTitle(id, *body.Title); err != nil {
+				writeJSONError(w, 404, err.Error())
+				return
+			}
+		}
+		if body.InjectAgents != nil {
+			if err := r.store.UpdateAgentsInjection(id, *body.InjectAgents); err != nil {
+				writeJSONError(w, 404, err.Error())
+				return
+			}
+		}
+		item, err := r.store.GetSession(id)
+		if err != nil {
 			writeJSONError(w, 404, err.Error())
 			return
 		}
-		w.WriteHeader(204)
+		writeJSON(w, 200, item)
 	case http.MethodDelete:
 		if r.runs.Status(id).Active {
 			writeJSONError(w, 409, "会话正在执行，请先停止")
@@ -222,12 +250,26 @@ func (r *Router) handleSessionDebug(w http.ResponseWriter, req *http.Request) {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	calls, err := r.store.SessionModelCallDebug(sessionID)
+	after, _ := strconv.ParseInt(req.URL.Query().Get("after"), 10, 64)
+	calls, next, err := r.store.SessionModelCallDebugSummaries(sessionID, after)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"calls": calls})
+	writeJSON(w, http.StatusOK, map[string]any{"calls": calls, "next_after": next})
+}
+
+func (r *Router) handleModelCallDebug(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	detail, err := r.store.GetModelCallDebug(req.PathValue("id"), req.PathValue("call"))
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
 }
 
 func (r *Router) handleSessionExport(w http.ResponseWriter, req *http.Request) {
@@ -448,6 +490,7 @@ func (r *Router) decideApproval(w http.ResponseWriter, req *http.Request, status
 	}
 	var body struct {
 		Note     string `json:"note"`
+		Scope    string `json:"scope"`
 		Provider string `json:"provider"`
 		Model    string `json:"model"`
 		Thinking string `json:"thinking"`
@@ -462,7 +505,18 @@ func (r *Router) decideApproval(w http.ResponseWriter, req *http.Request, status
 		writeJSONError(w, 409, "当前 Approval 的解释 Action 仍在执行")
 		return
 	}
-	approval, err := r.store.DecideApproval(req.PathValue("id"), status, map[string]any{"note": body.Note})
+	scope := body.Scope
+	if scope != "phase" && scope != "turn" {
+		scope = "once"
+	}
+	phaseID := ""
+	if scope == "phase" {
+		phaseID = r.runtime.CurrentPhaseID(current.TurnID)
+		if phaseID == "" {
+			scope = "once"
+		}
+	}
+	approval, err := r.store.DecideApproval(req.PathValue("id"), status, map[string]any{"note": body.Note, "scope": scope, "risk_class": current.RiskClass, "phase_id": phaseID})
 	if err != nil {
 		writeJSONError(w, 409, err.Error())
 		return

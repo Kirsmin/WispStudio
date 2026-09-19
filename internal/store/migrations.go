@@ -253,6 +253,33 @@ ALTER TABLE model_calls ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}';
 			return err
 		},
 	},
+	{
+		version: 8,
+		name:    "Session 指令开关与 Turn 有效目标状态",
+		up: func(ctx context.Context, tx *sql.Tx) error {
+			const schema = `
+ALTER TABLE sessions ADD COLUMN inject_agents INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE turns ADD COLUMN current_objective TEXT NOT NULL DEFAULT '';
+ALTER TABLE turns ADD COLUMN decisions_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE turns ADD COLUMN task_complexity TEXT NOT NULL DEFAULT 'standard';
+ALTER TABLE turns ADD COLUMN allow_reconnaissance INTEGER NOT NULL DEFAULT 1;
+UPDATE turns SET current_objective=COALESCE(
+    NULLIF((SELECT content FROM records WHERE records.turn_id=turns.id AND kind IN ('user.message','user.steering') ORDER BY seq DESC LIMIT 1), ''),
+    objective
+) WHERE current_objective='';
+`
+			_, err := tx.ExecContext(ctx, schema)
+			return err
+		},
+	},
+	{
+		version: 9,
+		name:    "Approval 风险类别与授权作用域",
+		up: func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `ALTER TABLE approvals ADD COLUMN risk_class TEXT NOT NULL DEFAULT '';`)
+			return err
+		},
+	},
 }
 
 // migrate 执行所有尚未应用的迁移。整个流程在一个事务内完成。

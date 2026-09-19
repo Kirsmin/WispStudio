@@ -36,6 +36,10 @@ export interface TurnState {
   turn_index: number
   status: string
   objective: string
+  current_objective?: string
+  user_decisions?: string[]
+  task_complexity?: 'trivial' | 'standard' | 'complex'
+  allow_reconnaissance?: boolean
   active_agent: string
   context_epoch: number
   active_agent_run_id?: string
@@ -70,6 +74,7 @@ export interface Approval {
   tool_name: string
   args: Record<string, any>
   risk: string
+  risk_class?: string
   status: string
 }
 export interface AgentRun {
@@ -108,6 +113,8 @@ export interface StreamingModel {
   model?: string
   reasoning: string
   content: string
+  toolNames: string[]
+  toolFragments: Record<string, string>
   phase: 'waiting' | 'reasoning' | 'answer' | 'done' | 'error'
   usage?: Record<string, number>
   error?: string
@@ -285,16 +292,25 @@ export const useChatStore = defineStore('chat', () => {
         const record = payload.record
         if (record?.id) upsertRecord(normalizeRecord(record))
       } else if (event.event === 'model.start') {
-        streamingModel.value = reactive<StreamingModel>({ callId: String(payload.call_id || ''), agentRunId: payload.agent_run_id, profileId: payload.profile_id, model: payload.model, reasoning: '', content: '', phase: 'waiting' })
+        streamingModel.value = reactive<StreamingModel>({ callId: String(payload.call_id || ''), agentRunId: payload.agent_run_id, profileId: payload.profile_id, model: payload.model, reasoning: '', content: '', toolNames: [], toolFragments: {}, phase: 'waiting' })
         runtimeState.value.execution = { active: true, turn_id: String(payload.turn_id || runtimeState.value.turn?.id || '') }
         if (runtimeState.value.turn && payload.profile_id) {
           runtimeState.value.turn.active_agent = String(payload.profile_id)
           runtimeState.value.turn.status = 'running'
         }
       } else if (event.event === 'reasoning') {
-        if (streamingModel.value) { streamingModel.value.reasoning += String(payload.text || ''); if (!streamingModel.value.content) streamingModel.value.phase = 'reasoning' }
+        // Reasoning 由后端完整持久化并可在 Trace Debug 中查看；主聊天只保留“正在思考”的状态信号，避免隐藏 token 持续触发 Vue 重渲染。
+        if (streamingModel.value) { if (!streamingModel.value.reasoning) streamingModel.value.reasoning = '…'; if (!streamingModel.value.content) streamingModel.value.phase = 'reasoning' }
       } else if (event.event === 'delta') {
         if (streamingModel.value) { streamingModel.value.content += String(payload.text || ''); streamingModel.value.phase = 'answer' }
+      } else if (event.event === 'tool.delta') {
+        if (streamingModel.value) {
+          const index = String(Number(payload.index || 0))
+          const fragment = String(payload.name || '')
+          if (fragment) streamingModel.value.toolFragments[index] = (streamingModel.value.toolFragments[index] || '') + fragment
+          streamingModel.value.toolNames = Object.keys(streamingModel.value.toolFragments).sort((a, b) => Number(a) - Number(b)).map(key => streamingModel.value!.toolFragments[key]).filter(Boolean)
+          if (streamingModel.value.toolNames.length) streamingModel.value.content = ''
+        }
       } else if (event.event === 'usage') {
         if (streamingModel.value) streamingModel.value.usage = payload as Record<string, number>
       } else if (event.event === 'model.done') {
@@ -401,8 +417,8 @@ export const useChatStore = defineStore('chat', () => {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
-  async function decideApproval(id: string, decision: 'approve' | 'reject') {
-    const response = await fetch(connectionStore.api(`/api/approvals/${encodeURIComponent(id)}/${decision}`), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: selectedProvider.value, model: selectedModel.value, thinking: selectedThinking.value }) })
+  async function decideApproval(id: string, decision: 'approve' | 'reject', scope: 'once' | 'phase' | 'turn' = 'once') {
+    const response = await fetch(connectionStore.api(`/api/approvals/${encodeURIComponent(id)}/${decision}`), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scope, provider: selectedProvider.value, model: selectedModel.value, thinking: selectedThinking.value }) })
     if (!response.ok) throw new Error(await readHTTPError(response, '处理 Approval 失败'))
     if (sessionsStore.currentSessionId) await refreshAll(sessionsStore.currentSessionId)
   }

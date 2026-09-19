@@ -106,22 +106,23 @@ type Approval struct {
 	ToolName   string          `json:"tool_name"`
 	Args       json.RawMessage `json:"args"`
 	Risk       string          `json:"risk"`
+	RiskClass  string          `json:"risk_class,omitempty"`
 	Status     string          `json:"status"`
 	Decision   json.RawMessage `json:"decision,omitempty"`
 	CreatedAt  string          `json:"created_at"`
 	DecidedAt  string          `json:"decided_at,omitempty"`
 }
 
-func (s *Store) CreateApproval(sessionID, turnID, agentRunID, toolCallID, toolName string, args json.RawMessage, risk string) (*Approval, error) {
+func (s *Store) CreateApproval(sessionID, turnID, agentRunID, toolCallID, toolName string, args json.RawMessage, risk, riskClass string) (*Approval, error) {
 	if len(args) == 0 {
 		args = json.RawMessage(`{}`)
 	}
 	a := &Approval{
 		ID: "ap_" + compactUUID(), SessionID: sessionID, TurnID: turnID, AgentRunID: agentRunID,
-		ToolCallID: toolCallID, ToolName: toolName, Args: args, Risk: risk, Status: "pending", CreatedAt: stamp(time.Now().UTC()), Decision: json.RawMessage(`{}`),
+		ToolCallID: toolCallID, ToolName: toolName, Args: args, Risk: risk, RiskClass: riskClass, Status: "pending", CreatedAt: stamp(time.Now().UTC()), Decision: json.RawMessage(`{}`),
 	}
-	_, err := s.db.Exec(`INSERT INTO approvals(id,session_id,turn_id,agent_run_id,tool_call_id,tool_name,args_json,risk,status,decision_json,created_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, a.ID, sessionID, turnID, agentRunID, toolCallID, toolName, string(args), risk, a.Status, `{}`, a.CreatedAt)
+	_, err := s.db.Exec(`INSERT INTO approvals(id,session_id,turn_id,agent_run_id,tool_call_id,tool_name,args_json,risk,risk_class,status,decision_json,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, a.ID, sessionID, turnID, agentRunID, toolCallID, toolName, string(args), risk, riskClass, a.Status, `{}`, a.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -155,8 +156,8 @@ func (s *Store) DecideApproval(id, status string, decision any) (*Approval, erro
 func (s *Store) GetApproval(id string) (*Approval, error) {
 	var a Approval
 	var args, decision string
-	err := s.db.QueryRow(`SELECT id,session_id,turn_id,agent_run_id,tool_call_id,tool_name,args_json,risk,status,decision_json,created_at,COALESCE(decided_at,'') FROM approvals WHERE id=?`, id).
-		Scan(&a.ID, &a.SessionID, &a.TurnID, &a.AgentRunID, &a.ToolCallID, &a.ToolName, &args, &a.Risk, &a.Status, &decision, &a.CreatedAt, &a.DecidedAt)
+	err := s.db.QueryRow(`SELECT id,session_id,turn_id,agent_run_id,tool_call_id,tool_name,args_json,risk,risk_class,status,decision_json,created_at,COALESCE(decided_at,'') FROM approvals WHERE id=?`, id).
+		Scan(&a.ID, &a.SessionID, &a.TurnID, &a.AgentRunID, &a.ToolCallID, &a.ToolName, &args, &a.Risk, &a.RiskClass, &a.Status, &decision, &a.CreatedAt, &a.DecidedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("Approval 不存在")
 	}
@@ -198,7 +199,7 @@ func (s *Store) NextResolvedApproval(turnID string) (*Approval, error) {
 }
 
 func (s *Store) ListApprovals(turnID string) ([]Approval, error) {
-	rows, err := s.db.Query(`SELECT id,session_id,turn_id,agent_run_id,tool_call_id,tool_name,args_json,risk,status,decision_json,created_at,COALESCE(decided_at,'') FROM approvals WHERE turn_id=? ORDER BY created_at`, turnID)
+	rows, err := s.db.Query(`SELECT id,session_id,turn_id,agent_run_id,tool_call_id,tool_name,args_json,risk,risk_class,status,decision_json,created_at,COALESCE(decided_at,'') FROM approvals WHERE turn_id=? ORDER BY created_at`, turnID)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +208,7 @@ func (s *Store) ListApprovals(turnID string) ([]Approval, error) {
 	for rows.Next() {
 		var a Approval
 		var args, decision string
-		if err := rows.Scan(&a.ID, &a.SessionID, &a.TurnID, &a.AgentRunID, &a.ToolCallID, &a.ToolName, &args, &a.Risk, &a.Status, &decision, &a.CreatedAt, &a.DecidedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.SessionID, &a.TurnID, &a.AgentRunID, &a.ToolCallID, &a.ToolName, &args, &a.Risk, &a.RiskClass, &a.Status, &decision, &a.CreatedAt, &a.DecidedAt); err != nil {
 			return nil, err
 		}
 		a.Args = json.RawMessage(args)
@@ -215,6 +216,44 @@ func (s *Store) ListApprovals(turnID string) ([]Approval, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+type approvalDecision struct {
+	Scope     string `json:"scope"`
+	RiskClass string `json:"risk_class"`
+	PhaseID   string `json:"phase_id"`
+}
+
+// ApprovalGrantAllows 只在用户明确声明的授权作用域内复用批准。
+// phase 绑定 Runtime Phase ID；turn 授权持续到当前 Turn 结束。
+func (s *Store) ApprovalGrantAllows(turnID, toolName, riskClass, phaseID string) (bool, error) {
+	rows, err := s.db.Query(`SELECT tool_name,risk_class,decision_json FROM approvals WHERE turn_id=? AND status='approved' ORDER BY decided_at DESC`, turnID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, class, raw string
+		if err := rows.Scan(&name, &class, &raw); err != nil {
+			return false, err
+		}
+		if name != toolName || class != riskClass {
+			continue
+		}
+		var decision approvalDecision
+		if json.Unmarshal([]byte(raw), &decision) != nil {
+			continue
+		}
+		switch decision.Scope {
+		case "turn":
+			return true, nil
+		case "phase":
+			if phaseID != "" && decision.PhaseID == phaseID {
+				return true, nil
+			}
+		}
+	}
+	return false, rows.Err()
 }
 
 type Checkpoint struct {
