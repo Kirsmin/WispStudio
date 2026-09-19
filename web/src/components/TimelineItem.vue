@@ -123,7 +123,9 @@ function stringData(key: string) { const value = data.value[key]; return typeof 
 .reasoning summary { cursor: pointer; color: var(--accent-text); }
 .reasoning :deep(.md) { margin-top: 7px; font-size: 13px; color: var(--text-2); }
 .event-card { padding: 10px 12px; border: 1px solid var(--border); border-radius: 11px; background: var(--bg-soft); }
-.event-card.tool-card { border-left: 3px solid var(--accent); }
+.event-card.tool-card { border-left: 3px solid var(--accent); background: linear-gradient(180deg,var(--bg-soft),var(--bg)); }
+.tool-summary { display:flex; flex-direction:column; gap:8px; }
+.tool-line span { font-size:11px; color:var(--text-3); }
 .event-card.runtime, .event-card.context, .event-card.checkpoint { background: transparent; border-style: dashed; }
 .event-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .event-kind { color: var(--text-3); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; flex-shrink: 0; }
