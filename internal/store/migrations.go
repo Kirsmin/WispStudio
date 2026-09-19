@@ -9,20 +9,14 @@ import (
 )
 
 // migration 表示一次递增的 Schema 版本升级。
-// 所有迁移在 migrate 的同一个事务中按版本升序执行；
-// 中途任何一步失败都会整体回滚，不会留下“版本已升但结构只做了一半”的状态。
+// 所有迁移在 migrate 的同一个事务中按版本升序执行；任一步失败都会整体回滚。
 type migration struct {
 	version int
 	name    string
 	up      func(ctx context.Context, tx *sql.Tx) error
 }
 
-// migrations 按版本升序登记全部 Schema 迁移。
-// 新增结构变更时的规范：
-//  1. 在末尾追加新的 migration，version 严格递增，name 用中文简述用途；
-//  2. 不允许修改或删除已发布的迁移（旧库升级依赖其顺序与幂等性）；
-//  3. DDL 必须对“从上一版本升级过来的库”安全生效，必要时使用 IF NOT EXISTS；
-//  4. 只放当前阶段需要的结构，不为未来需求提前建表。
+// migrations 只追加、不改写已发布版本。每个版本只建立当时 Runtime 已经需要的数据结构。
 var migrations = []migration{
 	{
 		version: 1,
@@ -84,17 +78,172 @@ CREATE TABLE IF NOT EXISTS records (
 CREATE INDEX IF NOT EXISTS idx_records_session_seq ON records(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_model_calls_session ON model_calls(session_id, created_at);
 `
-			_, err := tx.ExecContext(ctx, schema)
-			if err != nil {
+			if _, err := tx.ExecContext(ctx, schema); err != nil {
 				return fmt.Errorf("初始化 SQLite 失败: %w", err)
 			}
 			return nil
 		},
 	},
+	{
+		version: 2,
+		name:    "Turn 与 Timeline 任务语义",
+		up: func(ctx context.Context, tx *sql.Tx) error {
+			const schema = `
+ALTER TABLE turns ADD COLUMN objective TEXT NOT NULL DEFAULT '';
+ALTER TABLE turns ADD COLUMN active_agent TEXT NOT NULL DEFAULT 'plan';
+ALTER TABLE turns ADD COLUMN context_epoch INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE turns ADD COLUMN steering_cursor INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE turns ADD COLUMN root_agent_run_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE turns ADD COLUMN active_agent_run_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE turns ADD COLUMN active_checkpoint_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE turns ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE turns ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_turns_session_status ON turns(session_id, status, turn_index);
+CREATE INDEX IF NOT EXISTS idx_records_turn_seq ON records(turn_id, seq);
+`
+			_, err := tx.ExecContext(ctx, schema)
+			return err
+		},
+	},
+	{
+		version: 3,
+		name:    "ModelCall Context 可观测信息",
+		up: func(ctx context.Context, tx *sql.Tx) error {
+			const schema = `
+ALTER TABLE model_calls ADD COLUMN agent_run_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE model_calls ADD COLUMN context_epoch INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE model_calls ADD COLUMN context_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE model_calls ADD COLUMN prefix_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE model_calls ADD COLUMN context_debug_json TEXT NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_model_calls_turn_index ON model_calls(turn_id, call_index);
+CREATE INDEX IF NOT EXISTS idx_model_calls_agent_run ON model_calls(agent_run_id, call_index);
+`
+			_, err := tx.ExecContext(ctx, schema)
+			return err
+		},
+	},
+	{
+		version: 4,
+		name:    "AgentRun 与版本化 Artifact",
+		up: func(ctx context.Context, tx *sql.Tx) error {
+			const schema = `
+CREATE TABLE agent_runs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+    parent_run_id TEXT REFERENCES agent_runs(id) ON DELETE SET NULL,
+    profile_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX idx_agent_runs_turn ON agent_runs(turn_id, created_at);
+
+CREATE TABLE artifacts (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    active_version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(turn_id, type, name)
+);
+CREATE INDEX idx_artifacts_turn ON artifacts(turn_id, type);
+
+CREATE TABLE artifact_versions (
+    id TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    data_json TEXT NOT NULL DEFAULT '{}',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(artifact_id, version)
+);
+CREATE INDEX idx_artifact_versions_artifact ON artifact_versions(artifact_id, version);
+`
+			_, err := tx.ExecContext(ctx, schema)
+			return err
+		},
+	},
+	{
+		version: 5,
+		name:    "Approval/Checkpoint/Context Epoch",
+		up: func(ctx context.Context, tx *sql.Tx) error {
+			const schema = `
+CREATE TABLE approvals (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+    agent_run_id TEXT NOT NULL DEFAULT '',
+    tool_call_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    args_json TEXT NOT NULL DEFAULT '{}',
+    risk TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    decision_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    decided_at TEXT,
+    UNIQUE(turn_id, tool_call_id)
+);
+CREATE INDEX idx_approvals_turn_status ON approvals(turn_id, status, created_at);
+
+CREATE TABLE checkpoints (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+    context_epoch INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    facts_json TEXT NOT NULL DEFAULT '{}',
+    timeline_seq INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_checkpoints_turn_epoch ON checkpoints(turn_id, context_epoch);
+
+CREATE TABLE context_epochs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+    epoch_index INTEGER NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    checkpoint_id TEXT NOT NULL DEFAULT '',
+    prefix_hash TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(turn_id, epoch_index)
+);
+`
+			_, err := tx.ExecContext(ctx, schema)
+			return err
+		},
+	},
+	{
+		version: 6,
+		name:    "Turn Context Fold/Restore",
+		up: func(ctx context.Context, tx *sql.Tx) error {
+			const schema = `
+CREATE TABLE context_folds (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+    stack_index INTEGER NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    restored_at TEXT,
+    UNIQUE(session_id, stack_index)
+);
+CREATE INDEX idx_context_folds_session_active ON context_folds(session_id, active, stack_index);
+`
+			_, err := tx.ExecContext(ctx, schema)
+			return err
+		},
+	},
 }
 
-// migrate 执行所有尚未应用的迁移。整个流程在一个事务内完成：
-// 读取当前版本 -> 顺序执行缺失迁移 -> 逐条记录版本与审计信息 -> 提交。
+// migrate 执行所有尚未应用的迁移。整个流程在一个事务内完成。
 func (s *Store) migrate(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -102,14 +251,12 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 
-	// meta 保存兼容用的当前 schema_version。
 	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS meta (
 		key TEXT PRIMARY KEY,
 		value TEXT NOT NULL
 	)`); err != nil {
 		return fmt.Errorf("初始化 meta 表失败: %w", err)
 	}
-	// schema_migrations 逐条记录已应用的迁移，便于 debug 与审计。
 	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version INTEGER PRIMARY KEY,
 		name TEXT NOT NULL,
@@ -122,11 +269,17 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// 补记历史版本审计：从旧机制升级过来的库可能已处于较新版本，
-	// 但 schema_migrations 中没有对应记录。
+	latest := 0
+	if len(migrations) > 0 {
+		latest = migrations[len(migrations)-1].version
+	}
+	if current > latest {
+		return fmt.Errorf("数据库 schema_version=%d 高于当前程序支持的 v%d", current, latest)
+	}
+
 	for _, m := range migrations {
 		if m.version > current {
-			continue
+			break
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)`,
@@ -134,6 +287,14 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("补记迁移 v%d 失败: %w", m.version, err)
 		}
 	}
+
+	// 兼容旧 v1：如果版本是通过表结构识别出来的，也必须立即写回 meta。
+	if current > 0 {
+		if err := setSchemaVersion(ctx, tx, current); err != nil {
+			return err
+		}
+	}
+
 	for _, m := range migrations {
 		if m.version <= current {
 			continue
@@ -141,14 +302,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := m.up(ctx, tx); err != nil {
 			return fmt.Errorf("迁移 v%d (%s) 失败: %w", m.version, m.name, err)
 		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO meta(key, value) VALUES ('schema_version', ?)
-			 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-			strconv.Itoa(m.version)); err != nil {
+		if err := setSchemaVersion(ctx, tx, m.version); err != nil {
 			return fmt.Errorf("记录 schema_version=%d 失败: %w", m.version, err)
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)`,
+			`INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)`,
 			m.version, m.name, stamp(time.Now().UTC())); err != nil {
 			return fmt.Errorf("记录迁移 v%d 失败: %w", m.version, err)
 		}
@@ -157,8 +315,14 @@ func (s *Store) migrate(ctx context.Context) error {
 	return tx.Commit()
 }
 
-// currentSchemaVersion 读取 meta 中的 schema_version。
-// 兼容极旧数据库：结构已存在但没有版本记录时，按 v1 处理。
+func setSchemaVersion(ctx context.Context, tx *sql.Tx, version int) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO meta(key, value) VALUES ('schema_version', ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, strconv.Itoa(version))
+	return err
+}
+
+// currentSchemaVersion 兼容极旧数据库：四张 v1 核心表完整存在但没有版本记录时按 v1 处理。
 func (s *Store) currentSchemaVersion(ctx context.Context, tx *sql.Tx) (int, error) {
 	var raw string
 	err := tx.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='schema_version'`).Scan(&raw)
@@ -183,14 +347,12 @@ func (s *Store) currentSchemaVersion(ctx context.Context, tx *sql.Tx) (int, erro
 	return version, nil
 }
 
-// AppliedMigration 是一次已应用迁移的审计记录。
 type AppliedMigration struct {
 	Version   int    `json:"version"`
 	Name      string `json:"name"`
 	AppliedAt string `json:"applied_at"`
 }
 
-// AppliedMigrations 返回全部已应用的迁移，便于 debug。
 func (s *Store) AppliedMigrations() ([]AppliedMigration, error) {
 	rows, err := s.db.Query(`SELECT version, name, applied_at FROM schema_migrations ORDER BY version`)
 	if err != nil {
@@ -208,7 +370,6 @@ func (s *Store) AppliedMigrations() ([]AppliedMigration, error) {
 	return out, rows.Err()
 }
 
-// SchemaVersion 返回当前数据库结构版本，便于 debug。
 func (s *Store) SchemaVersion() (int, error) {
 	var raw string
 	if err := s.db.QueryRow(`SELECT value FROM meta WHERE key='schema_version'`).Scan(&raw); err != nil {

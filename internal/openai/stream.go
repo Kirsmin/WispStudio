@@ -8,16 +8,24 @@ import (
 	"strings"
 )
 
-// StreamEvent 是从 OpenAI Chat Completions 兼容 SSE 中抽象出的事件。
-type StreamEvent struct {
-	Type   string // delta | reasoning | usage | done | error
-	Text   string
-	Usage  *Usage
-	Finish string
-	Error  string
+type ToolCallDelta struct {
+	Index     int
+	ID        string
+	Type      string
+	Name      string
+	Arguments string
 }
 
-// Usage token 用量。
+// StreamEvent 是上游流到 Runtime 的协议事件，不依赖 SSE/HTTP。
+type StreamEvent struct {
+	Type     string // delta | reasoning | tool_call | usage | done | error
+	Text     string
+	ToolCall *ToolCallDelta
+	Usage    *Usage
+	Finish   string
+	Error    string
+}
+
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
@@ -25,7 +33,6 @@ type Usage struct {
 	ReasoningTokens  int `json:"reasoning_tokens"`
 }
 
-// StreamReader 解析上游 SSE。
 type StreamReader struct {
 	reader io.ReadCloser
 	scan   *bufio.Scanner
@@ -33,25 +40,15 @@ type StreamReader struct {
 
 func NewStreamReader(r io.ReadCloser) *StreamReader {
 	scan := bufio.NewScanner(r)
-	// 某些兼容网关会把工具调用/长 delta 放在单个 SSE data 行里，默认 64KB 不够。
 	const maxCapacity = 16 * 1024 * 1024
 	scan.Buffer(make([]byte, 64*1024), maxCapacity)
 	return &StreamReader{reader: r, scan: scan}
 }
+func (sr *StreamReader) Close() error { return sr.reader.Close() }
 
-func (sr *StreamReader) Close() error {
-	return sr.reader.Close()
-}
-
-// ReadEvents 兼容：
-//   - OpenAI Chat Completions 标准 delta.content / delta.refusal；
-//   - 常见 reasoning 扩展：reasoning_content / reasoning / thinking / analysis；
-//   - stream_options.include_usage 的末尾 usage chunk（choices 可为空）。
 func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 	defer close(ch)
-
 	finish := ""
-
 	for sr.scan.Scan() {
 		line := strings.TrimSuffix(sr.scan.Text(), "\r")
 		if !strings.HasPrefix(line, "data:") {
@@ -67,16 +64,13 @@ func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 
 		var chunk streamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			// 不让单个非标准心跳/注释块击穿整个流。
 			continue
 		}
-
 		if chunk.Error != nil {
 			ch <- StreamEvent{Type: "error", Error: errorMessage(chunk.Error)}
 			finish = "error"
 			continue
 		}
-
 		for _, choice := range chunk.Choices {
 			if text := rawText(choice.Delta.Content); text != "" {
 				ch <- StreamEvent{Type: "delta", Text: text}
@@ -84,28 +78,22 @@ func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 			if choice.Delta.Refusal != "" {
 				ch <- StreamEvent{Type: "delta", Text: choice.Delta.Refusal}
 			}
-
-			reasoning := firstNonEmpty(
-				choice.Delta.ReasoningContent,
-				choice.Delta.Reasoning,
-				choice.Delta.Thinking,
-				choice.Delta.Analysis,
-			)
+			reasoning := firstNonEmpty(choice.Delta.ReasoningContent, choice.Delta.Reasoning, choice.Delta.Thinking, choice.Delta.Analysis)
 			if reasoning != "" {
 				ch <- StreamEvent{Type: "reasoning", Text: reasoning}
 			}
-
+			for _, call := range choice.Delta.ToolCalls {
+				index := call.Index
+				ch <- StreamEvent{Type: "tool_call", ToolCall: &ToolCallDelta{
+					Index: index, ID: call.ID, Type: call.Type, Name: call.Function.Name, Arguments: call.Function.Arguments,
+				}}
+			}
 			if choice.FinishReason != nil && *choice.FinishReason != "" && finish == "" {
 				finish = *choice.FinishReason
 			}
 		}
-
 		if chunk.Usage != nil {
-			u := &Usage{
-				PromptTokens:     chunk.Usage.PromptTokens,
-				CompletionTokens: chunk.Usage.CompletionTokens,
-				ReasoningTokens:  chunk.Usage.ReasoningTokens,
-			}
+			u := &Usage{PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens, ReasoningTokens: chunk.Usage.ReasoningTokens}
 			if chunk.Usage.PromptTokensDetails != nil {
 				u.CachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
 			}
@@ -115,7 +103,6 @@ func (sr *StreamReader) ReadEvents(ch chan<- StreamEvent) {
 			ch <- StreamEvent{Type: "usage", Usage: u}
 		}
 	}
-
 	if err := sr.scan.Err(); err != nil {
 		ch <- StreamEvent{Type: "error", Error: fmt.Sprintf("读取流失败: %v", err)}
 		return
@@ -135,6 +122,15 @@ type streamChunk struct {
 			Reasoning        string          `json:"reasoning"`
 			Thinking         string          `json:"thinking"`
 			Analysis         string          `json:"analysis"`
+			ToolCalls        []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -152,7 +148,6 @@ type streamChunk struct {
 	Error any `json:"error"`
 }
 
-// rawText 兼容标准 string content，也容忍部分网关返回 text parts 数组。
 func rawText(raw json.RawMessage) string {
 	if len(raw) == 0 || string(raw) == "null" {
 		return ""
@@ -186,7 +181,6 @@ func errorMessage(value any) string {
 	}
 	return fmt.Sprint(value)
 }
-
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if value != "" {

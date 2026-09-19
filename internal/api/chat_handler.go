@@ -1,36 +1,26 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"wisp/internal/config"
-	"wisp/internal/openai"
 	"wisp/internal/provider"
+	agentruntime "wisp/internal/runtime"
 	"wisp/internal/store"
 )
 
 type ChatHandler struct {
-	cfg          *config.Config
-	catalog      *provider.Catalog
-	store        *store.Store
-	runs         *RunRegistry
-	openaiClient *openai.Client
+	cfg     *config.Config
+	catalog *provider.Catalog
+	store   *store.Store
+	runtime *agentruntime.Coordinator
 }
 
-func NewChatHandler(cfg *config.Config, catalog *provider.Catalog, st *store.Store, runs *RunRegistry) *ChatHandler {
-	return &ChatHandler{
-		cfg:          cfg,
-		catalog:      catalog,
-		store:        st,
-		runs:         runs,
-		openaiClient: openai.NewClient(&cfg.OpenAI),
-	}
+func NewChatHandler(cfg *config.Config, catalog *provider.Catalog, st *store.Store, runtime *agentruntime.Coordinator) *ChatHandler {
+	return &ChatHandler{cfg: cfg, catalog: catalog, store: st, runtime: runtime}
 }
 
 type chatRequest struct {
@@ -40,298 +30,146 @@ type chatRequest struct {
 	Thinking string `json:"thinking"`
 }
 
-type callOutcome struct {
-	Content    string
-	Reasoning  string
-	Usage      *store.Usage
-	Finish     string
-	Error      string
-	DurationMs int
-	TTFTMs     int
-}
-
+// HandleChat 只负责传输、校验、持久化用户输入、启动/继续 Runtime 与 SSE 订阅。
+// Provider 流读取、Tool Loop、Turn 生命周期等业务规则全部由 Coordinator 管理。
 func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
 	}
-
 	sessionID := r.PathValue("id")
 	if sessionID == "" {
-		http.Error(w, "缺少会话ID", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "缺少会话ID")
 		return
 	}
 	var req chatRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&req); err != nil {
-		http.Error(w, "请求体解析失败", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "请求体解析失败")
 		return
 	}
 	req.Message = strings.TrimSpace(req.Message)
 	if req.Message == "" {
-		http.Error(w, "消息不能为空", http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "消息不能为空")
 		return
 	}
-
 	sess, err := h.store.GetSession(sessionID)
 	if err != nil {
-		http.Error(w, "会话不存在", http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, "会话不存在")
 		return
 	}
 	providerID := strings.TrimSpace(req.Provider)
 	if providerID == "" {
 		providerID = strings.TrimSpace(sess.Provider)
 	}
-	provCfg, modelInfo, err := h.catalog.Resolve(r.Context(), providerID, req.Model)
+	prov, model, err := h.catalog.Resolve(r.Context(), providerID, req.Model)
 	if err != nil && strings.TrimSpace(req.Provider) == "" && providerID != "" {
-		provCfg, modelInfo, err = h.catalog.Resolve(r.Context(), "", req.Model)
+		prov, model, err = h.catalog.Resolve(r.Context(), "", req.Model)
 	}
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	req.Provider = provCfg.ID
-	req.Model = modelInfo.ID
-
-	prior, err := h.store.ContextMessages(sessionID)
-	if err != nil {
-		http.Error(w, "读取历史失败", http.StatusInternalServerError)
-		return
+	req.Provider, req.Model = prov.ID, model.ID
+	if req.Thinking == "" {
+		req.Thinking = "default"
 	}
-
-	runCtx, ok := h.runs.Begin(sessionID)
-	if !ok {
-		writeJSONError(w, http.StatusConflict, "该会话有任务正在执行")
-		return
-	}
-	defer h.runs.End(sessionID)
-
-	turnID, err := h.store.BeginTurn(sessionID)
-	if err != nil {
-		http.Error(w, "创建 Turn 失败", http.StatusInternalServerError)
-		return
-	}
-	userRecord, err := h.store.AppendUser(sessionID, turnID, req.Message, req.Provider, req.Model, req.Thinking)
-	if err != nil {
-		_ = h.store.CompleteTurn(turnID, "failed")
-		http.Error(w, "保存消息失败", http.StatusInternalServerError)
-		return
-	}
+	selection := agentruntime.Selection{Provider: req.Provider, Model: req.Model, Thinking: req.Thinking}
 	_ = h.store.UpdateSelection(sessionID, req.Provider, req.Model)
-	if !sess.Renamed && len(prior) == 0 {
+
+	turn, err := h.store.GetOpenTurn(sessionID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	isNew := turn == nil
+	if isNew {
+		turn, err = h.store.BeginTaskTurn(sessionID, req.Message)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "创建 Turn 失败: "+err.Error())
+			return
+		}
+	}
+
+	var userRecord store.Record
+	execStatus := h.runtime.Runs().Status(sessionID)
+	if !isNew && execStatus.Active {
+		userRecord, err = h.store.AppendSteering(sessionID, turn.ID, req.Message)
+	} else {
+		userRecord, err = h.store.AppendUser(sessionID, turn.ID, req.Message, req.Provider, req.Model, req.Thinking)
+	}
+	if err != nil {
+		if isNew {
+			_ = h.store.CompleteTurn(turn.ID, store.TurnFailed)
+		}
+		writeJSONError(w, http.StatusInternalServerError, "保存消息失败: "+err.Error())
+		return
+	}
+	if isNew && !sess.Renamed {
 		_ = h.store.UpdateAutoTitle(sessionID, store.GenerateTitle(req.Message))
 	}
 
 	sse, supported := NewSSEWriter(w)
 	if !supported {
-		_ = h.store.CompleteTurn(turnID, "failed")
-		http.Error(w, "SSE 不支持", http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "SSE 不支持")
 		return
 	}
 	_ = sse.WriteEvent("ack", mustJSON(map[string]any{
-		"message": map[string]any{
-			"id":       userRecord.ID,
-			"type":     "user",
-			"ts":       userRecord.CreatedAt,
-			"content":  req.Message,
-			"provider": req.Provider,
-			"model":    req.Model,
-			"thinking": req.Thinking,
-		},
-		"turn_id": turnID,
+		"record": userRecord, "turn_id": turn.ID, "steering": userRecord.Kind == store.EventUserSteering,
+		"message": map[string]any{"id": userRecord.ID, "type": "user", "ts": userRecord.CreatedAt, "content": req.Message, "provider": req.Provider, "model": req.Model, "thinking": req.Thinking},
 	}))
 
-	baseURL, apiKey := h.cfg.OpenAI.BaseURL, h.cfg.OpenAI.APIKey
-	if provCfg.BaseURL != "" {
-		baseURL = provCfg.BaseURL
+	// 正在执行时该请求只是 Steering：事实已经持久化，当前 Action 到安全点后会消费。
+	if userRecord.Kind == store.EventUserSteering {
+		_ = sse.WriteEvent("done", mustJSON(map[string]any{"turn_id": turn.ID, "status": store.TurnRunning, "steering": true}))
+		return
 	}
-	if provCfg.APIKey != "" {
-		apiKey = provCfg.APIKey
+	if turn.Status == store.TurnPaused {
+		_ = sse.WriteEvent("done", mustJSON(map[string]any{"turn_id": turn.ID, "status": store.TurnPaused}))
+		return
 	}
-
-	if runCtx.Err() != nil {
-		h.finishCancelled(sse, sessionID, turnID, "")
+	if pending, _ := h.store.PendingApproval(turn.ID); pending != nil {
+		_ = sse.WriteEvent("done", mustJSON(map[string]any{"turn_id": turn.ID, "status": store.TurnWaitingUser, "approval_id": pending.ID}))
 		return
 	}
 
-	history, err := h.store.ContextMessages(sessionID)
-	if err != nil {
-		h.finishTurnError(sse, sessionID, turnID, "", "读取上下文失败: "+err.Error())
+	events, unsubscribe := h.runtime.Hub().Subscribe(sessionID)
+	defer unsubscribe()
+	if !h.runtime.Start(turn.ID, selection) {
+		_ = sse.WriteEvent("done", mustJSON(map[string]any{"turn_id": turn.ID, "status": "running"}))
 		return
 	}
-	systemPrompt := buildSystemPrompt(h.cfg.SystemPrompt)
-	messages := make([]openai.ChatMessage, 0, len(history)+1)
-	messages = append(messages, openai.ChatMessage{Role: "system", Content: systemPrompt})
-	for _, msg := range history {
-		messages = append(messages, openai.ChatMessage{Role: msg.Role, Content: msg.Content})
-	}
-
-	modelCallID, err := h.store.BeginModelCall(sessionID, turnID, 1, req.Provider, req.Model, req.Thinking, systemPrompt)
-	if err != nil {
-		h.finishTurnError(sse, sessionID, turnID, "", "创建 ModelCall 失败: "+err.Error())
-		return
-	}
-	_ = sse.WriteEvent("model.start", mustJSON(map[string]any{
-		"call_id":  modelCallID,
-		"index":    1,
-		"provider": req.Provider,
-		"model":    req.Model,
-		"thinking": req.Thinking,
-	}))
-
-	upReq, err := h.openaiClient.BuildRequest(baseURL, apiKey, req.Model, modelInfo.ThinkingStyle, req.Thinking, messages)
-	if err != nil {
-		message := "构造请求失败: " + err.Error()
-		_ = h.store.AppendError(sessionID, turnID, modelCallID, message)
-		_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{Status: "failed", Finish: "error", Error: message})
-		h.finishTurnError(sse, sessionID, turnID, modelCallID, message)
-		return
-	}
-
-	outcome := h.runModelCall(runCtx, sse, upReq)
-	if runCtx.Err() != nil {
-		h.persistCallBody(sessionID, turnID, modelCallID, outcome)
-		_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
-			Status: "cancelled", Finish: "aborted", Usage: outcome.Usage,
-			DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs, Error: "生成已停止",
-		})
-		h.finishCancelled(sse, sessionID, turnID, modelCallID)
-		return
-	}
-
-	h.persistCallBody(sessionID, turnID, modelCallID, outcome)
-	if outcome.Error != "" {
-		_ = h.store.AppendError(sessionID, turnID, modelCallID, outcome.Error)
-		_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
-			Status: "failed", Finish: "error", Usage: outcome.Usage,
-			DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs, Error: outcome.Error,
-		})
-		h.finishTurnError(sse, sessionID, turnID, modelCallID, outcome.Error)
-		return
-	}
-
-	finish := outcome.Finish
-	if finish == "" {
-		finish = "stop"
-	}
-	if outcome.Content == "" && outcome.Reasoning == "" {
-		message := "模型没有返回可显示的内容"
-		_ = h.store.AppendError(sessionID, turnID, modelCallID, message)
-		_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
-			Status: "failed", Finish: "error", Usage: outcome.Usage,
-			DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs, Error: message,
-		})
-		h.finishTurnError(sse, sessionID, turnID, modelCallID, message)
-		return
-	}
-	_ = h.store.FinishModelCall(modelCallID, store.ModelCallResult{
-		Status: "completed", Finish: finish, Usage: outcome.Usage,
-		DurationMs: outcome.DurationMs, TTFTMs: outcome.TTFTMs,
-	})
-	_ = h.store.CompleteTurn(turnID, "completed")
-	_ = h.store.Touch(sessionID)
-	_ = sse.WriteEvent("model.done", mustJSON(map[string]any{
-		"call_id": modelCallID, "finish": finish,
-		"duration_ms": outcome.DurationMs, "ttft_ms": outcome.TTFTMs,
-	}))
-	_ = sse.WriteEvent("done", mustJSON(map[string]any{"finish": finish, "turn_id": turnID}))
-}
-
-func (h *ChatHandler) runModelCall(ctx context.Context, sse *SSEWriter, upReq *http.Request) callOutcome {
-	startTime := time.Now()
-	resp, err := h.openaiClient.DoStream(ctx, upReq)
-	if err != nil {
-		return callOutcome{Finish: "error", Error: err.Error(), DurationMs: int(time.Since(startTime).Milliseconds())}
-	}
-	defer resp.Body.Close()
-
-	reader := openai.NewStreamReader(resp.Body)
-	ch := make(chan openai.StreamEvent, 32)
-	go reader.ReadEvents(ch)
-
-	var out callOutcome
-	var finalUsage *openai.Usage
-	var firstToken time.Time
-
-	for evt := range ch {
-		switch evt.Type {
-		case "reasoning":
-			if firstToken.IsZero() {
-				firstToken = time.Now()
-				_ = sse.WriteEvent("ttft", mustJSON(map[string]any{"ms": firstToken.Sub(startTime).Milliseconds()}))
+	for {
+		select {
+		case <-r.Context().Done():
+			// 浏览器断开只结束订阅，Runtime 的独立 Context 继续执行并落盘。
+			return
+		case event, ok := <-events:
+			if !ok {
+				return
 			}
-			out.Reasoning += evt.Text
-			_ = sse.WriteEvent("reasoning", mustJSON(map[string]any{"text": evt.Text}))
-		case "delta":
-			if firstToken.IsZero() {
-				firstToken = time.Now()
-				_ = sse.WriteEvent("ttft", mustJSON(map[string]any{"ms": firstToken.Sub(startTime).Milliseconds()}))
+			if event.TurnID != turn.ID {
+				continue
 			}
-			out.Content += evt.Text
-			_ = sse.WriteEvent("delta", mustJSON(map[string]any{"text": evt.Text}))
-		case "usage":
-			finalUsage = evt.Usage
-			_ = sse.WriteEvent("usage", mustJSON(evt.Usage))
-		case "done":
-			if out.Finish == "" {
-				out.Finish = evt.Finish
+			_ = sse.WriteEvent(event.Type, string(event.Data))
+			if event.Type == "runtime.status" {
+				var state struct {
+					Status string `json:"status"`
+				}
+				_ = json.Unmarshal(event.Data, &state)
+				switch state.Status {
+				case store.TurnWaitingUser, store.TurnPaused, store.TurnCompleted, store.TurnStopped, store.TurnCancelled, store.TurnFailed:
+					_ = sse.WriteEvent("done", mustJSON(map[string]any{"turn_id": turn.ID, "status": state.Status}))
+					return
+				}
 			}
-		case "error":
-			out.Error = evt.Error
-			out.Finish = "error"
 		}
 	}
-
-	out.DurationMs = int(time.Since(startTime).Milliseconds())
-	if !firstToken.IsZero() {
-		out.TTFTMs = int(firstToken.Sub(startTime).Milliseconds())
-	}
-	if finalUsage != nil {
-		out.Usage = &store.Usage{
-			PromptTokens:     finalUsage.PromptTokens,
-			CompletionTokens: finalUsage.CompletionTokens,
-			CachedTokens:     finalUsage.CachedTokens,
-			ReasoningTokens:  finalUsage.ReasoningTokens,
-		}
-	}
-	if out.Finish == "" && out.Error == "" {
-		out.Finish = "stop"
-	}
-	return out
-}
-
-func (h *ChatHandler) persistCallBody(sessionID, turnID, modelCallID string, out callOutcome) {
-	_ = h.store.AppendThinking(sessionID, turnID, modelCallID, out.Reasoning)
-	_ = h.store.AppendAssistant(sessionID, turnID, modelCallID, out.Content)
-}
-
-func buildSystemPrompt(userPrompt string) string {
-	userPrompt = strings.TrimSpace(userPrompt)
-	if userPrompt == "" {
-		userPrompt = config.DefaultSystemPrompt
-	}
-	return "<System>\n" + userPrompt + "\n</System>"
-}
-
-func (h *ChatHandler) finishCancelled(sse *SSEWriter, sessionID, turnID, modelCallID string) {
-	_ = h.store.CompleteTurn(turnID, "cancelled")
-	_ = h.store.Touch(sessionID)
-	if modelCallID != "" {
-		_ = sse.WriteEvent("model.done", mustJSON(map[string]any{"call_id": modelCallID, "finish": "aborted", "error": "生成已停止"}))
-	}
-	_ = sse.WriteEvent("done", mustJSON(map[string]any{"finish": "aborted", "turn_id": turnID, "error": "生成已停止"}))
-}
-
-func (h *ChatHandler) finishTurnError(sse *SSEWriter, sessionID, turnID, modelCallID, message string) {
-	_ = h.store.CompleteTurn(turnID, "failed")
-	_ = h.store.Touch(sessionID)
-	_ = sse.WriteEvent("error", mustJSON(map[string]any{"call_id": modelCallID, "message": message}))
-	_ = sse.WriteEvent("done", mustJSON(map[string]any{"finish": "error", "error": message, "turn_id": turnID}))
 }
 
 func mustJSON(value any) string {
 	data, err := json.Marshal(value)
 	if err != nil {
-		return fmt.Sprintf(`{"error":%q}`, err.Error())
+		return `{}`
 	}
 	return string(data)
 }

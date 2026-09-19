@@ -3,105 +3,158 @@ import { defineStore } from 'pinia'
 import { useConnectionStore } from './connection'
 import { useSessionsStore } from './sessions'
 
-export type StreamPhase = 'idle' | 'waiting' | 'reasoning' | 'answer' | 'done' | 'error'
-export type MessageStatus = 'complete' | 'streaming' | 'background' | 'aborted' | 'error'
-
 export interface ChatMessage {
   id: string
   type: 'user' | 'assistant'
   content: string
   reasoning?: string
-  provider?: string
+  phase?: 'waiting' | 'reasoning' | 'answer' | 'done' | 'error'
+  streaming?: boolean
+  error?: string
+  usage?: Record<string, number>
   model?: string
-  thinking?: string
-  usage?: {
-    prompt_tokens: number
-    completion_tokens: number
-    cached_tokens: number
-    reasoning_tokens: number
-  }
   duration_ms?: number
   ttft_ms?: number
-  finish?: string
-  error?: string
-  streaming?: boolean
-  phase?: StreamPhase
-  status?: MessageStatus
 }
 
-export const OPENAI_REASONING_LEVELS = [
-  'default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
-] as const
+export interface TimelineRecord {
+  id: string
+  session_id: string
+  turn_id?: string
+  seq: number
+  model_call_id?: string
+  kind: string
+  content?: string
+  data?: Record<string, any>
+  created_at: string
+  temporary?: boolean
+}
 
+export interface TurnState {
+  id: string
+  session_id: string
+  turn_index: number
+  status: string
+  objective: string
+  active_agent: string
+  context_epoch: number
+  active_agent_run_id?: string
+  root_agent_run_id?: string
+  active_checkpoint_id?: string
+}
+
+export interface ArtifactVersion {
+  id: string
+  artifact_id: string
+  version: number
+  content: string
+  data?: Record<string, any>
+  created_by?: string
+  created_at: string
+}
+export interface Artifact {
+  id: string
+  session_id: string
+  turn_id: string
+  type: string
+  name: string
+  active_version: number
+  versions: ArtifactVersion[]
+}
+export interface Approval {
+  id: string
+  session_id: string
+  turn_id: string
+  agent_run_id?: string
+  tool_call_id: string
+  tool_name: string
+  args: Record<string, any>
+  risk: string
+  status: string
+}
+export interface AgentRun {
+  id: string
+  turn_id: string
+  parent_run_id?: string
+  profile_id: string
+  status: string
+  result?: Record<string, any>
+}
+export interface RuntimeCapabilities {
+  can_pause?: boolean
+  can_resume?: boolean
+  can_stop?: boolean
+  can_cancel?: boolean
+  can_steer?: boolean
+  can_start_build?: boolean
+  can_approve?: boolean
+  can_reject?: boolean
+  can_challenge?: boolean
+}
+export interface RuntimeState {
+  turn: TurnState | null
+  turns: TurnState[]
+  execution: { active: boolean; turn_id?: string; started_at?: string }
+  capabilities: RuntimeCapabilities
+  artifacts: Artifact[]
+  approvals: Approval[]
+  agent_runs: AgentRun[]
+  can_restore_fold: boolean
+}
+export interface StreamingModel {
+  callId: string
+  agentRunId?: string
+  profileId?: string
+  model?: string
+  reasoning: string
+  content: string
+  phase: 'waiting' | 'reasoning' | 'answer' | 'done' | 'error'
+  usage?: Record<string, number>
+  error?: string
+}
+
+export const OPENAI_REASONING_LEVELS = ['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 export function modelThinkingLevels(model?: { id?: string; thinking_levels?: string[]; thinking_style?: string }): string[] {
   if (!model) return ['default']
-  const configured = (model.thinking_levels || [])
-    .map(level => String(level).trim().toLowerCase())
-    .filter(Boolean)
+  const configured = (model.thinking_levels || []).map(level => String(level).trim().toLowerCase()).filter(Boolean)
   const modelId = String(model.id || '').toLowerCase()
-  if (modelId.startsWith('deepseek-v4-')) {
-    return ['default', 'none', 'low', 'medium', 'high', 'xhigh', 'max']
-  }
-  if (model.thinking_style === 'enable_thinking') {
-    if (configured.some(level => level !== 'off')) return configured
-    return ['off', 'on']
-  }
+  if (modelId.startsWith('deepseek-v4-')) return ['default', 'none', 'low', 'medium', 'high', 'xhigh', 'max']
+  if (model.thinking_style === 'enable_thinking') return configured.some(level => level !== 'off') ? configured : ['off', 'on']
   if (model.thinking_style === 'disabled') return ['default']
-  if (configured.length === 0 || configured.every(level => level === 'off' || level === 'default')) {
-    return [...OPENAI_REASONING_LEVELS]
-  }
+  if (configured.length === 0 || configured.every(level => level === 'off' || level === 'default')) return [...OPENAI_REASONING_LEVELS]
   return configured
 }
 
 type SSEMessage = { event: string; data: string }
-
 class SSEDecoder {
   private buffer = ''
-
   feed(chunk: string): SSEMessage[] {
     this.buffer = (this.buffer + chunk).replace(/\r\n/g, '\n')
     const out: SSEMessage[] = []
     let index = this.buffer.indexOf('\n\n')
     while (index >= 0) {
-      const block = this.buffer.slice(0, index)
-      this.buffer = this.buffer.slice(index + 2)
-      const parsed = this.parse(block)
-      if (parsed) out.push(parsed)
-      index = this.buffer.indexOf('\n\n')
+      const parsed = this.parse(this.buffer.slice(0, index)); this.buffer = this.buffer.slice(index + 2)
+      if (parsed) out.push(parsed); index = this.buffer.indexOf('\n\n')
     }
     return out
   }
-
-  flush(): SSEMessage[] {
-    const parsed = this.parse(this.buffer.trim())
-    this.buffer = ''
-    return parsed ? [parsed] : []
-  }
-
+  flush(): SSEMessage[] { const parsed = this.parse(this.buffer.trim()); this.buffer = ''; return parsed ? [parsed] : [] }
   private parse(block: string): SSEMessage | null {
     if (!block) return null
-    let event = 'message'
-    const data: string[] = []
-    for (const line of block.split('\n')) {
-      if (line.startsWith('event:')) event = line.slice(6).trim()
-      else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''))
-    }
+    let event = 'message'; const data: string[] = []
+    for (const line of block.split('\n')) { if (line.startsWith('event:')) event = line.slice(6).trim(); else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, '')) }
     return data.length ? { event, data: data.join('\n') } : null
   }
 }
-
-function parseJSON(data: string): Record<string, any> {
-  try {
-    return JSON.parse(data) as Record<string, any>
-  } catch {
-    return {}
-  }
-}
+function parseJSON(data: string): Record<string, any> { try { return JSON.parse(data) as Record<string, any> } catch { return {} } }
 
 export const useChatStore = defineStore('chat', () => {
-  const messages = ref<ChatMessage[]>([])
+  const timeline = ref<TimelineRecord[]>([])
+  const runtimeState = ref<RuntimeState>({ turn: null, turns: [], execution: { active: false }, capabilities: {}, artifacts: [], approvals: [], agent_runs: [], can_restore_fold: false })
+  const streamingModel = ref<StreamingModel | null>(null)
   const inputText = ref('')
   const isStreaming = ref(false)
+  const sendingSteering = ref(false)
   const backgroundGenerating = ref(false)
   const notice = ref('')
   const selectedProvider = ref('')
@@ -112,413 +165,209 @@ export const useChatStore = defineStore('chat', () => {
   const connectionStore = useConnectionStore()
   const sessionsStore = useSessionsStore()
   let activeRun = 0
-  let messageLoadSeq = 0
+  let loadSeq = 0
   let backgroundTimer: number | null = null
 
-  const isBusy = computed(() => isStreaming.value || backgroundGenerating.value)
+  const isBusy = computed(() => isStreaming.value || sendingSteering.value)
+  const executionActive = computed(() => Boolean(runtimeState.value.execution?.active) || isStreaming.value || backgroundGenerating.value)
+  const capabilities = computed(() => runtimeState.value.capabilities || {})
   const thinkingOptions = computed(() => modelThinkingLevels(currentModel()))
 
-  function providerModels(providerId = selectedProvider.value) {
-    if (!providerId) return connectionStore.models
-    return connectionStore.models.filter(model => model.provider_id === providerId)
-  }
-
-  function currentModel() {
-    return connectionStore.models.find(model =>
-      model.id === selectedModel.value && (!selectedProvider.value || model.provider_id === selectedProvider.value),
-    )
-  }
-
+  function providerModels(providerId = selectedProvider.value) { return providerId ? connectionStore.models.filter(model => model.provider_id === providerId) : connectionStore.models }
+  function currentModel() { return connectionStore.models.find(model => model.id === selectedModel.value && (!selectedProvider.value || model.provider_id === selectedProvider.value)) }
   function ensureSelection() {
-    const providersWithModels = connectionStore.providers.filter(provider =>
-      connectionStore.models.some(model => model.provider_id === provider.id),
-    )
+    const providersWithModels = connectionStore.providers.filter(provider => connectionStore.models.some(model => model.provider_id === provider.id))
     if (!selectedProvider.value || !providersWithModels.some(provider => provider.id === selectedProvider.value)) {
-      const provider = providersWithModels.find(item => item.default && item.available)
-        || providersWithModels.find(item => item.available)
-        || providersWithModels[0]
+      const provider = providersWithModels.find(item => item.default && item.available) || providersWithModels.find(item => item.available) || providersWithModels[0]
       selectedProvider.value = provider?.id || connectionStore.models[0]?.provider_id || ''
     }
     const candidates = providerModels()
-    if (!candidates.some(model => model.id === selectedModel.value)) {
-      selectedModel.value = (candidates.find(model => model.default) || candidates[0])?.id || ''
-    }
-    const levels = modelThinkingLevels(currentModel())
-    if (!levels.includes(selectedThinking.value)) {
-      selectedThinking.value = levels.includes('default') ? 'default' : levels[0]
-    }
-  }
-
-  watch(() => [connectionStore.providers, connectionStore.models], ensureSelection, { immediate: true, deep: true })
-  watch(selectedProvider, ensureSelection)
-  watch(selectedModel, () => {
+    if (!candidates.some(model => model.id === selectedModel.value)) selectedModel.value = (candidates.find(model => model.default) || candidates[0])?.id || ''
     const levels = modelThinkingLevels(currentModel())
     if (!levels.includes(selectedThinking.value)) selectedThinking.value = levels.includes('default') ? 'default' : levels[0]
-  })
+  }
+  watch(() => [connectionStore.providers, connectionStore.models], ensureSelection, { immediate: true, deep: true })
+  watch(selectedProvider, ensureSelection)
+  watch(selectedModel, () => { const levels = modelThinkingLevels(currentModel()); if (!levels.includes(selectedThinking.value)) selectedThinking.value = levels.includes('default') ? 'default' : levels[0] })
 
   function applySessionSelection(sessionId: string) {
-    const session = sessionsStore.sessions.find(item => item.id === sessionId)
-    if (!session) return
-    if (session.provider && connectionStore.models.some(model => model.provider_id === session.provider)) {
-      selectedProvider.value = session.provider
-    }
-    if (session.model && connectionStore.models.some(model => model.id === session.model)) {
-      selectedModel.value = session.model
-    }
+    const session = sessionsStore.sessions.find(item => item.id === sessionId); if (!session) return
+    if (session.provider && connectionStore.models.some(model => model.provider_id === session.provider)) selectedProvider.value = session.provider
+    if (session.model && connectionStore.models.some(model => model.id === session.model)) selectedModel.value = session.model
     ensureSelection()
   }
 
-  function normalizeMessage(m: any): ChatMessage {
-    return {
-      id: String(m.id || `message_${Date.now()}`),
-      type: m.type === 'user' ? 'user' : 'assistant',
-      content: String(m.content || ''),
-      reasoning: String(m.reasoning || ''),
-      provider: m.provider,
-      model: m.model,
-      thinking: m.thinking,
-      usage: m.usage,
-      duration_ms: m.duration_ms,
-      ttft_ms: m.ttft_ms,
-      finish: m.finish,
-      error: m.error,
-      streaming: false,
-      phase: m.error ? 'error' : 'done',
-      status: m.error ? 'error' : (m.finish === 'aborted' ? 'aborted' : 'complete'),
-    }
-  }
-
-  async function loadMessages(sessionId: string) {
-    if (!sessionId || !connectionStore.isConnected) {
-      messages.value = []
-      return
-    }
-    const seq = ++messageLoadSeq
-    const res = await fetch(`${connectionStore.serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/messages`, { cache: 'no-store' })
+  async function loadTimeline(sessionId: string) {
+    if (!sessionId || !connectionStore.isConnected) { timeline.value = []; return }
+    const seq = ++loadSeq
+    const res = await fetch(connectionStore.api(`/api/sessions/${encodeURIComponent(sessionId)}/timeline`), { cache: 'no-store' })
     if (!res.ok) return
-    const data = await res.json()
-    if (seq !== messageLoadSeq || sessionsStore.currentSessionId !== sessionId || isStreaming.value) return
-    messages.value = (Array.isArray(data) ? data : []).map(normalizeMessage)
+    const data = await res.json() as TimelineRecord[]
+    if (seq !== loadSeq || sessionsStore.currentSessionId !== sessionId) return
+    timeline.value = Array.isArray(data) ? data.map(normalizeRecord) : []
+  }
+  async function loadRuntime(sessionId: string) {
+    if (!sessionId || !connectionStore.isConnected) return
+    const res = await fetch(connectionStore.api(`/api/sessions/${encodeURIComponent(sessionId)}/runtime`), { cache: 'no-store' })
+    if (!res.ok) return
+    const data = await res.json() as RuntimeState
+    if (sessionsStore.currentSessionId !== sessionId) return
+    runtimeState.value = data
+    backgroundGenerating.value = Boolean(data.execution?.active) && !isStreaming.value
+    if (data.execution?.active) scheduleBackgroundPoll(sessionId)
+  }
+  async function refreshAll(sessionId = sessionsStore.currentSessionId) { if (!sessionId) return; await Promise.all([loadTimeline(sessionId), loadRuntime(sessionId)]); await sessionsStore.loadSessions().catch(() => undefined) }
+
+  function normalizeRecord(r: any): TimelineRecord {
+    let data = r.data
+    if (typeof data === 'string') { try { data = JSON.parse(data) } catch { data = {} } }
+    return { id: String(r.id || `record_${Date.now()}`), session_id: String(r.session_id || ''), turn_id: r.turn_id, seq: Number(r.seq || 0), model_call_id: r.model_call_id, kind: String(r.kind || 'runtime.status'), content: String(r.content || ''), data: data || {}, created_at: String(r.created_at || '') }
+  }
+  function upsertRecord(record: TimelineRecord) {
+    const index = timeline.value.findIndex(item => item.id === record.id)
+    if (index >= 0) timeline.value[index] = record
+    else timeline.value.push(record)
+    timeline.value.sort((a, b) => a.seq - b.seq)
   }
 
-  function createDeltaBatcher(getMessage: () => ChatMessage | null) {
-    let reasoning = ''
-    let content = ''
-    let frame: number | null = null
-
-    function flush() {
-      frame = null
-      const target = getMessage()
-      if (!target) {
-        reasoning = ''
-        content = ''
-        return
-      }
-      if (reasoning) {
-        target.reasoning = (target.reasoning || '') + reasoning
-        if (!target.content) target.phase = 'reasoning'
-        reasoning = ''
-      }
-      if (content) {
-        target.content += content
-        target.phase = 'answer'
-        content = ''
-      }
-    }
-
-    function schedule() {
-      if (frame == null) frame = requestAnimationFrame(flush)
-    }
-
-    return {
-      reasoning(text: string) { reasoning += text; schedule() },
-      content(text: string) { content += text; schedule() },
-      flush() {
-        if (frame != null) cancelAnimationFrame(frame)
-        flush()
-      },
-      cancel() {
-        if (frame != null) cancelAnimationFrame(frame)
-        frame = null
-        reasoning = ''
-        content = ''
-      },
-    }
-  }
-
-  function createAssistant(payload: Record<string, any>): ChatMessage {
-    const message = reactive<ChatMessage>({
-      id: String(payload.call_id || `stream_${Date.now()}`),
-      type: 'assistant',
-      content: '',
-      reasoning: '',
-      provider: String(payload.provider || selectedProvider.value),
-      model: String(payload.model || selectedModel.value),
-      thinking: String(payload.thinking || selectedThinking.value),
-      streaming: true,
-      phase: 'waiting',
-      status: 'streaming',
+  async function postChat(text: string, steeringOnly = false) {
+    const sessionId = sessionsStore.currentSessionId
+    if (!sessionId) return
+    const controller = steeringOnly ? new AbortController() : new AbortController()
+    if (!steeringOnly) abortController.value = controller
+    const decoder = new SSEDecoder(); const textDecoder = new TextDecoder()
+    const res = await fetch(connectionStore.api(`/api/sessions/${encodeURIComponent(sessionId)}/chat`), {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body: JSON.stringify({ message: text, provider: selectedProvider.value, model: selectedModel.value, thinking: selectedThinking.value }), signal: controller.signal,
     })
-    messages.value.push(message)
-    return message
+    if (!res.ok) throw new Error((await res.text()).trim() || `发送失败 (${res.status})`)
+    if (!res.body) throw new Error('浏览器没有拿到流式响应体')
+    const handle = (event: SSEMessage) => {
+      const payload = parseJSON(event.data)
+      if (event.event === 'ack') {
+        const record = payload.record
+        if (record?.id) upsertRecord(normalizeRecord(record))
+      } else if (event.event === 'model.start') {
+        streamingModel.value = reactive({ callId: String(payload.call_id || ''), agentRunId: payload.agent_run_id, profileId: payload.profile_id, model: payload.model, reasoning: '', content: '', phase: 'waiting' })
+        runtimeState.value.execution = { active: true, turn_id: String(payload.turn_id || runtimeState.value.turn?.id || '') }
+      } else if (event.event === 'reasoning') {
+        if (streamingModel.value) { streamingModel.value.reasoning += String(payload.text || ''); if (!streamingModel.value.content) streamingModel.value.phase = 'reasoning' }
+      } else if (event.event === 'delta') {
+        if (streamingModel.value) { streamingModel.value.content += String(payload.text || ''); streamingModel.value.phase = 'answer' }
+      } else if (event.event === 'usage') {
+        if (streamingModel.value) streamingModel.value.usage = payload as Record<string, number>
+      } else if (event.event === 'model.done') {
+        if (streamingModel.value) { streamingModel.value.phase = payload.error ? 'error' : 'done'; streamingModel.value.error = payload.error ? String(payload.error) : undefined }
+      } else if (event.event.startsWith('tool.') || event.event.startsWith('approval.') || event.event === 'runtime.status') {
+        window.setTimeout(() => void refreshAll(sessionId), 20)
+      } else if (event.event === 'runtime.error') {
+        window.$message?.error(String(payload.message || 'Runtime 执行失败'))
+      }
+    }
+    const reader = res.body.getReader()
+    while (true) { const { done, value } = await reader.read(); if (done) break; for (const event of decoder.feed(textDecoder.decode(value, { stream: true }))) handle(event) }
+    for (const event of decoder.feed(textDecoder.decode())) handle(event); for (const event of decoder.flush()) handle(event)
   }
 
   async function sendMessage() {
     const text = inputText.value.trim()
-    if (!text || !connectionStore.isConnected || isBusy.value || !selectedModel.value) return
-
+    if (!text || !connectionStore.isConnected || !selectedModel.value) return
     ensureSelection()
-    const provider = selectedProvider.value
-    const model = selectedModel.value
-    const thinking = selectedThinking.value
-    const run = ++activeRun
-    const userMsg = reactive<ChatMessage>({
-      id: `temp_user_${Date.now()}`,
-      type: 'user',
-      content: text,
-      provider,
-      model,
-      thinking,
-      phase: 'done',
-      status: 'complete',
-    })
-    messages.value.push(userMsg)
-    inputText.value = ''
-    isStreaming.value = true
-    backgroundGenerating.value = false
-    notice.value = ''
-
-    let currentId = sessionsStore.currentSessionId
-    const assistantRef = { value: null as ChatMessage | null }
-    let gotSSE = false
-    let finalError = ''
-    const controller = new AbortController()
-    abortController.value = controller
-    const batcher = createDeltaBatcher(() => assistantRef.value)
-
-    try {
-      if (!currentId) {
-        const session = await sessionsStore.createPersistedSession(text.slice(0, 20))
-        currentId = session.id
-      }
-      if (!currentId || run !== activeRun) return
-
-      const decoder = new SSEDecoder()
-      const textDecoder = new TextDecoder()
-      const handleEvent = (event: SSEMessage) => {
-        gotSSE = true
-        const payload = parseJSON(event.data)
-        switch (event.event) {
-          case 'ack': {
-            const saved = payload.message
-            if (saved?.id) userMsg.id = String(saved.id)
-            break
-          }
-          case 'model.start':
-            batcher.flush()
-            if (assistantRef.value?.streaming) {
-              assistantRef.value.streaming = false
-              assistantRef.value.phase = 'done'
-              assistantRef.value.status = 'complete'
-            }
-            assistantRef.value = createAssistant(payload)
-            break
-          case 'ttft': {
-            if (!assistantRef.value) assistantRef.value = createAssistant({})
-            const value = Number(payload.ms)
-            if (Number.isFinite(value)) assistantRef.value.ttft_ms = value
-            break
-          }
-          case 'reasoning':
-            if (!assistantRef.value) assistantRef.value = createAssistant({})
-            batcher.reasoning(String(payload.text || ''))
-            break
-          case 'delta':
-            if (!assistantRef.value) assistantRef.value = createAssistant({})
-            batcher.content(String(payload.text || ''))
-            break
-          case 'usage':
-            if (assistantRef.value) assistantRef.value.usage = payload as ChatMessage['usage']
-            break
-          case 'model.done': {
-            batcher.flush()
-            if (!assistantRef.value) break
-            assistantRef.value.streaming = false
-            assistantRef.value.finish = String(payload.finish || 'stop')
-            assistantRef.value.duration_ms = Number.isFinite(Number(payload.duration_ms)) ? Number(payload.duration_ms) : assistantRef.value.duration_ms
-            assistantRef.value.ttft_ms = Number.isFinite(Number(payload.ttft_ms)) ? Number(payload.ttft_ms) : assistantRef.value.ttft_ms
-            if (payload.error) assistantRef.value.error = String(payload.error)
-            assistantRef.value.phase = assistantRef.value.error ? 'error' : 'done'
-            assistantRef.value.status = assistantRef.value.error ? 'error' : (assistantRef.value.finish === 'aborted' ? 'aborted' : 'complete')
-            break
-          }
-          case 'error':
-            finalError = String(payload.message || '生成失败')
-            if (assistantRef.value) assistantRef.value.error = finalError
-            break
-          case 'done':
-            if (payload.error) finalError = String(payload.error)
-            break
-        }
-      }
-
-      const res = await fetch(`${connectionStore.serverUrl}/api/sessions/${encodeURIComponent(currentId)}/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-        body: JSON.stringify({ message: text, provider, model, thinking }),
-        signal: controller.signal,
-      })
-      if (!res.ok) {
-        const body = (await res.text()).trim()
-        throw new Error(body || `发送失败 (${res.status})`)
-      }
-      if (!res.body) throw new Error('浏览器没有拿到流式响应体')
-
-      const reader = res.body.getReader()
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        for (const event of decoder.feed(textDecoder.decode(value, { stream: true }))) handleEvent(event)
-      }
-      for (const event of decoder.feed(textDecoder.decode())) handleEvent(event)
-      for (const event of decoder.flush()) handleEvent(event)
-      batcher.flush()
-
-      if (run !== activeRun || sessionsStore.currentSessionId !== currentId) return
-      if (assistantRef.value?.streaming) {
-        assistantRef.value.streaming = false
-        assistantRef.value.phase = finalError ? 'error' : 'done'
-        assistantRef.value.status = finalError ? 'error' : 'complete'
-        assistantRef.value.error = finalError || assistantRef.value.error
-      }
-      if (finalError) window.$message?.error(finalError)
-      await sessionsStore.loadSessions().catch(() => undefined)
-    } catch (error: any) {
-      batcher.flush()
-      if (error?.name === 'AbortError' || run !== activeRun) return
-      const message = error instanceof Error ? error.message : String(error)
-      if (assistantRef.value) {
-        assistantRef.value.streaming = false
-        assistantRef.value.phase = 'error'
-        assistantRef.value.status = 'error'
-        assistantRef.value.finish = 'error'
-        assistantRef.value.error = message
-      } else {
-        messages.value.push(reactive<ChatMessage>({
-          id: `error_${Date.now()}`, type: 'assistant', content: '', error: message,
-          phase: 'error', status: 'error', streaming: false,
-        }))
-      }
-      if (!gotSSE) window.$message?.error(message)
-      console.error('发送失败', error)
-    } finally {
-      batcher.cancel()
-      if (run === activeRun) {
-        isStreaming.value = false
-        if (abortController.value === controller) abortController.value = null
-        if (currentId) await refreshRunStatus(currentId)
-      }
+    if (!sessionsStore.currentSessionId) {
+      const session = await sessionsStore.createPersistedSession(text.slice(0, 20)); applySessionSelection(session.id)
     }
+    const sessionId = sessionsStore.currentSessionId; if (!sessionId) return
+    inputText.value = ''
+    const steering = executionActive.value && (capabilities.value.can_steer || isStreaming.value)
+    if (steering) {
+      sendingSteering.value = true
+      try { await postChat(text, true); await loadTimeline(sessionId) } catch (error) { const message = error instanceof Error ? error.message : String(error); window.$message?.error(message); inputText.value = text } finally { sendingSteering.value = false }
+      return
+    }
+    if (isStreaming.value) return
+    const run = ++activeRun; isStreaming.value = true; backgroundGenerating.value = false; notice.value = ''; streamingModel.value = null
+    try { await postChat(text, false); if (run === activeRun) await refreshAll(sessionId) }
+    catch (error: any) { if (error?.name !== 'AbortError' && run === activeRun) { const message = error instanceof Error ? error.message : String(error); window.$message?.error(message); console.error('发送失败', error) } }
+    finally { if (run === activeRun) { isStreaming.value = false; abortController.value = null; streamingModel.value = null; await loadRuntime(sessionId) } }
   }
 
-  async function refreshRunStatus(sessionId: string) {
-    if (!sessionId || !connectionStore.isConnected) return false
-    try {
-      const res = await fetch(`${connectionStore.serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/chat/status`, { cache: 'no-store' })
-      if (!res.ok) return false
-      const data = await res.json() as { active?: boolean }
-      const active = Boolean(data.active)
-      if (sessionsStore.currentSessionId === sessionId) backgroundGenerating.value = active && !isStreaming.value
-      if (active && sessionsStore.currentSessionId === sessionId) scheduleBackgroundPoll(sessionId)
-      return active
-    } catch {
-      return false
-    }
+  async function runtimeCommand(path: string, body: Record<string, any> = {}) {
+    const sessionId = sessionsStore.currentSessionId; const turn = runtimeState.value.turn; if (!sessionId || !turn) return
+    const response = await fetch(connectionStore.api(`/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turn.id)}/${path}`), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, provider: selectedProvider.value, model: selectedModel.value, thinking: selectedThinking.value }) })
+    if (!response.ok) throw new Error(await readHTTPError(response, '操作失败'))
+    await refreshAll(sessionId)
+  }
+  async function pauseTurn() { await runtimeCommand('pause') }
+  async function resumeTurn() { await runtimeCommand('resume') }
+  async function stopTurn() { await runtimeCommand('stop') }
+  async function startBuild() { await runtimeCommand('start-build') }
+  async function hardCancel() {
+    const id = sessionsStore.currentSessionId; if (!id) return
+    await fetch(connectionStore.api(`/api/sessions/${encodeURIComponent(id)}/chat/cancel`), { method: 'POST' }).catch(() => undefined)
+    ++activeRun; abortController.value?.abort(); abortController.value = null; isStreaming.value = false; streamingModel.value = null
+    await refreshAll(id)
+  }
+  function stopStream() { void hardCancel() }
+  function stopGeneration() { return hardCancel() }
+
+  async function decideApproval(id: string, decision: 'approve' | 'reject') {
+    const response = await fetch(connectionStore.api(`/api/approvals/${encodeURIComponent(id)}/${decision}`), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: selectedProvider.value, model: selectedModel.value, thinking: selectedThinking.value }) })
+    if (!response.ok) throw new Error(await readHTTPError(response, '处理 Approval 失败'))
+    if (sessionsStore.currentSessionId) await refreshAll(sessionsStore.currentSessionId)
+  }
+  async function challengeApproval(id: string, question: string) {
+    const response = await fetch(connectionStore.api(`/api/approvals/${encodeURIComponent(id)}/challenge`), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question, provider: selectedProvider.value, model: selectedModel.value, thinking: selectedThinking.value }) })
+    if (!response.ok) throw new Error(await readHTTPError(response, 'Challenge 失败'))
+    if (sessionsStore.currentSessionId) scheduleBackgroundPoll(sessionsStore.currentSessionId)
+  }
+  async function activateArtifact(artifactId: string, version: number) {
+    const response = await fetch(connectionStore.api(`/api/artifacts/${encodeURIComponent(artifactId)}/activate`), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ version }) })
+    if (!response.ok) throw new Error(await readHTTPError(response, '切换 Artifact 版本失败'))
+    if (sessionsStore.currentSessionId) await refreshAll(sessionsStore.currentSessionId)
+  }
+  async function foldTurn(turnId: string) {
+    const id = sessionsStore.currentSessionId; if (!id) return
+    const response = await fetch(connectionStore.api(`/api/sessions/${encodeURIComponent(id)}/turns/${encodeURIComponent(turnId)}/fold`), { method: 'POST' })
+    if (!response.ok) throw new Error(await readHTTPError(response, 'Fold 失败')); await refreshAll(id)
+  }
+  async function restoreFold() {
+    const id = sessionsStore.currentSessionId; if (!id) return
+    const response = await fetch(connectionStore.api(`/api/sessions/${encodeURIComponent(id)}/folds/restore`), { method: 'POST' })
+    if (!response.ok) throw new Error(await readHTTPError(response, 'Restore 失败')); await refreshAll(id)
+  }
+  async function loadAgentTimeline(runId: string): Promise<TimelineRecord[]> {
+    const response = await fetch(connectionStore.api(`/api/agent-runs/${encodeURIComponent(runId)}/timeline`), { cache: 'no-store' })
+    if (!response.ok) throw new Error(await readHTTPError(response, '读取 SubAgent Timeline 失败'))
+    return ((await response.json()) as TimelineRecord[]).map(normalizeRecord)
   }
 
   function scheduleBackgroundPoll(sessionId: string) {
     if (backgroundTimer != null) window.clearTimeout(backgroundTimer)
     backgroundTimer = window.setTimeout(async () => {
-      backgroundTimer = null
-      if (sessionsStore.currentSessionId !== sessionId) return
-      const active = await refreshRunStatus(sessionId)
-      if (!active) {
-        backgroundGenerating.value = false
-        await loadMessages(sessionId)
-        await sessionsStore.loadSessions().catch(() => undefined)
-      }
-    }, 1000)
+      backgroundTimer = null; if (sessionsStore.currentSessionId !== sessionId) return
+      await loadRuntime(sessionId); await loadTimeline(sessionId)
+      if (!runtimeState.value.execution?.active) { backgroundGenerating.value = false; await sessionsStore.loadSessions().catch(() => undefined) }
+    }, 900)
   }
-
-  async function stopGeneration() {
-    const sessionId = sessionsStore.currentSessionId
-    if (sessionId && connectionStore.isConnected) {
-      await fetch(`${connectionStore.serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/chat/cancel`, { method: 'POST' }).catch(() => undefined)
-    }
-    activeRun++
-    abortController.value?.abort()
-    abortController.value = null
-    isStreaming.value = false
-    backgroundGenerating.value = false
-    const last = [...messages.value].reverse().find(message => message.type === 'assistant' && (message.streaming || message.status === 'background'))
-    if (last) {
-      last.streaming = false
-      last.finish = 'aborted'
-      last.phase = 'done'
-      last.status = 'aborted'
-    }
-    if (sessionId) window.setTimeout(() => void loadMessages(sessionId), 120)
-  }
-
-  function stopStream() {
-    void stopGeneration()
-  }
+  async function refreshRunStatus(sessionId: string) { await loadRuntime(sessionId); return Boolean(runtimeState.value.execution?.active) }
 
   async function openSession(id: string) {
-    if (!id) return
-    activeRun++
-    messageLoadSeq++
-    abortController.value?.abort()
-    abortController.value = null
-    isStreaming.value = false
-    backgroundGenerating.value = false
-    notice.value = ''
-    messages.value = []
-    sessionsStore.selectSession(id)
-    applySessionSelection(id)
-    await loadMessages(id)
-    await refreshRunStatus(id)
+    if (!id) return; ++activeRun; ++loadSeq; abortController.value?.abort(); abortController.value = null; isStreaming.value = false; streamingModel.value = null; backgroundGenerating.value = false; notice.value = ''; timeline.value = []
+    sessionsStore.selectSession(id); applySessionSelection(id); await refreshAll(id)
   }
-
   function newConversation() {
-    activeRun++
-    messageLoadSeq++
-    abortController.value?.abort()
-    abortController.value = null
-    isStreaming.value = false
-    backgroundGenerating.value = false
-    notice.value = ''
-    messages.value = []
-    sessionsStore.beginNewSession()
+    ++activeRun; ++loadSeq; abortController.value?.abort(); abortController.value = null; isStreaming.value = false; streamingModel.value = null; backgroundGenerating.value = false; notice.value = ''; timeline.value = []; runtimeState.value = { turn: null, turns: [], execution: { active: false }, capabilities: {}, artifacts: [], approvals: [], agent_runs: [], can_restore_fold: false }; sessionsStore.beginNewSession()
   }
 
   return {
-    messages,
-    input: inputText,
-    inputText,
-    isStreaming,
-    isBusy,
-    backgroundGenerating,
-    notice,
-    selectedProvider,
-    selectedModel,
-    selectedThinking,
-    thinkingOptions,
-    loadMessages,
-    sendMessage,
-    stopStream,
-    stopGeneration,
-    openSession,
-    newConversation,
+    timeline, runtimeState, streamingModel, input: inputText, inputText, isStreaming, isBusy, executionActive, sendingSteering, backgroundGenerating, notice,
+    selectedProvider, selectedModel, selectedThinking, thinkingOptions, capabilities,
+    loadTimeline, loadRuntime, refreshAll, refreshRunStatus, sendMessage, stopStream, stopGeneration, hardCancel,
+    pauseTurn, resumeTurn, stopTurn, startBuild, decideApproval, challengeApproval, activateArtifact, foldTurn, restoreFold, loadAgentTimeline,
+    openSession, newConversation,
   }
 })
+
+async function readHTTPError(response: Response, fallback: string): Promise<string> {
+  try { const payload = await response.json() as { error?: string }; return payload.error || fallback } catch { return fallback }
+}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -9,6 +10,34 @@ import (
 )
 
 const (
+	// Timeline 新事件统一使用 namespace.action。旧 kind 在读取时仍兼容映射。
+	EventUserMessage       = "user.message"
+	EventUserSteering      = "user.steering"
+	EventAssistantMessage  = "assistant.message"
+	EventModelReasoning    = "model.reasoning"
+	EventRuntimeError      = "runtime.error"
+	EventRuntimeStatus     = "runtime.status"
+	EventRuntimeCommand    = "runtime.command"
+	EventRuntimeHint       = "runtime.hint"
+	EventToolRequested     = "tool.requested"
+	EventToolStarted       = "tool.started"
+	EventToolCompleted     = "tool.completed"
+	EventToolFailed        = "tool.failed"
+	EventToolRejected      = "tool.rejected"
+	EventToolCancelled     = "tool.cancelled"
+	EventArtifactCreated   = "artifact.created"
+	EventArtifactVersion   = "artifact.version_created"
+	EventArtifactActivated = "artifact.version_activated"
+	EventApprovalRequested = "approval.requested"
+	EventApprovalDecided   = "approval.decided"
+	EventAgentStarted      = "agent.started"
+	EventAgentCompleted    = "agent.completed"
+	EventAgentFailed       = "agent.failed"
+	EventCheckpointCreated = "checkpoint.created"
+	EventContextFolded     = "context.folded"
+	EventContextRestored   = "context.restored"
+
+	// 旧常量保留给兼容 Projection 使用。
 	RecordUser      = "user"
 	RecordAssistant = "assistant"
 	RecordThinking  = "thinking"
@@ -23,19 +52,19 @@ type Usage struct {
 }
 
 type Message struct {
-	ID         string  `json:"id"`
-	Type       string  `json:"type"`
-	TS         string  `json:"ts,omitempty"`
-	Content    string  `json:"content"`
-	Provider   string  `json:"provider,omitempty"`
-	Model      string  `json:"model,omitempty"`
-	Thinking   string  `json:"thinking,omitempty"`
-	Reasoning  string  `json:"reasoning,omitempty"`
-	Usage      *Usage  `json:"usage,omitempty"`
-	DurationMs int     `json:"duration_ms,omitempty"`
-	TTFTMs     int     `json:"ttft_ms,omitempty"`
-	Finish     string  `json:"finish,omitempty"`
-	Error      string  `json:"error,omitempty"`
+	ID         string `json:"id"`
+	Type       string `json:"type"`
+	TS         string `json:"ts,omitempty"`
+	Content    string `json:"content"`
+	Provider   string `json:"provider,omitempty"`
+	Model      string `json:"model,omitempty"`
+	Thinking   string `json:"thinking,omitempty"`
+	Reasoning  string `json:"reasoning,omitempty"`
+	Usage      *Usage `json:"usage,omitempty"`
+	DurationMs int    `json:"duration_ms,omitempty"`
+	TTFTMs     int    `json:"ttft_ms,omitempty"`
+	Finish     string `json:"finish,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 type ContextMessage struct {
@@ -55,48 +84,20 @@ type Record struct {
 	CreatedAt   string          `json:"created_at"`
 }
 
-func (s *Store) BeginTurn(sessionID string) (string, error) {
-	if _, err := s.GetSession(sessionID); err != nil {
-		return "", err
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return "", err
-	}
-	defer tx.Rollback()
-	var index int
-	if err := tx.QueryRow(`SELECT COALESCE(MAX(turn_index),0)+1 FROM turns WHERE session_id=?`, sessionID).Scan(&index); err != nil {
-		return "", err
-	}
-	id := "t_" + compactUUID()
-	now := stamp(time.Now().UTC())
-	if _, err := tx.Exec(`INSERT INTO turns(id,session_id,turn_index,status,created_at) VALUES(?,?,?,?,?)`, id, sessionID, index, "running", now); err != nil {
-		return "", err
-	}
-	if err := tx.Commit(); err != nil {
-		return "", err
-	}
-	return id, nil
-}
-
-func (s *Store) CompleteTurn(turnID, status string) error {
-	if status == "" {
-		status = "completed"
-	}
-	_, err := s.db.Exec(`UPDATE turns SET status=?, completed_at=? WHERE id=?`, status, stamp(time.Now().UTC()), turnID)
-	return err
-}
-
 func (s *Store) AppendUser(sessionID, turnID, content, provider, model, thinking string) (Record, error) {
 	data, _ := json.Marshal(map[string]string{"provider": provider, "model": model, "thinking": thinking})
-	return s.appendRecord(Record{SessionID: sessionID, TurnID: turnID, Kind: RecordUser, Content: content, Data: data})
+	return s.AppendEvent(Record{SessionID: sessionID, TurnID: turnID, Kind: EventUserMessage, Content: content, Data: data})
+}
+
+func (s *Store) AppendSteering(sessionID, turnID, content string) (Record, error) {
+	return s.AppendEvent(Record{SessionID: sessionID, TurnID: turnID, Kind: EventUserSteering, Content: content})
 }
 
 func (s *Store) AppendThinking(sessionID, turnID, modelCallID, content string) error {
 	if content == "" {
 		return nil
 	}
-	_, err := s.appendRecord(Record{SessionID: sessionID, TurnID: turnID, ModelCallID: modelCallID, Kind: RecordThinking, Content: content})
+	_, err := s.AppendEvent(Record{SessionID: sessionID, TurnID: turnID, ModelCallID: modelCallID, Kind: EventModelReasoning, Content: content})
 	return err
 }
 
@@ -104,16 +105,23 @@ func (s *Store) AppendAssistant(sessionID, turnID, modelCallID, content string) 
 	if content == "" {
 		return nil
 	}
-	_, err := s.appendRecord(Record{SessionID: sessionID, TurnID: turnID, ModelCallID: modelCallID, Kind: RecordAssistant, Content: content})
+	_, err := s.AppendEvent(Record{SessionID: sessionID, TurnID: turnID, ModelCallID: modelCallID, Kind: EventAssistantMessage, Content: content})
 	return err
 }
 
 func (s *Store) AppendError(sessionID, turnID, modelCallID, message string) error {
-	_, err := s.appendRecord(Record{SessionID: sessionID, TurnID: turnID, ModelCallID: modelCallID, Kind: RecordError, Content: message})
+	_, err := s.AppendEvent(Record{SessionID: sessionID, TurnID: turnID, ModelCallID: modelCallID, Kind: EventRuntimeError, Content: message})
 	return err
 }
 
-func (s *Store) appendRecord(record Record) (Record, error) {
+// AppendEvent 是 Timeline 唯一追加入口。已有 Record 永不更新；状态变化通过新事件 + 规范化状态表表达。
+func (s *Store) AppendEvent(record Record) (Record, error) {
+	if strings.TrimSpace(record.SessionID) == "" {
+		return record, fmt.Errorf("Timeline Event 缺少 session_id")
+	}
+	if strings.TrimSpace(record.Kind) == "" {
+		return record, fmt.Errorf("Timeline Event 缺少 kind")
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return record, err
@@ -127,11 +135,10 @@ func (s *Store) appendRecord(record Record) (Record, error) {
 	if len(record.Data) == 0 {
 		record.Data = json.RawMessage(`{}`)
 	}
-	_, err = tx.Exec(`INSERT INTO records(id,session_id,turn_id,seq,model_call_id,kind,content,data_json,created_at)
+	if _, err = tx.Exec(`INSERT INTO records(id,session_id,turn_id,seq,model_call_id,kind,content,data_json,created_at)
 		VALUES(?,?,?,?,NULLIF(?,''),?,?,?,?)`,
 		record.ID, record.SessionID, nullString(record.TurnID), record.Seq,
-		record.ModelCallID, record.Kind, record.Content, string(record.Data), record.CreatedAt)
-	if err != nil {
+		record.ModelCallID, record.Kind, record.Content, string(record.Data), record.CreatedAt); err != nil {
 		return record, err
 	}
 	if _, err := tx.Exec(`UPDATE sessions SET updated_at=? WHERE id=?`, record.CreatedAt, record.SessionID); err != nil {
@@ -143,30 +150,85 @@ func (s *Store) appendRecord(record Record) (Record, error) {
 	return record, nil
 }
 
-func (s *Store) ContextMessages(sessionID string) ([]ContextMessage, error) {
-	rows, err := s.db.Query(`SELECT kind,content FROM records WHERE session_id=? ORDER BY seq`, sessionID)
+// Timeline 返回 Session 的不可变事件流。afterSeq 用于增量订阅；limit<=0 时使用安全上限。
+func (s *Store) Timeline(sessionID string, afterSeq int64, limit int) ([]Record, error) {
+	if limit <= 0 || limit > 5000 {
+		limit = 5000
+	}
+	rows, err := s.db.Query(`SELECT id,session_id,COALESCE(turn_id,''),seq,COALESCE(model_call_id,''),kind,content,data_json,created_at
+		FROM records WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?`, sessionID, afterSeq, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanRecords(rows)
+}
 
-	// 模型上下文只回放用户与可见助手正文。Thinking 仅用于 UI/debug。
-	var out []ContextMessage
+func (s *Store) TimelineByTurn(turnID string, afterSeq int64) ([]Record, error) {
+	rows, err := s.db.Query(`SELECT id,session_id,COALESCE(turn_id,''),seq,COALESCE(model_call_id,''),kind,content,data_json,created_at
+		FROM records WHERE turn_id=? AND seq>? ORDER BY seq`, turnID, afterSeq)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRecords(rows)
+}
+
+type recordRows interface {
+	Next() bool
+	Scan(...any) error
+	Err() error
+}
+
+func scanRecords(rows recordRows) ([]Record, error) {
+	var out []Record
 	for rows.Next() {
-		var kind, content string
-		if err := rows.Scan(&kind, &content); err != nil {
+		var r Record
+		var raw string
+		if err := rows.Scan(&r.ID, &r.SessionID, &r.TurnID, &r.Seq, &r.ModelCallID, &r.Kind, &r.Content, &raw, &r.CreatedAt); err != nil {
 			return nil, err
 		}
-		switch kind {
-		case RecordUser:
-			out = append(out, ContextMessage{Role: "user", Content: content})
-		case RecordAssistant:
-			out = append(out, ContextMessage{Role: "assistant", Content: content})
-		}
+		r.Kind = NormalizeRecordKind(r.Kind)
+		r.Data = json.RawMessage(raw)
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }
 
+func NormalizeRecordKind(kind string) string {
+	switch kind {
+	case RecordUser:
+		return EventUserMessage
+	case RecordAssistant:
+		return EventAssistantMessage
+	case RecordThinking:
+		return EventModelReasoning
+	case RecordError:
+		return EventRuntimeError
+	default:
+		return kind
+	}
+}
+
+// ContextMessages 仅保留旧 API 兼容，不再供 Agent Runtime 直接构造上下文。
+func (s *Store) ContextMessages(sessionID string) ([]ContextMessage, error) {
+	records, err := s.Timeline(sessionID, 0, 5000)
+	if err != nil {
+		return nil, err
+	}
+	var out []ContextMessage
+	for _, record := range records {
+		switch record.Kind {
+		case EventUserMessage, EventUserSteering:
+			out = append(out, ContextMessage{Role: "user", Content: record.Content})
+		case EventAssistantMessage:
+			out = append(out, ContextMessage{Role: "assistant", Content: record.Content})
+		}
+	}
+	return out, nil
+}
+
+// ListMessages 是 message-only 旧前端的兼容 Projection；事实来源始终是 Timeline。
 func (s *Store) ListMessages(sessionID string) ([]Message, error) {
 	calls, err := s.loadModelCalls(sessionID)
 	if err != nil {
@@ -181,11 +243,12 @@ func (s *Store) ListMessages(sessionID string) ([]Message, error) {
 	var out []Message
 	assistantIndex := map[string]int{}
 	for rows.Next() {
-		var recordID, kind, content, modelCallID, rawData, created string
-		if err := rows.Scan(&recordID, &kind, &content, &modelCallID, &rawData, &created); err != nil {
+		var recordID, rawKind, content, modelCallID, rawData, created string
+		if err := rows.Scan(&recordID, &rawKind, &content, &modelCallID, &rawData, &created); err != nil {
 			return nil, err
 		}
-		if kind == RecordUser {
+		kind := NormalizeRecordKind(rawKind)
+		if kind == EventUserMessage || kind == EventUserSteering {
 			var data struct {
 				Provider string `json:"provider"`
 				Model    string `json:"model"`
@@ -195,7 +258,7 @@ func (s *Store) ListMessages(sessionID string) ([]Message, error) {
 			out = append(out, Message{ID: recordID, Type: "user", TS: created, Content: content, Provider: data.Provider, Model: data.Model, Thinking: data.Thinking})
 			continue
 		}
-		if modelCallID == "" || (kind != RecordThinking && kind != RecordAssistant && kind != RecordError) {
+		if modelCallID == "" || (kind != EventModelReasoning && kind != EventAssistantMessage && kind != EventRuntimeError) {
 			continue
 		}
 		idx, exists := assistantIndex[modelCallID]
@@ -212,11 +275,11 @@ func (s *Store) ListMessages(sessionID string) ([]Message, error) {
 			assistantIndex[modelCallID] = idx
 		}
 		switch kind {
-		case RecordThinking:
+		case EventModelReasoning:
 			out[idx].Reasoning += content
-		case RecordAssistant:
+		case EventAssistantMessage:
 			out[idx].Content += content
-		case RecordError:
+		case EventRuntimeError:
 			if out[idx].Error == "" {
 				out[idx].Error = content
 			}
