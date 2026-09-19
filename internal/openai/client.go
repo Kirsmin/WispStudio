@@ -95,7 +95,6 @@ func (c *Client) BuildRequestWithTools(baseURL, apiKey, model, thinkingStyle, th
 	// 把兼容性问题直接传给上游，最终变成难以定位的 HTTP 400。
 	messages = NormalizeToolMessages(messages)
 	tools = NormalizeToolDefinitions(tools)
-	messages = NormalizeReasoningMessages(messages, shouldReplayReasoningContent(baseURL, model, thinkingStyle) && len(tools) > 0)
 	body := ChatRequest{
 		Model: model, Messages: messages, Stream: true,
 		StreamOptions: &StreamOptions{IncludeUsage: true}, Tools: tools,
@@ -241,27 +240,6 @@ func NormalizeToolMessages(messages []ChatMessage) []ChatMessage {
 		}
 	}
 	return out
-}
-
-// NormalizeReasoningMessages 只在需要 reasoning_content 回放的兼容接口上保留该字段。
-// DeepSeek 思考模式在请求携带 tools 时要求完整回传历史 reasoning_content；
-// 其他 OpenAI 兼容服务未必接受这个扩展字段，因此在不需要时主动剥离。
-func NormalizeReasoningMessages(messages []ChatMessage, keep bool) []ChatMessage {
-	if keep || len(messages) == 0 {
-		return messages
-	}
-	out := make([]ChatMessage, len(messages))
-	copy(out, messages)
-	for i := range out {
-		out[i].ReasoningContent = ""
-	}
-	return out
-}
-
-func shouldReplayReasoningContent(baseURL, model, thinkingStyle string) bool {
-	target := strings.ToLower(strings.TrimSpace(baseURL) + " " + strings.TrimSpace(model))
-	style := strings.ToLower(strings.TrimSpace(thinkingStyle))
-	return strings.Contains(target, "deepseek") || style == "enable_thinking" || style == "reasoning_content"
 }
 
 func isDeepSeekV4(model string) bool {

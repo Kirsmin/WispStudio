@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -55,6 +56,8 @@ func (r *Router) registerRoutes() {
 	r.mux.HandleFunc("/api/sessions/{id}/messages", cors(r.handleMessages))
 	r.mux.HandleFunc("/api/sessions/{id}/timeline", cors(r.handleTimeline))
 	r.mux.HandleFunc("/api/sessions/{id}/runtime", cors(r.handleRuntimeState))
+	r.mux.HandleFunc("/api/sessions/{id}/debug", cors(r.handleSessionDebug))
+	r.mux.HandleFunc("/api/sessions/{id}/export", cors(r.handleSessionExport))
 	r.mux.HandleFunc("/api/sessions/{id}/chat", cors(r.chatHandler.HandleChat))
 	r.mux.HandleFunc("/api/sessions/{id}/chat/status", cors(r.handleChatStatus))
 	r.mux.HandleFunc("/api/sessions/{id}/chat/cancel", cors(r.handleChatCancel))
@@ -207,6 +210,47 @@ func (r *Router) handleTimeline(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeJSON(w, 200, items)
+}
+
+func (r *Router) handleSessionDebug(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	sessionID := req.PathValue("id")
+	if _, err := r.store.GetSession(sessionID); err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	calls, err := r.store.SessionModelCallDebug(sessionID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"calls": calls})
+}
+
+func (r *Router) handleSessionExport(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	sessionID := req.PathValue("id")
+	if _, err := r.store.GetSession(sessionID); err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	var archive bytes.Buffer
+	if err := r.store.WriteSessionArchive(req.Context(), sessionID, &archive); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "导出 Session 失败: "+err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="wisp-session-`+sessionID+`.zip"`)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Length", strconv.Itoa(archive.Len()))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(archive.Bytes())
 }
 
 func (r *Router) handleRuntimeState(w http.ResponseWriter, req *http.Request) {

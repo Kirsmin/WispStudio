@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -206,7 +207,7 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 		// assistant.tool_calls 与 tool 结果交错，从而被 OpenAI 兼容接口以 HTTP 400 拒绝。
 		// 未采纳的调用不进入 Timeline/上下文，模型会在拿到首个 ToolResult 后重新规划。
 		call := out.ToolCalls[0]
-		c.recordToolRequested(turn, turn.ActiveAgentRunID, callID, call)
+		c.recordToolRequested(turn, turn.ActiveAgentRunID, callID, out.Reasoning, call)
 		decision := c.permissions.Evaluate(profile, call.Name, c.tools)
 		switch decision.Action {
 		case "deny":
@@ -267,19 +268,21 @@ func (c *Coordinator) callModel(ctx context.Context, turn *store.Turn, profile A
 		_ = c.store.FinishModelCall(callID, store.ModelCallResult{Status: "failed", Finish: "error", Error: message})
 		return callOutcome{Error: message}, callID
 	}
+	if req.GetBody != nil {
+		if body, bodyErr := req.GetBody(); bodyErr == nil {
+			if data, readErr := io.ReadAll(body); readErr == nil {
+				_ = c.store.SetModelCallRequest(callID, req.URL.String(), string(data))
+			}
+			_ = body.Close()
+		}
+	}
 	out := c.runModelStream(ctx, turn, callID, req)
 	if out.Reasoning != "" {
-		data := json.RawMessage(nil)
-		if child {
-			data = eventJSON(map[string]any{"agent_run_id": agentRunID, "child": true})
-		}
+		data := eventJSON(map[string]any{"agent_run_id": agentRunID, "child": child})
 		_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, ModelCallID: callID, Kind: store.EventModelReasoning, Content: out.Reasoning, Data: data})
 	}
 	if out.Content != "" {
-		data := json.RawMessage(nil)
-		if child {
-			data = eventJSON(map[string]any{"agent_run_id": agentRunID, "child": true})
-		}
+		data := eventJSON(map[string]any{"agent_run_id": agentRunID, "child": child, "reasoning_content": out.Reasoning})
 		_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, ModelCallID: callID, Kind: store.EventAssistantMessage, Content: out.Content, Data: data})
 	}
 	status := "completed"
@@ -412,11 +415,10 @@ func (c *Coordinator) executeTool(ctx context.Context, turn *store.Turn, selecti
 	return c.tools.Execute(ToolContext{Context: ctx, SessionID: turn.SessionID, TurnID: turn.ID, AgentRunID: turn.ActiveAgentRunID}, call)
 }
 
-func (c *Coordinator) recordToolRequested(turn *store.Turn, agentRunID, modelCallID string, call ToolCall) {
-	_, _ = c.store.AppendEvent(store.Record{
-		SessionID: turn.SessionID, TurnID: turn.ID, ModelCallID: modelCallID, Kind: store.EventToolRequested,
-		Data: eventJSON(map[string]any{"tool_call_id": call.ID, "name": call.Name, "arguments": call.Arguments, "agent_run_id": agentRunID}),
-	})
+func (c *Coordinator) recordToolRequested(turn *store.Turn, agentRunID, modelCallID, reasoning string, call ToolCall) {
+	_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, ModelCallID: modelCallID, Kind: store.EventToolRequested, Data: eventJSON(map[string]any{
+		"tool_call_id": call.ID, "name": call.Name, "arguments": call.Arguments, "agent_run_id": agentRunID, "reasoning_content": reasoning,
+	})})
 }
 func (c *Coordinator) recordToolResult(turn *store.Turn, call ToolCall, result ToolResult) {
 	kind := store.EventToolCompleted
@@ -577,7 +579,7 @@ func (c *Coordinator) runChild(ctx context.Context, turn *store.Turn, child *sto
 		if err != nil {
 			return "", err
 		}
-		out, childCallID := c.callModel(ctx, fresh, profile, child.ID, selection, compiled, true)
+		out, callID := c.callModel(ctx, fresh, profile, child.ID, selection, compiled, true)
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
@@ -588,7 +590,7 @@ func (c *Coordinator) runChild(ctx context.Context, turn *store.Turn, child *sto
 			return strings.TrimSpace(out.Content), nil
 		}
 		call := out.ToolCalls[0]
-		c.recordToolRequested(fresh, child.ID, childCallID, call)
+		c.recordToolRequested(fresh, child.ID, callID, out.Reasoning, call)
 		decision := c.permissions.Evaluate(profile, call.Name, c.tools)
 		if decision.Action != "allow" {
 			c.recordToolResult(fresh, call, ToolResult{Status: "rejected", Error: decision.Risk})

@@ -241,6 +241,18 @@ CREATE INDEX idx_context_folds_session_active ON context_folds(session_id, activ
 			return err
 		},
 	},
+	{
+		version: 7,
+		name:    "ModelCall 完整请求快照",
+		up: func(ctx context.Context, tx *sql.Tx) error {
+			const schema = `
+ALTER TABLE model_calls ADD COLUMN request_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE model_calls ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}';
+`
+			_, err := tx.ExecContext(ctx, schema)
+			return err
+		},
+	},
 }
 
 // migrate 执行所有尚未应用的迁移。整个流程在一个事务内完成。

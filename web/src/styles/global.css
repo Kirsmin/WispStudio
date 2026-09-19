@@ -35,19 +35,9 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* 无抖动：只允许背景色/颜色/边框色/透明度过渡 */
-*, *::before, *::after {
-  transition-property: background-color, color, border-color, opacity;
-  transition-duration: 0.2s;
-}
-
-/* 关闭 NaiveUI 所有弹出/进场动画（模态框、下拉、消息等） */
-[class*="transition-enter-active"],
-[class*="transition-leave-active"],
-[class*="transition-enter-from"],
-[class*="transition-leave-to"] {
-  transition: none !important;
-  animation: none !important;
+/* 不给长 Timeline 的每个节点挂全局 transition，只保留交互控件的轻量过渡。 */
+button, .n-button, a, [role="button"] {
+  transition: background-color .14s ease, color .14s ease, border-color .14s ease, opacity .14s ease;
 }
 
 /* 按钮样式 */

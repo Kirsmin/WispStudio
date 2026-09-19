@@ -4,11 +4,12 @@
       <n-message-provider>
         <MessageRegister />
         <div class="app">
-          <TopBar />
+          <TopBar @debug="debugOpen = true" />
           <div class="main">
             <SessionList />
             <ChatArea />
           </div>
+          <DebugPanel v-model:show="debugOpen" />
         </div>
       </n-message-provider>
     </n-dialog-provider>
@@ -16,7 +17,7 @@
 </template>
 
 <script setup lang="ts">
-import { defineComponent, onMounted } from 'vue'
+import { defineComponent, onMounted, ref } from 'vue'
 import { NConfigProvider, NDialogProvider, NMessageProvider, useMessage } from 'naive-ui'
 import { themeOverrides } from './theme'
 import { useConnectionStore } from './stores/connection'
@@ -25,6 +26,7 @@ import { useChatStore } from './stores/chat'
 import TopBar from './components/TopBar.vue'
 import SessionList from './components/SessionList.vue'
 import ChatArea from './components/ChatArea.vue'
+import DebugPanel from './components/DebugPanel.vue'
 
 const MessageRegister = defineComponent({
   setup() {
@@ -36,6 +38,7 @@ const MessageRegister = defineComponent({
 const connection = useConnectionStore()
 const sessions = useSessionsStore()
 const chat = useChatStore()
+const debugOpen = ref(false)
 
 onMounted(async () => {
   // Go 托管时默认同源直连；Vite 开发模式也通过 /api 代理同样工作。
