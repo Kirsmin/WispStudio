@@ -8,25 +8,15 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-const DefaultSystemPrompt = `你是 Wisp Agent。你的目标是可靠、直接地完成用户任务，而不是展示流程。
+const DefaultSystemPrompt = `你是 Wisp，目标是以最少的无效步骤可靠完成用户的实际任务。
+语言：面向用户的回答使用用户当前的语言；没有新信息时不要为工具动作逐条旁白。
 
-优先级（从高到低）：
-1. Runtime 安全边界和真实 Tool Result。
-2. 用户最新明确决定与 Current Objective。
-3. 当前 Active Plan / Runtime Todo / Checkpoint。
-4. 项目说明（例如启用时注入的 AGENTS.md）。
-5. 更旧的会话历史与 Original Objective，仅作背景。
-若后文明确修改了前文，采用最新决定，不要重新询问已经解决的问题。
+指令层次：Runtime 安全边界不可覆盖；用户最新的明确要求优先于项目指令和当前 Plan；当前有效 Plan 是工作基线；原始要求仅供归档。若新要求与 Plan 冲突，按新要求工作，并在需要时更新 Plan，不要反复质疑已确认的决定。
+低风险且可逆的格式、路径、命名等细节自行采用合理默认值；仅在重大开销、不可逆操作、权限或核心产物有真实歧义时，集中询问一个关键问题。不要让清单式确认阻塞任务。
 
-交互：
-- 只在高成本、不可逆、危险或会显著改变核心结果的歧义上阻塞询问。
-- 低风险、可逆、容易修改的细节采用合理默认值，并在计划或最终结果中简短说明。
-- 用户可见文本始终使用用户当前使用的语言；工具调用前不写例行旁白。
-
-效率：
-- 小型独立任务走快速路径；不要为了形式完整而探索仓库、建立 Phase 或重复读取已注入约束。
-- 互不依赖的只读调查可在一次响应中批量提出；有副作用或依赖关系的动作按顺序进行。
-- 工具结果才是真实状态，不伪造文件、命令、批准、Artifact 或完成状态。`
+先判断是否需要现有仓库知识：独立脚本、独立新文件等任务不做 list_files/read_file/search_text/Explorer 调研；项目指令如已在上下文注入，不再重复读取 AGENTS.md。调查前必须能说明哪项实现依赖被调查的事实；优先有针对性地读取相关文件。
+只在必要时调用工具，不创建仪式化 Phase；真实副作用以 Tool Result 为准，完成前明确区分“已执行”和“未验证”。
+工具可以一次提出最多四个相互独立的只读调用。写入与执行命令需要按依赖顺序单独确认/执行，永远不要臆造工具结果。`
 
 type ServerConfig struct {
 	Host string `toml:"host"`
@@ -35,24 +25,6 @@ type ServerConfig struct {
 
 type StorageConfig struct {
 	DataDir string `toml:"data_dir"`
-}
-
-type OpenAIConfig struct {
-	BaseURL    string `toml:"base_url"`
-	APIKey     string `toml:"api_key"`
-	TimeoutSec int    `toml:"timeout_sec"`
-}
-
-// ModelConfig 保留旧版 [[models]] 配置兼容。
-// 新配置优先使用 [[providers]] + [[providers.model_overrides]]。
-type ModelConfig struct {
-	ID             string   `toml:"id"`
-	Name           string   `toml:"name"`
-	Default        bool     `toml:"default"`
-	ThinkingLevels []string `toml:"thinking_levels"`
-	ThinkingStyle  string   `toml:"thinking_style"`
-	BaseURL        string   `toml:"base_url" json:"base_url,omitempty"`
-	APIKey         string   `toml:"api_key" json:"-"`
 }
 
 type ModelOverrideConfig struct {
@@ -79,8 +51,6 @@ type Config struct {
 	SystemPrompt string           `toml:"system_prompt"`
 	Server       ServerConfig     `toml:"server"`
 	Storage      StorageConfig    `toml:"storage"`
-	OpenAI       OpenAIConfig     `toml:"openai"`
-	Models       []ModelConfig    `toml:"models"`
 	Providers    []ProviderConfig `toml:"providers"`
 }
 
@@ -113,9 +83,6 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.Storage.DataDir) == "" {
 		c.Storage.DataDir = "Data"
 	}
-	if c.OpenAI.TimeoutSec <= 0 {
-		c.OpenAI.TimeoutSec = 120
-	}
 
 	usedIDs := make(map[string]struct{}, len(c.Providers))
 	for i := range c.Providers {
@@ -138,7 +105,7 @@ func (c *Config) applyDefaults() {
 			provider.Name = provider.ID
 		}
 		if provider.TimeoutSec <= 0 {
-			provider.TimeoutSec = c.OpenAI.TimeoutSec
+			provider.TimeoutSec = 120
 		}
 		provider.ThinkingLevels = cleanLevels(provider.ThinkingLevels)
 		provider.ThinkingStyle = normalizeThinkingStyle(provider.ThinkingStyle)
@@ -150,17 +117,13 @@ func (c *Config) applyDefaults() {
 			override.ThinkingStyle = normalizeThinkingStyle(override.ThinkingStyle)
 		}
 	}
-	for i := range c.Models {
-		model := &c.Models[i]
-		model.ID = strings.TrimSpace(model.ID)
-		model.Name = strings.TrimSpace(model.Name)
-		model.BaseURL = strings.TrimRight(strings.TrimSpace(model.BaseURL), "/")
-		model.ThinkingLevels = cleanLevels(model.ThinkingLevels)
-		model.ThinkingStyle = normalizeThinkingStyle(model.ThinkingStyle)
-	}
+
 }
 
 func (c *Config) validate() error {
+	if len(c.Providers) == 0 {
+		return fmt.Errorf("至少配置一个 [[providers]]；旧版 [openai]/[[models]] 已移除")
+	}
 	for i, provider := range c.Providers {
 		if provider.BaseURL == "" {
 			return fmt.Errorf("providers[%d] (%s) 缺少 base_url", i, provider.Name)
@@ -235,7 +198,7 @@ func normalizeThinkingStyle(style string) string {
 const DefaultConfigTOML = `# Wisp 默认配置（首次运行自动生成，请勿提交到版本库）
 # 修改 api_key 等配置后保存，再重新启动服务器。
 
-system_prompt = """你是先进的 Wisp Alpha 模型，具有长文本对话/角色扮演/答疑能力。"""
+# 不设置 system_prompt 即使用 Wisp 任务型默认提示词；配置后将作为核心指令。
 
 [server]
 host = "127.0.0.1"
@@ -274,18 +237,7 @@ timeout_sec = 120
 # thinking_levels = ["off", "on"]
 # thinking_style = "enable_thinking"
 
-# 旧版兼容：如果没有配置 [[providers]]，仍可继续使用 [openai] + [[models]]。
-# [openai]
-# base_url = "https://api.deepseek.com/v1"
-# api_key = "sk-xxx"
-# timeout_sec = 120
-#
-# [[models]]
-# id = "deepseek-chat"
-# name = "DeepSeek-V3"
-# default = true
-# thinking_levels = ["off"]
-# thinking_style = "none"
+
 `
 
 func WriteDefault(path string) error {

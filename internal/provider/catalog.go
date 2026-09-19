@@ -61,60 +61,11 @@ func NewCatalog(cfg *config.Config) *Catalog {
 }
 
 func buildRuntimeProviders(cfg *config.Config) []runtimeProvider {
-	if len(cfg.Providers) > 0 {
-		result := make([]runtimeProvider, 0, len(cfg.Providers))
-		for _, provider := range cfg.Providers {
-			result = append(result, runtimeProvider{Config: provider})
-		}
-		return result
+	providers := make([]runtimeProvider, 0, len(cfg.Providers))
+	for _, item := range cfg.Providers {
+		providers = append(providers, runtimeProvider{Config: item})
 	}
-
-	// 兼容旧配置：没有 [[providers]] 时，把 [openai] + [[models]] 映射为运行时 Provider。
-	result := make([]runtimeProvider, 0)
-	legacy := config.ProviderConfig{
-		ID:         "default",
-		Name:       "Default",
-		BaseURL:    strings.TrimRight(strings.TrimSpace(cfg.OpenAI.BaseURL), "/"),
-		APIKey:     cfg.OpenAI.APIKey,
-		Default:    true,
-		TimeoutSec: cfg.OpenAI.TimeoutSec,
-	}
-	for index, model := range cfg.Models {
-		modelBaseURL := strings.TrimRight(strings.TrimSpace(model.BaseURL), "/")
-		if (modelBaseURL == "" || modelBaseURL == legacy.BaseURL) && (model.APIKey == "" || model.APIKey == legacy.APIKey) {
-			legacy.ModelOverrides = append(legacy.ModelOverrides, config.ModelOverrideConfig{
-				ID:             model.ID,
-				Name:           model.Name,
-				Default:        model.Default,
-				ThinkingLevels: model.ThinkingLevels,
-				ThinkingStyle:  model.ThinkingStyle,
-			})
-			continue
-		}
-		name := model.Name
-		if name == "" {
-			name = model.ID
-		}
-		provider := config.ProviderConfig{
-			ID:         fmt.Sprintf("legacy-%d", index+1),
-			Name:       name,
-			BaseURL:    modelBaseURL,
-			APIKey:     firstNonEmpty(model.APIKey, cfg.OpenAI.APIKey),
-			TimeoutSec: cfg.OpenAI.TimeoutSec,
-			ModelOverrides: []config.ModelOverrideConfig{{
-				ID:             model.ID,
-				Name:           name,
-				Default:        true,
-				ThinkingLevels: model.ThinkingLevels,
-				ThinkingStyle:  model.ThinkingStyle,
-			}},
-		}
-		result = append(result, runtimeProvider{Config: provider})
-	}
-	if legacy.BaseURL != "" || len(legacy.ModelOverrides) > 0 {
-		result = append([]runtimeProvider{{Config: legacy}}, result...)
-	}
-	return result
+	return providers
 }
 
 func (c *Catalog) Snapshot(ctx context.Context, force bool) CatalogSnapshot {

@@ -51,15 +51,14 @@ func NewCoordinator(cfg *config.Config, catalog *provider.Catalog, st *store.Sto
 	tools := NewToolRuntime(st, workspaceRoot)
 	return &Coordinator{
 		cfg: cfg, catalog: catalog, store: st, runs: runs, hub: hub,
-		client: openai.NewClient(&cfg.OpenAI), profiles: profiles, tools: tools,
+		client: openai.NewClient(180), profiles: profiles, tools: tools,
 		compiler: NewContextCompiler(cfg, st, profiles, tools, workspaceRoot), permissions: NewPermissionEngine(profiles),
 	}
 }
 
-func (c *Coordinator) Profiles() []AgentProfile            { return c.profiles.List() }
-func (c *Coordinator) Hub() *EventHub                      { return c.hub }
-func (c *Coordinator) Runs() *RunRegistry                  { return c.runs }
-func (c *Coordinator) CurrentPhaseID(turnID string) string { return c.tools.currentPhaseID(turnID) }
+func (c *Coordinator) Profiles() []AgentProfile { return c.profiles.List() }
+func (c *Coordinator) Hub() *EventHub           { return c.hub }
+func (c *Coordinator) Runs() *RunRegistry       { return c.runs }
 
 func (c *Coordinator) Capabilities(turn *store.Turn, executionActive, hasApproval, hasPlan bool) map[string]bool {
 	caps := c.store.TurnCapabilities(turn, executionActive, hasApproval, hasPlan)
@@ -84,7 +83,7 @@ func (c *Coordinator) ArtifactVersionMutable(turn *store.Turn, artifact *store.A
 	if turn.Status == store.TurnCompleted || turn.Status == store.TurnStopped || turn.Status == store.TurnCancelled || turn.Status == store.TurnFailed {
 		return false
 	}
-	// 迁移目标 Profile（例如 Build）会冻结作为输入契约的 Artifact。
+	// Transition target profile（例如 Build）会冻结作为输入契约的 Artifact。
 	return !c.profiles.ArtifactFrozenByProfile(turn.ActiveAgent, artifact.Type, artifact.Name)
 }
 
@@ -132,7 +131,6 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 		turn.RootAgentRunID = run.ID
 	}
 
-	nextTrigger := initialCallTrigger(turn)
 	for action := 0; action < 96; action++ {
 		if c.handleCancellation(ctx, turn.ID) {
 			return
@@ -154,11 +152,6 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 			if !c.applyResolvedApproval(ctx, turn, resolved) {
 				return
 			}
-			if resolved.Status == "rejected" {
-				nextTrigger = "用户拒绝 Approval，已写入 Tool Result：" + resolved.ToolName
-			} else {
-				nextTrigger = "Approval 已处理并获得 Tool Result：" + resolved.ToolName
-			}
 			continue
 		}
 		pending, err := c.store.PendingApproval(turn.ID)
@@ -172,17 +165,31 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 			return
 		}
 
+		// 一批 ToolCalls 的全部请求已落盘；在编译下轮上下文前逐个结清结果。
+		// 如有 Approval，先暂停，重新启动后继续批次中尚未执行的调用。
+		pendingCall, pendingErr := c.store.NextPendingToolCall(turn.ID)
+		if pendingErr != nil {
+			c.failTurn(turn, "读取待执行工具失败: "+pendingErr.Error())
+			return
+		}
+		if pendingCall != nil {
+			if !c.runPendingTool(ctx, turn, selection, pendingCall) {
+				return
+			}
+			continue
+		}
 		profile, ok := c.profiles.Get(turn.ActiveAgent)
 		if !ok {
 			c.failTurn(turn, "未知 AgentProfile: "+turn.ActiveAgent)
 			return
 		}
-		profile = effectiveProfile(profile, turn.TaskComplexity, turn.AllowReconnaissance)
-		trigger := nextTrigger
-		if steering, steeringErr := c.store.PendingSteering(turn.ID, turn.SteeringCursor); steeringErr == nil && len(steering) > 0 {
-			trigger = fmt.Sprintf("用户 Steering 到达安全点：%d 条新指令", len(steering))
+		if turn.TaskMode == "complex" {
+			if err := c.compactProgress(turn); err != nil {
+				c.failTurn(turn, "进度 Checkpoint 失败: "+err.Error())
+				return
+			}
 		}
-		compiled, err := c.compiler.Compile(CompileInput{Turn: turn, Profile: profile, AgentRunID: turn.ActiveAgentRunID, Trigger: trigger})
+		compiled, err := c.compiler.Compile(CompileInput{Turn: turn, Profile: profile, AgentRunID: turn.ActiveAgentRunID})
 		if err != nil {
 			c.failTurn(turn, "Context Compile 失败: "+err.Error())
 			return
@@ -207,13 +214,6 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 				_ = c.store.SetTurnStatus(turn.ID, store.TurnWaitingUser)
 				c.publish("runtime.status", turn, map[string]any{"status": store.TurnWaitingUser, "reason": "agent_waiting", "profile_id": profile.ID})
 			case "complete_turn":
-				if profile.ID == "build" && turn.TaskComplexity == "complex" {
-					if phaseID := c.tools.currentPhaseID(turn.ID); phaseID != "" {
-						nextTrigger = "Runtime 状态约束：当前 " + phaseID + " 尚未关闭；阶段工作完成后先调用 done_phase，否则继续执行"
-						_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, Kind: store.EventRuntimeHint, Content: "复杂任务仍有进行中的 Phase，Runtime 暂不允许提前完成 Turn。"})
-						continue
-					}
-				}
 				c.completeTurn(turn, out.Content)
 			default:
 				c.failTurn(turn, "Root Agent 不支持 IdlePolicy: "+profile.IdlePolicy)
@@ -221,113 +221,158 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 			return
 		}
 
-		calls := acceptedToolBatch(out.ToolCalls)
-		for _, call := range calls {
-			c.recordToolRequested(turn, turn.ActiveAgentRunID, callID, out.Reasoning, call)
-		}
-		for _, call := range calls {
-			decision := c.permissions.Evaluate(profile, call, c.tools)
-			switch decision.Action {
-			case "deny":
-				c.recordToolResult(turn, call, ToolResult{Status: "rejected", Error: decision.Risk})
-				continue
-			case "ask_user":
-				phaseID := c.tools.currentPhaseID(turn.ID)
-				granted, grantErr := c.store.ApprovalGrantAllows(turn.ID, call.Name, decision.RiskClass, phaseID)
-				if grantErr != nil {
-					c.failTurn(turn, "读取授权作用域失败: "+grantErr.Error())
-					return
-				}
-				if !granted {
-					approval, err := c.store.CreateApproval(turn.SessionID, turn.ID, turn.ActiveAgentRunID, call.ID, call.Name, call.Arguments, decision.Risk, decision.RiskClass)
-					if err != nil {
-						c.failTurn(turn, err.Error())
-						return
-					}
-					_ = c.store.SetTurnStatus(turn.ID, store.TurnWaitingUser)
-					c.publish("approval.requested", turn, approval)
-					return
-				}
-			}
-
-			result := c.executeTool(ctx, turn, selection, call)
-			c.recordToolResult(turn, call, result)
-			if call.Name == "done_phase" && result.Status == "success" {
-				if err := c.compactPhase(turn, call, result); err != nil {
-					_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, Kind: store.EventRuntimeHint, Content: "Phase 已完成，但创建 Checkpoint 失败: " + err.Error()})
-				}
-			}
-			if (call.Name == "new_plan" || call.Name == "edit_plan") && result.Status == "success" && profile.ID == "plan" {
-				c.finishPlanAfterSave(turn, result)
-				return
+		// 所有 ToolCall 一次性落盘再结清；跨依赖写入/执行不允许成批静默推进。
+		// 只接受 ≤4 个相互独立的只读操作；其他场景仅执行第一个，并为剩余调用记录拒绝结果。
+		readonly := map[string]bool{"list_files": true, "read_file": true, "search_text": true, "verify_file": true}
+		allowBatch := len(out.ToolCalls) <= 4
+		for _, tool := range out.ToolCalls {
+			if !readonly[tool.Name] {
+				allowBatch = false
 			}
 		}
-		toolNames := make([]string, 0, len(calls))
-		for _, call := range calls {
-			toolNames = append(toolNames, call.Name)
+		for _, tool := range out.ToolCalls {
+			c.recordToolRequested(turn, turn.ActiveAgentRunID, callID, out.Reasoning, tool)
 		}
-		nextTrigger = "Tool Result 已返回：" + strings.Join(toolNames, ", ")
-
-		// 批量 assistant tool_calls 在下一次模型回放前，必须为每个已接纳调用写入终态 Tool Result；因此 Safe Point 只在整批只读调用完成后检查。
-		if c.safePointAfterReload(turn.ID) {
-			return
+		for index, tool := range out.ToolCalls {
+			if (len(out.ToolCalls) > 1 && !allowBatch && index > 0) || index >= 4 {
+				c.recordToolResult(turn, tool, ToolResult{Status: "rejected", Error: "批量执行仅支持至多四个互不依赖的只读操作；请等待首个工具结果再继续"})
+			}
 		}
+		continue
 	}
 	c.failTurn(turn, "Action Loop 超过安全上限（96）")
 }
 
-func initialCallTrigger(turn *store.Turn) string {
-	if turn == nil {
-		return "开始 Agent Action Loop"
-	}
-	switch turn.ActiveAgent {
-	case "build":
-		return "开始 Build：执行当前有效 Plan 与用户决定"
-	case "plan":
-		if len(turn.UserDecisions) > 0 {
-			return "用户追加或修改要求：生成/修订当前 Plan"
-		}
-		return "用户提交新目标：生成最小充分 Plan"
-	default:
-		return "开始 " + turn.ActiveAgent + " Agent"
-	}
-}
-
-func acceptedToolBatch(calls []ToolCall) []ToolCall {
-	if len(calls) <= 1 {
-		return calls
-	}
-	if len(calls) > 6 {
-		return calls[:1]
-	}
-	for _, call := range calls {
-		if !isIndependentReadOnlyCall(call) {
-			return calls[:1]
-		}
-	}
-	return calls
-}
-
-func isIndependentReadOnlyCall(call ToolCall) bool {
-	switch call.Name {
-	case "list_files", "read_file", "search_text":
-		return true
-	case "run_command":
-		command, ok := readCommandArg(call.Arguments)
-		return ok && isReadOnlyCommand(command)
-	default:
+// runPendingTool 不让工具的权限与阶段迁移依赖 LLM 自觉；每个操作后都有安全点。
+func (c *Coordinator) runPendingTool(ctx context.Context, turn *store.Turn, selection Selection, pending *store.PendingToolCall) bool {
+	call := ToolCall{ID: pending.ToolCallID, Name: pending.Name, Arguments: pending.Arguments}
+	profile, ok := c.profiles.Get(turn.ActiveAgent)
+	if !ok {
+		c.failTurn(turn, "未知 AgentProfile: "+turn.ActiveAgent)
 		return false
 	}
+	decision := c.permissions.Evaluate(profile, call.Name, c.tools)
+	if decision.Action == "allow" {
+		if risk := c.reconnaissanceGuard(turn, call); risk != "" {
+			decision = PermissionDecision{Action: "deny", Risk: risk}
+		}
+	}
+	if decision.Action == "deny" {
+		c.recordToolResult(turn, call, ToolResult{Status: "rejected", Error: decision.Risk})
+		return !c.safePointAfterReload(turn.ID)
+	}
+	if decision.Action == "ask_user" {
+		grant, err := c.store.HasApprovalGrant(turn.ID, call.Name, call.Arguments)
+		if err != nil {
+			c.failTurn(turn, err.Error())
+			return false
+		}
+		if !grant {
+			approval, err := c.store.CreateApproval(turn.SessionID, turn.ID, turn.ActiveAgentRunID, call.ID, call.Name, call.Arguments, decision.Risk, "")
+			if err != nil {
+				c.failTurn(turn, err.Error())
+				return false
+			}
+			_ = c.store.SetTurnStatus(turn.ID, store.TurnWaitingUser)
+			c.publish("approval.requested", turn, approval)
+			return false
+		}
+	}
+	result := c.executeTool(ctx, turn, selection, call)
+	c.recordToolResult(turn, call, result)
+	if result.Status == "success" && call.Name == "verify_file" && turn.Stage == "build" {
+		_ = c.store.TransitionStage(turn.ID, "verify")
+	} else if result.Status == "success" && (call.Name == "write_file" || call.Name == "run_command") && turn.Stage == "verify" {
+		_ = c.store.TransitionStage(turn.ID, "build")
+	}
+	return !c.safePointAfterReload(turn.ID)
 }
 
-func (c *Coordinator) finishPlanAfterSave(turn *store.Turn, result ToolResult) {
-	summary := "计划已准备好。你可以修改计划，或点击“开始执行”。"
-	if value, ok := result.Data["user_summary"].(string); ok && strings.TrimSpace(value) != "" {
-		summary = strings.TrimSpace(value)
+func (c *Coordinator) reconnaissanceGuard(turn *store.Turn, call ToolCall) string {
+	if call.Name == "read_file" {
+		var args struct {
+			Path string `json:"path"`
+		}
+		_ = json.Unmarshal(call.Arguments, &args)
+		if strings.TrimPrefix(strings.TrimSpace(args.Path), "./") == "AGENTS.md" {
+			session, err := c.store.GetSession(turn.SessionID)
+			if err == nil && session.AgentsEnabled {
+				return "AGENTS.md 已在本轮 Context 注入，无需再次读取"
+			}
+		}
 	}
-	_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, Kind: store.EventAssistantMessage, Content: summary, Data: eventJSON(map[string]any{"agent_run_id": turn.ActiveAgentRunID, "runtime_generated": true})})
-	_ = c.store.SetTurnStatus(turn.ID, store.TurnWaitingUser)
-	c.publish("runtime.status", turn, map[string]any{"status": store.TurnWaitingUser, "reason": "plan_ready", "profile_id": "plan"})
+	if looksStandalone(turn.Objective) && (call.Name == "list_files" || call.Name == "search_text" || call.Name == "spawn_explorer") {
+		return "独立新文件任务不需要仓库探查；直接保存计划或实现文件"
+	}
+	return ""
+}
+
+func looksStandalone(objective string) bool {
+	text := strings.ToLower(objective)
+	for _, word := range []string{"wisp", "仓库", "项目", "现有", "已有", "修改", "重构", "前端", "后端", "网页", "多个文件", "多文件", "已有代码", "源代码", "源码"} {
+		if strings.Contains(text, word) {
+			return false
+		}
+	}
+	for _, word := range []string{"python", "脚本", "单文件", "密码本", "生成器", "独立文件"} {
+		if strings.Contains(text, word) {
+			return true
+		}
+	}
+	return false
+}
+
+// 复杂任务按计划文本确定性选择阶段模式；无需 LLM 为阶段状态消耗额外请求。
+func classifyMode(objective, plan string) string {
+	if looksStandalone(objective) && len([]rune(plan)) < 1200 {
+		return "trivial"
+	}
+	complexity := 0
+	for _, line := range strings.Split(plan, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "-") || strings.HasPrefix(line, "1.") || strings.HasPrefix(line, "2.") || strings.HasPrefix(line, "3.") {
+			complexity++
+		}
+	}
+	if len([]rune(plan)) > 1000 || complexity >= 7 || strings.Contains(plan, "跨模块") {
+		return "complex"
+	}
+	return "standard"
+}
+
+// 复杂任务每完成一批真实 Tool Result，自动创建事实 Checkpoint；绝不在批次尚未结清时压缩。
+func (c *Coordinator) compactProgress(turn *store.Turn) error {
+	latest, err := c.store.LatestCheckpoint(turn.ID)
+	if err != nil {
+		return err
+	}
+	after := int64(0)
+	if latest != nil {
+		after = latest.TimelineSeq
+	}
+	records, err := c.store.TimelineByTurn(turn.ID, after)
+	if err != nil {
+		return err
+	}
+	count := 0
+	for _, r := range records {
+		if r.Kind == store.EventToolCompleted || r.Kind == store.EventToolFailed {
+			count++
+		}
+	}
+	if count < 8 {
+		return nil
+	}
+	facts, err := c.collectDeterministicFacts(turn, after)
+	if err != nil {
+		return err
+	}
+	cp, err := c.store.CreateCheckpoint(turn.SessionID, turn.ID, "runtime.progress", fmt.Sprintf("Runtime 已处理 %d 个执行动作", count), facts)
+	if err != nil {
+		return err
+	}
+	_, err = c.store.AdvanceContextEpoch(turn.ID, "runtime.progress", cp.ID, "")
+	return err
 }
 
 func (c *Coordinator) callModel(ctx context.Context, turn *store.Turn, profile AgentProfile, agentRunID string, selection Selection, compiled CompiledContext, child bool) (callOutcome, string) {
@@ -335,13 +380,7 @@ func (c *Coordinator) callModel(ctx context.Context, turn *store.Turn, profile A
 	if err != nil {
 		return callOutcome{Error: err.Error()}, ""
 	}
-	baseURL, apiKey := c.cfg.OpenAI.BaseURL, c.cfg.OpenAI.APIKey
-	if provCfg.BaseURL != "" {
-		baseURL = provCfg.BaseURL
-	}
-	if provCfg.APIKey != "" {
-		apiKey = provCfg.APIKey
-	}
+	baseURL, apiKey := provCfg.BaseURL, provCfg.APIKey
 	index, err := c.store.NextModelCallIndex(turn.ID)
 	if err != nil {
 		return callOutcome{Error: err.Error()}, ""
@@ -389,7 +428,7 @@ func (c *Coordinator) callModel(ctx context.Context, turn *store.Turn, profile A
 		finish = "error"
 	}
 	_ = c.store.FinishModelCall(callID, store.ModelCallResult{Status: status, Finish: finish, Usage: out.Usage, DurationMs: out.DurationMs, TTFTMs: out.TTFTMs, Error: errText})
-	c.publish("model.done", turn, map[string]any{"call_id": callID, "finish": finish, "duration_ms": out.DurationMs, "ttft_ms": out.TTFTMs, "error": errText})
+	c.publish("model.done", turn, map[string]any{"call_id": callID, "finish": finish, "duration_ms": out.DurationMs, "ttft_ms": out.TTFTMs, "error": errText, "has_tool_calls": len(out.ToolCalls) > 0})
 	return out, callID
 }
 
@@ -546,16 +585,15 @@ func (c *Coordinator) applyResolvedApproval(ctx context.Context, turn *store.Tur
 	if !ok {
 		return false
 	}
-	profile = effectiveProfile(profile, turn.TaskComplexity, turn.AllowReconnaissance)
-	decision := c.permissions.Evaluate(profile, call, c.tools)
+	decision := c.permissions.Evaluate(profile, call.Name, c.tools)
 	if decision.Action == "deny" {
 		c.recordToolResult(turn, call, ToolResult{Status: "rejected", Error: "批准后权限策略已变化: " + decision.Risk})
 		return true
 	}
 	result := c.executeTool(ctx, turn, Selection{}, call)
 	c.recordToolResult(turn, call, result)
-	if call.Name == "done_phase" && result.Status == "success" {
-		_ = c.compactPhase(turn, call, result)
+	if result.Status == "success" && call.Name == "verify_file" && turn.Stage == "build" {
+		_ = c.store.TransitionStage(turn.ID, "verify")
 	}
 	return ctx.Err() == nil
 }
@@ -663,12 +701,12 @@ func (c *Coordinator) runChild(ctx context.Context, turn *store.Turn, child *sto
 	if err != nil {
 		return "", err
 	}
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 5; i++ {
 		fresh, err := c.store.GetTurn(turn.ID)
 		if err != nil {
 			return "", err
 		}
-		compiled, err := c.compiler.Compile(CompileInput{Turn: fresh, Profile: profile, AgentRunID: child.ID, ExtraUser: objective, Trigger: "SubAgent 定向调查"})
+		compiled, err := c.compiler.Compile(CompileInput{Turn: fresh, Profile: profile, AgentRunID: child.ID, ExtraUser: objective})
 		if err != nil {
 			return "", err
 		}
@@ -682,21 +720,26 @@ func (c *Coordinator) runChild(ctx context.Context, turn *store.Turn, child *sto
 		if len(out.ToolCalls) == 0 {
 			return strings.TrimSpace(out.Content), nil
 		}
-		calls := acceptedToolBatch(out.ToolCalls)
-		for _, call := range calls {
+		for index, call := range out.ToolCalls {
 			c.recordToolRequested(fresh, child.ID, callID, out.Reasoning, call)
-		}
-		for _, call := range calls {
-			decision := c.permissions.Evaluate(profile, call, c.tools)
+			if index >= 4 {
+				c.recordToolResult(fresh, call, ToolResult{Status: "rejected", Error: "每轮最多四个工具"})
+				continue
+			}
+			decision := c.permissions.Evaluate(profile, call.Name, c.tools)
 			if decision.Action != "allow" {
 				c.recordToolResult(fresh, call, ToolResult{Status: "rejected", Error: decision.Risk})
+				continue
+			}
+			if risk := c.reconnaissanceGuard(fresh, call); risk != "" {
+				c.recordToolResult(fresh, call, ToolResult{Status: "rejected", Error: risk})
 				continue
 			}
 			result := c.tools.Execute(ToolContext{Context: ctx, SessionID: fresh.SessionID, TurnID: fresh.ID, AgentRunID: child.ID}, call)
 			c.recordToolResult(fresh, call, result)
 		}
 	}
-	return "", fmt.Errorf("Child Agent 超过定向调查上限（8）")
+	return "", fmt.Errorf("Child Agent 超过 Action 上限")
 }
 
 func (c *Coordinator) collectDeterministicFacts(turn *store.Turn, after int64) (map[string]any, error) {
@@ -771,16 +814,15 @@ func (c *Coordinator) collectDeterministicFacts(turn *store.Turn, after int64) (
 	for _, record := range pending {
 		steering = append(steering, map[string]any{"seq": record.Seq, "content": record.Content})
 	}
-	session, _ := c.store.GetSession(turn.SessionID)
-	injectAgents := session != nil && session.InjectAgents
-	project, scoped := c.compiler.resolver.Resolve(injectAgents)
-	constraintSnapshot := map[string]any{
-		"agents_md_injected": injectAgents && len(project) > 0, "project": project, "scoped": scoped,
-		"hash": hashValue(struct {
-			Project []string `json:"project"`
-			Scoped  []string `json:"scoped"`
-		}{project, scoped}),
+	session, err := c.store.GetSession(turn.SessionID)
+	if err != nil {
+		return nil, err
 	}
+	project, err := c.compiler.resolver.Resolve(session.AgentsEnabled)
+	if err != nil {
+		return nil, err
+	}
+	constraintSnapshot := map[string]any{"agents_enabled": session.AgentsEnabled, "project_instructions": project, "hash": hashValue(project)}
 	return map[string]any{
 		"modified_files":           fileList,
 		"command_actions":          commands,
@@ -797,30 +839,17 @@ func (c *Coordinator) collectDeterministicFacts(turn *store.Turn, after int64) (
 	}, nil
 }
 
-func (c *Coordinator) compactPhase(turn *store.Turn, call ToolCall, result ToolResult) error {
-	latest, err := c.store.LatestCheckpoint(turn.ID)
-	if err != nil {
-		return err
-	}
-	after := int64(0)
-	if latest != nil {
-		after = latest.TimelineSeq
-	}
-	facts, err := c.collectDeterministicFacts(turn, after)
-	if err != nil {
-		return err
-	}
-	facts["done_phase_tool_call_id"] = call.ID
-	summary, _ := result.Data["summary"].(string)
-	cp, err := c.store.CreateCheckpoint(turn.SessionID, turn.ID, "phase.completed", summary, facts)
-	if err != nil {
-		return err
-	}
-	_, err = c.store.AdvanceContextEpoch(turn.ID, "phase.completed", cp.ID, "")
-	return err
-}
-
 func (c *Coordinator) completeTurn(turn *store.Turn, content string) {
+	if turn.TaskMode == "complex" {
+		if err := c.tools.finishAutomaticPhase(turn.SessionID, turn.ID, turn.ActiveAgentRunID); err != nil {
+			c.failTurn(turn, "完成自动 Phase 失败: "+err.Error())
+			return
+		}
+	}
+	if err := c.store.TransitionStage(turn.ID, "complete"); err != nil {
+		c.failTurn(turn, err.Error())
+		return
+	}
 	content = strings.TrimSpace(content)
 	if content == "" {
 		content = "任务已完成。"
@@ -870,24 +899,20 @@ func (c *Coordinator) StartBuild(turnID string, selection Selection) error {
 	if version == nil {
 		return fmt.Errorf("没有 Active Plan")
 	}
-	plan := decodePlanState(version.Data)
-	if plan.Complexity == "" {
-		plan.Complexity = turn.TaskComplexity
+	_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, Kind: store.EventRuntimeCommand, Content: "start_build", Data: eventJSON(map[string]any{"artifact_id": artifact.ID, "plan_version": version.Version})})
+	cp, err := c.store.CreateCheckpoint(turn.SessionID, turn.ID, transition.CheckpointKind, "Planning 已完成，Build 从固定的 Active Plan 开始。", map[string]any{"plan_artifact_id": artifact.ID, "plan_version": version.Version})
+	if err != nil {
+		return err
 	}
-	_ = c.store.SetTurnTaskPolicy(turn.ID, plan.Complexity, plan.Complexity == "complex")
-	_, _ = c.store.AppendEvent(store.Record{SessionID: turn.SessionID, TurnID: turn.ID, Kind: store.EventRuntimeCommand, Content: "start_build", Data: eventJSON(map[string]any{"artifact_id": artifact.ID, "plan_version": version.Version, "complexity": plan.Complexity})})
-	if plan.Complexity == "complex" {
-		cp, cpErr := c.store.CreateCheckpoint(turn.SessionID, turn.ID, transition.CheckpointKind, "Planning 已完成，Build 从固定的 Active Plan 开始。", map[string]any{"plan_artifact_id": artifact.ID, "plan_version": version.Version})
-		if cpErr != nil {
-			return cpErr
-		}
-		if _, err = c.store.AdvanceContextEpoch(turn.ID, transition.Reason, cp.ID, ""); err != nil {
-			return err
-		}
-	} else {
-		if _, err = c.store.AdvanceContextEpoch(turn.ID, transition.Reason+".fast_path", "", ""); err != nil {
-			return err
-		}
+	if _, err = c.store.AdvanceContextEpoch(turn.ID, transition.Reason, cp.ID, ""); err != nil {
+		return err
+	}
+	mode := classifyMode(turn.Objective, version.Content)
+	if err := c.store.SetTaskMode(turn.ID, mode); err != nil {
+		return err
+	}
+	if err := c.store.TransitionStage(turn.ID, "build"); err != nil {
+		return err
 	}
 	if turn.ActiveAgentRunID != "" {
 		_ = c.store.FinishAgentRun(turn.ActiveAgentRunID, "completed", map[string]any{"transition": "build", "plan_version": version.Version})
@@ -899,11 +924,17 @@ func (c *Coordinator) StartBuild(turnID string, selection Selection) error {
 	if err := c.store.SetTurnAgent(turn.ID, transition.TargetProfile, buildRun.ID); err != nil {
 		return err
 	}
-	if err := c.tools.initializeBuildTodo(ToolContext{Context: context.Background(), SessionID: turn.SessionID, TurnID: turn.ID, AgentRunID: buildRun.ID}, plan); err != nil {
+	if mode == "complex" {
+		if err := c.tools.beginAutomaticPhase(turn.SessionID, turn.ID, buildRun.ID); err != nil {
+			return err
+		}
+	}
+	if err := c.store.SetTurnStatus(turn.ID, store.TurnRunning); err != nil {
 		return err
 	}
-	_ = c.store.SetTurnStatus(turn.ID, store.TurnRunning)
-	c.Start(turn.ID, selection)
+	if !c.Start(turn.ID, selection) {
+		return fmt.Errorf("未能启动 Build：当前会话已有执行任务")
+	}
 	return nil
 }
 

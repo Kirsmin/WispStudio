@@ -50,7 +50,7 @@ func (s *Store) SyncJSONL() error {
 }
 
 func exportSessions(tx *sql.Tx) ([]Session, error) {
-	rows, err := tx.Query(`SELECT id,title,renamed,provider,model,created_at,updated_at FROM sessions ORDER BY created_at,id`)
+	rows, err := tx.Query(`SELECT id,title,renamed,provider,model,agents_enabled,created_at,updated_at FROM sessions ORDER BY created_at,id`)
 	if err != nil {
 		return nil, err
 	}

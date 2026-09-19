@@ -49,6 +49,7 @@ func (s *Store) WriteSessionArchive(ctx context.Context, sessionID string, dst i
 		{"requests/model_calls.jsonl", `SELECT * FROM model_calls WHERE session_id=? ORDER BY call_index,created_at,id`, []any{sessionID}},
 		{"runtime/agent_runs.jsonl", `SELECT * FROM agent_runs WHERE session_id=? ORDER BY created_at,id`, []any{sessionID}},
 		{"runtime/approvals.jsonl", `SELECT * FROM approvals WHERE session_id=? ORDER BY created_at,id`, []any{sessionID}},
+		{"runtime/approval_grants.jsonl", `SELECT * FROM approval_grants WHERE session_id=? ORDER BY created_at,id`, []any{sessionID}},
 		{"runtime/checkpoints.jsonl", `SELECT * FROM checkpoints WHERE session_id=? ORDER BY created_at,id`, []any{sessionID}},
 		{"runtime/context_epochs.jsonl", `SELECT * FROM context_epochs WHERE session_id=? ORDER BY turn_id,epoch_index,id`, []any{sessionID}},
 		{"runtime/context_folds.jsonl", `SELECT * FROM context_folds WHERE session_id=? ORDER BY stack_index,id`, []any{sessionID}},

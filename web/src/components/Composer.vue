@@ -14,6 +14,10 @@
           <n-select v-if="showProviderSelect" v-model:value="selectedProvider" :options="providerOptions" size="small" class="pill-select" style="width: 128px" />
           <n-select v-model:value="selectedModel" :options="modelOptions" size="small" class="pill-select" style="width: 160px" />
           <n-select v-model:value="selectedThinking" :options="thinkingOptions" size="small" class="pill-select" style="width: 104px" />
+          <label class="agents-toggle" title="仅在启用时将工作区根目录 AGENTS.md 注入当前 Session。默认关闭，不需要完整呈现工作区。">
+            <n-switch size="small" :value="agentsEnabled" :loading="agentsSaving" @update:value="updateAgents" />
+            <span>AGENTS.md</span>
+          </label>
           <span v-if="executionActive && capabilities.can_steer" class="steer-badge">Steering</span>
         </div>
         <button class="send-btn" :disabled="!canSend" title="发送 (Shift+Enter / Ctrl+Enter)" @click="sendMessage">
@@ -27,15 +31,23 @@
 </template>
 
 <script setup lang="ts">
-import { NInput, NSelect } from 'naive-ui'
-import { computed } from 'vue'
+import { NInput, NSelect, NSwitch } from 'naive-ui'
+import { computed, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { modelThinkingLevels, useChatStore } from '../stores/chat'
 import { useConnectionStore } from '../stores/connection'
 
 const chatStore = useChatStore()
 const connectionStore = useConnectionStore()
-const { selectedProvider, selectedModel, selectedThinking, inputText, executionActive, capabilities, sendingSteering } = storeToRefs(chatStore)
+const { selectedProvider, selectedModel, selectedThinking, inputText, executionActive, capabilities, sendingSteering, agentsEnabled } = storeToRefs(chatStore)
+const agentsSaving = ref(false)
+async function updateAgents(enabled: boolean) {
+  if (agentsSaving.value) return
+  agentsSaving.value = true
+  try { await chatStore.toggleAgents(enabled) }
+  catch (error) { window.$message?.error(error instanceof Error ? error.message : String(error)) }
+  finally { agentsSaving.value = false }
+}
 const { providers, models } = storeToRefs(connectionStore)
 const showProviderSelect = computed(() => providers.value.length > 1)
 const providerOptions = computed(() => providers.value.map(provider => ({ label: provider.name, value: provider.id, disabled: !provider.available })))
@@ -63,6 +75,7 @@ function sendMessage() { if (canSend.value) void chatStore.sendMessage() }
 .composer-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .bar-left { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
 .pill-select :deep(.n-base-selection) { border-radius: 999px; font-size: 12px; }
+.agents-toggle { display: flex; align-items: center; gap: 5px; color: var(--text-2); font-size: 11px; cursor: pointer; white-space: nowrap; }
 .steer-badge { font-size: 10px; padding: 3px 7px; border-radius: 999px; color: var(--accent-text); background: var(--accent-soft); text-transform: uppercase; letter-spacing: .06em; }
 .send-btn { width: 34px; height: 34px; flex-shrink: 0; border: none; border-radius: 50%; background: var(--accent); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 .send-btn:hover { background: var(--accent-hover); }

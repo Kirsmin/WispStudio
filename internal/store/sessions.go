@@ -10,18 +10,18 @@ import (
 )
 
 type Session struct {
-	ID           string    `json:"id"`
-	Title        string    `json:"title"`
-	Renamed      bool      `json:"renamed"`
-	Provider     string    `json:"provider,omitempty"`
-	Model        string    `json:"model"`
-	InjectAgents bool      `json:"inject_agents"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID            string    `json:"id"`
+	Title         string    `json:"title"`
+	Renamed       bool      `json:"renamed"`
+	Provider      string    `json:"provider,omitempty"`
+	Model         string    `json:"model"`
+	AgentsEnabled bool      `json:"agents_enabled"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 func (s *Store) ListSessions() ([]Session, error) {
-	rows, err := s.db.Query(`SELECT id,title,renamed,provider,model,inject_agents,created_at,updated_at FROM sessions ORDER BY updated_at DESC, id`)
+	rows, err := s.db.Query(`SELECT id,title,renamed,provider,model,agents_enabled,created_at,updated_at FROM sessions ORDER BY updated_at DESC, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +41,7 @@ func (s *Store) GetSession(id string) (*Session, error) {
 	if err := validateSessionID(id); err != nil {
 		return nil, err
 	}
-	row := s.db.QueryRow(`SELECT id,title,renamed,provider,model,inject_agents,created_at,updated_at FROM sessions WHERE id=?`, id)
+	row := s.db.QueryRow(`SELECT id,title,renamed,provider,model,agents_enabled,created_at,updated_at FROM sessions WHERE id=?`, id)
 	item, err := scanSession(row)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("会话不存在")
@@ -52,25 +52,20 @@ func (s *Store) GetSession(id string) (*Session, error) {
 	return &item, nil
 }
 
-func (s *Store) CreateSession(title string, injectAgents bool) (*Session, error) {
+func (s *Store) CreateSession(title string) (*Session, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		title = "新会话"
 	}
 	now := time.Now().UTC()
 	item := Session{
-		ID:           "s_" + strings.ReplaceAll(uuid.New().String(), "-", ""),
-		Title:        title,
-		InjectAgents: injectAgents,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:        "s_" + strings.ReplaceAll(uuid.New().String(), "-", ""),
+		Title:     title,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
-	inject := 0
-	if injectAgents {
-		inject = 1
-	}
-	_, err := s.db.Exec(`INSERT INTO sessions(id,title,renamed,provider,model,inject_agents,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
-		item.ID, item.Title, 0, "", "", inject, stamp(now), stamp(now))
+	_, err := s.db.Exec(`INSERT INTO sessions(id,title,renamed,provider,model,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`,
+		item.ID, item.Title, 0, "", "", stamp(now), stamp(now))
 	if err != nil {
 		return nil, err
 	}
@@ -102,16 +97,13 @@ func (s *Store) UpdateAutoTitle(id, title string) error {
 	return nil
 }
 
-func (s *Store) UpdateSelection(id, provider, model string) error {
-	return s.updateSession(id, `provider=?, model=?`, provider, model)
+// SetAgentsEnabled 是 Session 显式偏好；每次 Context Compile 均读取当前值。
+func (s *Store) SetAgentsEnabled(id string, enabled bool) error {
+	return s.updateSession(id, `agents_enabled=?`, enabled)
 }
 
-func (s *Store) UpdateAgentsInjection(id string, enabled bool) error {
-	value := 0
-	if enabled {
-		value = 1
-	}
-	return s.updateSession(id, `inject_agents=?`, value)
+func (s *Store) UpdateSelection(id, provider, model string) error {
+	return s.updateSession(id, `provider=?, model=?`, provider, model)
 }
 
 func (s *Store) Touch(id string) error {
@@ -177,14 +169,14 @@ type rowScanner interface{ Scan(...any) error }
 
 func scanSession(row rowScanner) (Session, error) {
 	var item Session
-	var renamed, injectAgents int
+	var renamed, agents int
 	var created, updated string
-	err := row.Scan(&item.ID, &item.Title, &renamed, &item.Provider, &item.Model, &injectAgents, &created, &updated)
+	err := row.Scan(&item.ID, &item.Title, &renamed, &item.Provider, &item.Model, &agents, &created, &updated)
 	if err != nil {
 		return item, err
 	}
 	item.Renamed = renamed != 0
-	item.InjectAgents = injectAgents != 0
+	item.AgentsEnabled = agents != 0
 	item.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	item.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return item, nil

@@ -30,7 +30,6 @@ type CompileInput struct {
 	Profile    AgentProfile
 	AgentRunID string
 	ExtraUser  string
-	Trigger    string
 }
 
 type ConstraintResolver struct{ workspaceRoot string }
@@ -42,15 +41,21 @@ func NewConstraintResolver(root string) *ConstraintResolver {
 	abs, _ := filepath.Abs(root)
 	return &ConstraintResolver{workspaceRoot: abs}
 }
-func (r *ConstraintResolver) Resolve(injectAgents bool) (project []string, scoped []string) {
-	if !injectAgents {
+func (r *ConstraintResolver) Resolve(enabled bool) (project []string, err error) {
+	if !enabled {
 		return nil, nil
 	}
-	path := filepath.Join(r.workspaceRoot, "AGENTS.md")
-	if data, err := os.ReadFile(path); err == nil && len(data) <= 128*1024 {
-		project = append(project, string(data))
+	data, err := os.ReadFile(filepath.Join(r.workspaceRoot, "AGENTS.md"))
+	if os.IsNotExist(err) {
+		return nil, nil
 	}
-	return project, nil
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 128*1024 {
+		return nil, fmt.Errorf("AGENTS.md 超过 128 KiB，建议精简或关闭注入")
+	}
+	return []string{string(data)}, nil
 }
 
 type ContextCompiler struct {
@@ -70,18 +75,20 @@ func (c *ContextCompiler) Compile(input CompileInput) (CompiledContext, error) {
 	if turn == nil {
 		return CompiledContext{}, fmt.Errorf("缺少 Turn")
 	}
-	session, err := c.store.GetSession(turn.SessionID)
-	if err != nil {
-		return CompiledContext{}, err
-	}
-	effective := effectiveProfile(input.Profile, turn.TaskComplexity, turn.AllowReconnaissance)
-	definitions := openai.NormalizeToolDefinitions(c.tools.Definitions(effective.Tools))
+	definitions := openai.NormalizeToolDefinitions(c.tools.Definitions(input.Profile.Tools))
 	kernel := strings.TrimSpace(c.cfg.SystemPrompt)
 	if kernel == "" {
 		kernel = config.DefaultSystemPrompt
 	}
-	project, scoped := c.resolver.Resolve(session.InjectAgents)
-	instructions := buildInstructionPrompt(kernel, effective, project, scoped, session.InjectAgents)
+	session, err := c.store.GetSession(turn.SessionID)
+	if err != nil {
+		return CompiledContext{}, err
+	}
+	project, err := c.resolver.Resolve(session.AgentsEnabled)
+	if err != nil {
+		return CompiledContext{}, err
+	}
+	instructions := buildInstructionPrompt(kernel, input.Profile, project)
 	prefix := []openai.ChatMessage{{Role: "system", Content: instructions}}
 
 	policy, ok := c.profiles.ContextPolicy(input.Profile.ContextPolicy)
@@ -162,24 +169,35 @@ func (c *ContextCompiler) Compile(input CompileInput) (CompiledContext, error) {
 			messages = append(messages, openai.ChatMessage{Role: "user", Content: input.ExtraUser})
 		}
 		messages = openai.NormalizeToolMessages(messages)
+		trigger := "继续任务"
+		if len(pending) > 0 {
+			trigger = "用户补充要求"
+		} else if turn.Stage == "build" && checkpoint != nil && checkpoint.Kind == "plan_to_build" && len(records) == 0 {
+			trigger = "开始执行"
+		} else if len(records) > 0 {
+			last := records[len(records)-1].Kind
+			if strings.HasPrefix(last, "tool.") {
+				trigger = "工具结果"
+			} else if turn.Stage == "plan" && len(records) == 1 {
+				trigger = "初次规划"
+			}
+		}
 		debug := map[string]any{
-			"agent": effective.ID, "agent_run_id": input.AgentRunID, "context_epoch": turn.ContextEpoch,
-			"trigger": defaultTrigger(input.Trigger, effective.ID), "task_complexity": turn.TaskComplexity,
-			"allow_reconnaissance": turn.AllowReconnaissance, "agents_md_enabled": session.InjectAgents, "agents_md_injected": session.InjectAgents && len(project) > 0,
+			"trigger": trigger, "active_user_override": len(pending) > 0, "agent": input.Profile.ID, "agent_run_id": input.AgentRunID, "context_epoch": turn.ContextEpoch,
 			"checkpoint_id": turn.ActiveCheckpoint, "active_artifacts": artifactRefs(artifacts), "timeline_after_seq": after,
-			"current_objective": turn.CurrentObjective, "user_decisions": turn.UserDecisions,
-			"prompt_layout": promptLayout(prefix, messages, definitions), "prompt_layers": promptLayers(kernel, effective, project, statePrompt, session.InjectAgents),
+			"prompt_layout":  promptLayout(prefix, messages, definitions),
+			"agents_enabled": session.AgentsEnabled, "agents_injected": len(project) > 0,
+			"objective_source": "current_plan_or_initial", "pending_user_decisions": len(turn.UserDecisions), "task_mode": turn.TaskMode, "stage": turn.Stage,
 		}
 		debugJSON, _ := json.Marshal(debug)
 		return CompiledContext{Messages: messages, Tools: definitions, SystemPromptSnapshot: systemSnapshot(prefix), ContextHash: hashValue(messages), PrefixHash: prefixHash, DebugJSON: string(debugJSON), MaxSteeringSeq: maxSteer}, nil
 	}
 	messages = openai.NormalizeToolMessages(messages)
 	debug := map[string]any{
-		"agent": effective.ID, "agent_run_id": input.AgentRunID, "context_epoch": turn.ContextEpoch, "isolated": true,
-		"trigger": defaultTrigger(input.Trigger, effective.ID), "task_complexity": turn.TaskComplexity,
-		"allow_reconnaissance": turn.AllowReconnaissance, "agents_md_enabled": session.InjectAgents, "agents_md_injected": session.InjectAgents && len(project) > 0,
-		"current_objective": turn.CurrentObjective, "user_decisions": turn.UserDecisions,
-		"prompt_layout": promptLayout(prefix, messages, definitions), "prompt_layers": promptLayers(kernel, effective, project, statePrompt, session.InjectAgents),
+		"agent": input.Profile.ID, "agent_run_id": input.AgentRunID, "context_epoch": turn.ContextEpoch, "isolated": true, "trigger": "子任务",
+		"prompt_layout":  promptLayout(prefix, messages, definitions),
+		"agents_enabled": session.AgentsEnabled, "agents_injected": len(project) > 0,
+		"objective_source": "current_plan_or_initial", "pending_user_decisions": len(turn.UserDecisions), "task_mode": turn.TaskMode, "stage": turn.Stage,
 	}
 	debugJSON, _ := json.Marshal(debug)
 	return CompiledContext{Messages: messages, Tools: definitions, SystemPromptSnapshot: systemSnapshot(prefix), ContextHash: hashValue(messages), PrefixHash: prefixHash, DebugJSON: string(debugJSON), MaxSteeringSeq: turn.SteeringCursor}, nil
@@ -244,126 +262,79 @@ func (c *ContextCompiler) previousTurnProjection(current *store.Turn) ([]openai.
 	return out, nil
 }
 
-type replayToolCall struct {
-	ToolCallID       string
-	Name             string
-	Arguments        json.RawMessage
-	AgentRunID       string
-	ReasoningContent string
+// replayTimeline 将同一次模型响应的 ToolCalls 聚合为一条 assistant 消息，
+// 紧随其后回放全部匹配的 tool results；兼容多次只读调用与暂停审批后的批次恢复。
+func agentRunTimelineMessages(records []store.Record, agentRunID string) []openai.ChatMessage {
+	return replayTimeline(records, agentRunID, 0, true)
 }
 
-func collectReplayGroups(records []store.Record, accept func(string) bool) (map[string][]replayToolCall, map[string]bool, map[string]string) {
-	groups := map[string][]replayToolCall{}
-	acceptedIDs := map[string]bool{}
-	assistantContent := map[string]string{}
+func timelineMessages(records []store.Record, steeringCursor int64, activeAgentRunID string) []openai.ChatMessage {
+	return replayTimeline(records, activeAgentRunID, steeringCursor, false)
+}
+
+func replayTimeline(records []store.Record, agentRunID string, steeringCursor int64, isolated bool) []openai.ChatMessage {
+	type requested struct {
+		ToolCallID       string          `json:"tool_call_id"`
+		Name             string          `json:"name"`
+		Arguments        json.RawMessage `json:"arguments"`
+		AgentRunID       string          `json:"agent_run_id"`
+		ReasoningContent string          `json:"reasoning_content"`
+	}
+	toolGroups := map[string][]requested{}
+	results := map[string]string{}
+	assistantText := map[string]string{}
+	reasoning := reasoningContentByCall(records)
 	for _, r := range records {
-		if r.Kind == store.EventAssistantMessage && r.ModelCallID != "" {
+		if r.Kind == store.EventToolRequested {
+			var item requested
+			if json.Unmarshal(r.Data, &item) == nil && item.ToolCallID != "" &&
+				((isolated && item.AgentRunID == agentRunID) || (!isolated && item.AgentRunID == agentRunID)) {
+				toolGroups[r.ModelCallID] = append(toolGroups[r.ModelCallID], item)
+			}
+		}
+		if r.Kind == store.EventAssistantMessage {
 			var meta struct {
 				AgentRunID string `json:"agent_run_id"`
 				Child      bool   `json:"child"`
 			}
 			_ = json.Unmarshal(r.Data, &meta)
-			if accept(meta.AgentRunID) && !meta.Child {
-				assistantContent[r.ModelCallID] = r.Content
+			if (isolated && meta.AgentRunID == agentRunID) || (!isolated && !meta.Child) {
+				assistantText[r.ModelCallID] = r.Content
 			}
-			continue
 		}
-		if r.Kind != store.EventToolRequested || r.ModelCallID == "" {
-			continue
-		}
-		var d struct {
-			ToolCallID       string          `json:"tool_call_id"`
-			Name             string          `json:"name"`
-			Arguments        json.RawMessage `json:"arguments"`
-			AgentRunID       string          `json:"agent_run_id"`
-			ReasoningContent string          `json:"reasoning_content"`
-		}
-		if json.Unmarshal(r.Data, &d) != nil || d.ToolCallID == "" || !accept(d.AgentRunID) {
-			continue
-		}
-		groups[r.ModelCallID] = append(groups[r.ModelCallID], replayToolCall{ToolCallID: d.ToolCallID, Name: d.Name, Arguments: d.Arguments, AgentRunID: d.AgentRunID, ReasoningContent: d.ReasoningContent})
-		acceptedIDs[d.ToolCallID] = true
-	}
-	return groups, acceptedIDs, assistantContent
-}
-
-func assistantToolReplay(modelCallID string, calls []replayToolCall, content string, reasoning map[string]string) openai.ChatMessage {
-	toolCalls := make([]openai.ToolCall, 0, len(calls))
-	reason := reasoning[modelCallID]
-	for _, call := range calls {
-		if reason == "" && call.ReasoningContent != "" {
-			reason = call.ReasoningContent
-		}
-		toolCalls = append(toolCalls, openai.ToolCall{ID: call.ToolCallID, Type: "function", Function: openai.ToolFunction{Name: call.Name, Arguments: string(call.Arguments)}})
-	}
-	return openai.ChatMessage{Role: "assistant", Content: content, ReasoningContent: reason, ToolCalls: toolCalls}
-}
-
-func agentRunTimelineMessages(records []store.Record, agentRunID string) []openai.ChatMessage {
-	reasoning := reasoningContentByCall(records)
-	groups, acceptedIDs, assistantContent := collectReplayGroups(records, func(runID string) bool { return runID == agentRunID })
-	firstRequestSeen := map[string]bool{}
-	var out []openai.ChatMessage
-	for _, r := range records {
-		switch r.Kind {
-		case store.EventAssistantMessage:
-			var meta struct {
-				AgentRunID       string `json:"agent_run_id"`
-				ReasoningContent string `json:"reasoning_content"`
-				Child            bool   `json:"child"`
-			}
-			_ = json.Unmarshal(r.Data, &meta)
-			if meta.AgentRunID != agentRunID || meta.Child || len(groups[r.ModelCallID]) > 0 {
-				continue
-			}
-			if meta.ReasoningContent == "" {
-				meta.ReasoningContent = reasoning[r.ModelCallID]
-			}
-			out = append(out, openai.ChatMessage{Role: "assistant", Content: r.Content, ReasoningContent: meta.ReasoningContent})
-		case store.EventToolRequested:
-			if len(groups[r.ModelCallID]) == 0 || firstRequestSeen[r.ModelCallID] {
-				continue
-			}
-			firstRequestSeen[r.ModelCallID] = true
-			out = append(out, assistantToolReplay(r.ModelCallID, groups[r.ModelCallID], assistantContent[r.ModelCallID], reasoning))
-		case store.EventToolCompleted, store.EventToolFailed, store.EventToolRejected, store.EventToolCancelled:
-			var d struct {
+		if r.Kind == store.EventToolCompleted || r.Kind == store.EventToolFailed || r.Kind == store.EventToolRejected || r.Kind == store.EventToolCancelled {
+			var result struct {
 				ToolCallID string          `json:"tool_call_id"`
 				Result     json.RawMessage `json:"result"`
 			}
-			if json.Unmarshal(r.Data, &d) == nil && acceptedIDs[d.ToolCallID] {
-				content := string(d.Result)
-				if content == "" || content == "null" {
-					content = r.Content
-				}
-				out = append(out, openai.ChatMessage{Role: "tool", ToolCallID: d.ToolCallID, Content: content})
+			if json.Unmarshal(r.Data, &result) == nil && result.ToolCallID != "" {
+				results[result.ToolCallID] = string(result.Result)
 			}
 		}
 	}
-	return out
-}
-
-func timelineMessages(records []store.Record, steeringCursor int64, activeAgentRunID string) []openai.ChatMessage {
-	reasoning := reasoningContentByCall(records)
-	groups, acceptedIDs, assistantContent := collectReplayGroups(records, func(runID string) bool { return runID == "" || runID == activeAgentRunID })
-	firstRequestSeen := map[string]bool{}
+	emitted := map[string]bool{}
 	var out []openai.ChatMessage
 	for _, r := range records {
 		switch r.Kind {
 		case store.EventUserMessage:
-			out = append(out, openai.ChatMessage{Role: "user", Content: r.Content})
+			if !isolated {
+				out = append(out, openai.ChatMessage{Role: "user", Content: r.Content})
+			}
 		case store.EventUserSteering:
-			if r.Seq <= steeringCursor {
-				out = append(out, openai.ChatMessage{Role: "user", Content: "[Steering]\n" + r.Content})
+			if !isolated && r.Seq <= steeringCursor {
+				out = append(out, openai.ChatMessage{Role: "user", Content: "[用户最新修改]\n" + r.Content})
 			}
 		case store.EventAssistantMessage:
+			if len(toolGroups[r.ModelCallID]) > 0 {
+				continue
+			}
 			var meta struct {
 				AgentRunID       string `json:"agent_run_id"`
 				Child            bool   `json:"child"`
 				ReasoningContent string `json:"reasoning_content"`
 			}
 			_ = json.Unmarshal(r.Data, &meta)
-			if meta.Child || (meta.AgentRunID != "" && meta.AgentRunID != activeAgentRunID) || len(groups[r.ModelCallID]) > 0 {
+			if (isolated && meta.AgentRunID != agentRunID) || (!isolated && meta.Child) {
 				continue
 			}
 			if meta.ReasoningContent == "" {
@@ -371,22 +342,24 @@ func timelineMessages(records []store.Record, steeringCursor int64, activeAgentR
 			}
 			out = append(out, openai.ChatMessage{Role: "assistant", Content: r.Content, ReasoningContent: meta.ReasoningContent})
 		case store.EventToolRequested:
-			if len(groups[r.ModelCallID]) == 0 || firstRequestSeen[r.ModelCallID] {
+			group := toolGroups[r.ModelCallID]
+			if len(group) == 0 || emitted[r.ModelCallID] {
 				continue
 			}
-			firstRequestSeen[r.ModelCallID] = true
-			out = append(out, assistantToolReplay(r.ModelCallID, groups[r.ModelCallID], assistantContent[r.ModelCallID], reasoning))
-		case store.EventToolCompleted, store.EventToolFailed, store.EventToolRejected, store.EventToolCancelled:
-			var d struct {
-				ToolCallID string          `json:"tool_call_id"`
-				Result     json.RawMessage `json:"result"`
+			emitted[r.ModelCallID] = true
+			calls := make([]openai.ToolCall, 0, len(group))
+			for _, call := range group {
+				calls = append(calls, openai.ToolCall{ID: call.ToolCallID, Type: "function", Function: openai.ToolFunction{Name: call.Name, Arguments: string(call.Arguments)}})
 			}
-			if json.Unmarshal(r.Data, &d) == nil && acceptedIDs[d.ToolCallID] {
-				content := string(d.Result)
-				if content == "" || content == "null" {
-					content = r.Content
+			why := group[0].ReasoningContent
+			if why == "" {
+				why = reasoning[r.ModelCallID]
+			}
+			out = append(out, openai.ChatMessage{Role: "assistant", Content: assistantText[r.ModelCallID], ReasoningContent: why, ToolCalls: calls})
+			for _, call := range group {
+				if result, ok := results[call.ToolCallID]; ok {
+					out = append(out, openai.ChatMessage{Role: "tool", ToolCallID: call.ToolCallID, Content: result})
 				}
-				out = append(out, openai.ChatMessage{Role: "tool", ToolCallID: d.ToolCallID, Content: content})
 			}
 		}
 	}
@@ -403,51 +376,35 @@ func reasoningContentByCall(records []store.Record) map[string]string {
 	return out
 }
 
-func buildInstructionPrompt(kernel string, profile AgentProfile, project, scoped []string, injectAgents bool) string {
+func buildInstructionPrompt(kernel string, profile AgentProfile, project []string) string {
 	var b strings.Builder
-	b.WriteString("<WispInstructions>\n")
-	b.WriteString("<Core>\n")
+	b.WriteString("<RuntimeCore>\n")
 	b.WriteString(strings.TrimSpace(kernel))
-	b.WriteString("\n</Core>\n")
-	b.WriteString(`<RuntimeProtocol>
-Timeline 是持久事实，只有 Tool Result 能证明真实副作用。Runtime 允许把互不依赖的只读 ToolCall 批量执行；有副作用或互相依赖的 ToolCall 会被串行化。每个 Tool 批次后 Runtime 会处理 steering/pause/stop/approval。不要伪造 Tool Result、Approval、Artifact 或已完成状态。
-</RuntimeProtocol>`)
+	b.WriteString("\n</RuntimeCore>\n")
+	b.WriteString(`<RuntimeSafety>用户的最新明确修改优先于 Plan 和项目指令，但不能跳过文件写入、命令执行等真实权限检查。Runtime 独占阶段迁移、批准与 Checkpoint；工具结果才是真实副作用。一次最多四个独立只读 ToolCall；跨依赖动作等待结果。禁止用 Tool 维护阶段。</RuntimeSafety>`)
 	b.WriteByte('\n')
-	if injectAgents && len(project) > 0 {
-		b.WriteString("<ProjectInstructions source=\"AGENTS.md\">\n")
-		for _, value := range project {
-			b.WriteString(strings.TrimSpace(value))
-			b.WriteByte('\n')
-		}
-		b.WriteString("</ProjectInstructions>\n")
+	for i, value := range project {
+		fmt.Fprintf(&b, "<ProjectInstructions source=\"AGENTS.md\" index=\"%d\">\n%s\n</ProjectInstructions>\n", i+1, strings.TrimSpace(value))
 	}
-	if len(scoped) > 0 {
-		b.WriteString("<ScopedProjectInstructions>\n")
-		for i, value := range scoped {
-			fmt.Fprintf(&b, "[Scoped %d]\n%s\n", i+1, strings.TrimSpace(value))
-		}
-		b.WriteString("</ScopedProjectInstructions>\n")
-	}
-	fmt.Fprintf(&b, "<AgentProfile id=\"%s\">\n%s\n</AgentProfile>\n", profile.ID, strings.TrimSpace(profile.Prompt))
-	b.WriteString("</WispInstructions>")
+	fmt.Fprintf(&b, "<AgentProfile id=\"%s\">\n%s\n</AgentProfile>", profile.ID, strings.TrimSpace(profile.Prompt))
 	return b.String()
 }
 
 func buildStatePrompt(turn *store.Turn, policy ContextPolicy, checkpoint *store.Checkpoint, artifacts []store.Artifact, childRuns []store.AgentRun, activeAgentRunID string) string {
 	var body strings.Builder
 	if turn.CurrentObjective != "" && policy.IncludeObjective {
-		body.WriteString("<CurrentObjective>\n")
+		body.WriteString("<CurrentObjective source=\"active-plan-or-user-request\">\n")
 		body.WriteString(turn.CurrentObjective)
 		body.WriteString("\n</CurrentObjective>\n")
 		if len(turn.UserDecisions) > 0 {
-			body.WriteString("<UserDecisions precedence=\"latest-wins\">\n")
-			for i, decision := range turn.UserDecisions {
-				fmt.Fprintf(&body, "%d. %s\n", i+1, strings.TrimSpace(decision))
+			body.WriteString("<UserOverrides priority=\"above-plan-and-project-instructions\">\n")
+			for _, text := range turn.UserDecisions {
+				body.WriteString("- " + text + "\n")
 			}
-			body.WriteString("</UserDecisions>\n")
+			body.WriteString("</UserOverrides>\n")
 		}
-		fmt.Fprintf(&body, "<TaskPolicy complexity=\"%s\" reconnaissance=\"%t\" />\n", turn.TaskComplexity, turn.AllowReconnaissance)
 	}
+	fmt.Fprintf(&body, "<Execution mode=\"%s\" stage=\"%s\"/>\n", turn.TaskMode, turn.Stage)
 	if checkpoint != nil {
 		fmt.Fprintf(&body, "<Checkpoint kind=\"%s\">\n<Summary>\n%s\n</Summary>\n<Facts>\n%s\n</Facts>\n</Checkpoint>\n", checkpoint.Kind, checkpoint.Summary, string(checkpoint.Facts))
 	}
@@ -465,7 +422,11 @@ func buildStatePrompt(turn *store.Turn, policy ContextPolicy, checkpoint *store.
 			if active == nil {
 				continue
 			}
-			fmt.Fprintf(&body, "<Artifact type=\"%s\" name=\"%s\" version=\"%d\">\n%s\n<Data>%s</Data>\n</Artifact>\n", artifact.Type, artifact.Name, active.Version, active.Content, string(active.Data))
+			if artifact.Type == "plan" && artifact.Name == "active" {
+				fmt.Fprintf(&body, "<ActivePlan version=\"%d\" source=\"CurrentObjective\"/>\n", active.Version)
+			} else {
+				fmt.Fprintf(&body, "<Artifact type=\"%s\" name=\"%s\" version=\"%d\">\n%s\n<Data>%s</Data>\n</Artifact>\n", artifact.Type, artifact.Name, active.Version, active.Content, string(active.Data))
+			}
 		}
 		body.WriteString("</Artifacts>\n")
 	}
@@ -485,48 +446,6 @@ func buildStatePrompt(turn *store.Turn, policy ContextPolicy, checkpoint *store.
 		return ""
 	}
 	return "<WispState>\n" + strings.TrimSpace(body.String()) + "\n</WispState>"
-}
-
-func defaultTrigger(trigger, profile string) string {
-	if strings.TrimSpace(trigger) != "" {
-		return strings.TrimSpace(trigger)
-	}
-	switch profile {
-	case "plan":
-		return "生成或修订执行计划"
-	case "build":
-		return "执行 Active Plan"
-	case "explore":
-		return "定向只读调查"
-	case "explain":
-		return "解释待审批操作"
-	default:
-		return "Runtime Action Loop"
-	}
-}
-
-func promptLayers(kernel string, profile AgentProfile, project []string, statePrompt string, injectAgents bool) []map[string]any {
-	layers := []map[string]any{
-		{"id": "core", "label": "Core", "chars": len(kernel), "summary": "全局决策优先级、交互和工具规则"},
-		{"id": "runtime", "label": "Runtime Protocol", "summary": "Tool Result / approval / safe-point 协议"},
-	}
-	chars := 0
-	for _, item := range project {
-		chars += len(item)
-	}
-	projectSummary := "用户已关闭注入"
-	if injectAgents && len(project) == 0 {
-		projectSummary = "已启用，但根目录未发现可读取的 AGENTS.md"
-	}
-	if injectAgents && len(project) > 0 {
-		projectSummary = "已注入的项目说明"
-	}
-	layers = append(layers, map[string]any{"id": "project", "label": "AGENTS.md", "chars": chars, "enabled": injectAgents && len(project) > 0, "summary": projectSummary})
-	layers = append(layers,
-		map[string]any{"id": "agent", "label": "Agent Profile", "chars": len(profile.Prompt), "summary": profile.DisplayName},
-		map[string]any{"id": "state", "label": "Current State", "chars": len(statePrompt), "summary": "Current Objective / Plan / Checkpoint / Artifact"},
-	)
-	return layers
 }
 
 func promptLayout(prefix, messages []openai.ChatMessage, tools []openai.ToolDefinition) map[string]any {

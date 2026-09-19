@@ -10,17 +10,14 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"wisp/internal/config"
 )
 
 type Client struct {
-	cfg    *config.OpenAIConfig
 	client *http.Client
 }
 
-func NewClient(cfg *config.OpenAIConfig) *Client {
-	sec := cfg.TimeoutSec
+func NewClient(timeoutSec int) *Client {
+	sec := timeoutSec
 	if sec <= 0 {
 		sec = 120
 	}
@@ -32,7 +29,7 @@ func NewClient(cfg *config.OpenAIConfig) *Client {
 		IdleConnTimeout:       90 * time.Second,
 		ForceAttemptHTTP2:     true,
 	}
-	return &Client{cfg: cfg, client: &http.Client{Transport: transport}}
+	return &Client{client: &http.Client{Transport: transport}}
 }
 
 type ChatMessage struct {
@@ -83,10 +80,6 @@ type ThinkingConfig struct {
 }
 type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
-}
-
-func (c *Client) BuildRequest(baseURL, apiKey, model, thinkingStyle, thinkingLevel string, messages []ChatMessage) (*http.Request, error) {
-	return c.BuildRequestWithTools(baseURL, apiKey, model, thinkingStyle, thinkingLevel, messages, nil)
 }
 
 // BuildRequestWithTools 构造 OpenAI Chat Completions 兼容请求，并在需要时附带工具定义。

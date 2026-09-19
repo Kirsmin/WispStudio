@@ -2,9 +2,9 @@
   <div v-if="turn || canRestore || completedTurns.length" class="runtime-controls">
     <div v-if="turn" class="turn-state">
       <span class="dot" :class="turn.status" />
-      <span>{{ turn.active_agent || 'agent' }}</span>
+      <span>{{ stageLabel }}</span>
       <span class="muted">{{ turn.status }}</span>
-      <span class="muted">epoch {{ turn.context_epoch }}</span>
+      <span v-if="turn.task_mode === 'complex'" class="muted">复杂任务</span>
     </div>
     <div class="buttons">
       <n-button v-if="caps.can_start_build" size="tiny" type="primary" :loading="pending === 'start-build'" @click="run(chatStore.startBuild)">开始执行</n-button>
@@ -29,6 +29,7 @@ const chatStore = useChatStore()
 const turn = computed(() => chatStore.runtimeState.turn)
 const caps = computed(() => chatStore.capabilities)
 const pending = computed(() => chatStore.runtimeActionPending)
+const stageLabel = computed(() => ({ plan: '规划', build: '执行', verify: '验证', complete: '完成' }[turn.value?.stage || 'plan'] || '运行中'))
 const canRestore = computed(() => chatStore.runtimeState.can_restore_fold)
 const completedTurns = computed(() => chatStore.runtimeState.turns.filter(item => item.status === 'completed'))
 const foldOptions = computed(() => completedTurns.value.map(item => ({ label: `Turn ${item.turn_index}: ${item.objective || item.id}`, key: item.id })))

@@ -3,20 +3,6 @@ import { defineStore } from 'pinia'
 import { useConnectionStore } from './connection'
 import { useSessionsStore } from './sessions'
 
-export interface ChatMessage {
-  id: string
-  type: 'user' | 'assistant'
-  content: string
-  reasoning?: string
-  phase?: 'waiting' | 'reasoning' | 'answer' | 'done' | 'error'
-  streaming?: boolean
-  error?: string
-  usage?: Record<string, number>
-  model?: string
-  duration_ms?: number
-  ttft_ms?: number
-}
-
 export interface TimelineRecord {
   id: string
   session_id: string
@@ -37,9 +23,8 @@ export interface TurnState {
   status: string
   objective: string
   current_objective?: string
-  user_decisions?: string[]
-  task_complexity?: 'trivial' | 'standard' | 'complex'
-  allow_reconnaissance?: boolean
+  task_mode?: string
+  stage?: string
   active_agent: string
   context_epoch: number
   active_agent_run_id?: string
@@ -74,7 +59,6 @@ export interface Approval {
   tool_name: string
   args: Record<string, any>
   risk: string
-  risk_class?: string
   status: string
 }
 export interface AgentRun {
@@ -113,8 +97,6 @@ export interface StreamingModel {
   model?: string
   reasoning: string
   content: string
-  toolNames: string[]
-  toolFragments: Record<string, string>
   phase: 'waiting' | 'reasoning' | 'answer' | 'done' | 'error'
   usage?: Record<string, number>
   error?: string
@@ -160,6 +142,10 @@ export const useChatStore = defineStore('chat', () => {
   const runtimeState = ref<RuntimeState>({ turn: null, turns: [], execution: { active: false }, capabilities: {}, artifacts: [], approvals: [], agent_runs: [], can_restore_fold: false })
   const streamingModel = ref<StreamingModel | null>(null)
   const inputText = ref('')
+  const newSessionAgents = ref(false)
+  const agentsEnabled = computed(() => sessionsStore.currentSessionId
+    ? Boolean(sessionsStore.sessions.find(session => session.id === sessionsStore.currentSessionId)?.agents_enabled)
+    : newSessionAgents.value)
   const isStreaming = ref(false)
   const sendingSteering = ref(false)
   const backgroundGenerating = ref(false)
@@ -292,29 +278,21 @@ export const useChatStore = defineStore('chat', () => {
         const record = payload.record
         if (record?.id) upsertRecord(normalizeRecord(record))
       } else if (event.event === 'model.start') {
-        streamingModel.value = reactive<StreamingModel>({ callId: String(payload.call_id || ''), agentRunId: payload.agent_run_id, profileId: payload.profile_id, model: payload.model, reasoning: '', content: '', toolNames: [], toolFragments: {}, phase: 'waiting' })
+        streamingModel.value = reactive<StreamingModel>({ callId: String(payload.call_id || ''), agentRunId: payload.agent_run_id, profileId: payload.profile_id, model: payload.model, reasoning: '', content: '', phase: 'waiting' })
         runtimeState.value.execution = { active: true, turn_id: String(payload.turn_id || runtimeState.value.turn?.id || '') }
         if (runtimeState.value.turn && payload.profile_id) {
           runtimeState.value.turn.active_agent = String(payload.profile_id)
           runtimeState.value.turn.status = 'running'
         }
       } else if (event.event === 'reasoning') {
-        // Reasoning 由后端完整持久化并可在 Trace Debug 中查看；主聊天只保留“正在思考”的状态信号，避免隐藏 token 持续触发 Vue 重渲染。
-        if (streamingModel.value) { if (!streamingModel.value.reasoning) streamingModel.value.reasoning = '…'; if (!streamingModel.value.content) streamingModel.value.phase = 'reasoning' }
+        if (streamingModel.value) { streamingModel.value.reasoning += String(payload.text || ''); if (!streamingModel.value.content) streamingModel.value.phase = 'reasoning' }
       } else if (event.event === 'delta') {
         if (streamingModel.value) { streamingModel.value.content += String(payload.text || ''); streamingModel.value.phase = 'answer' }
-      } else if (event.event === 'tool.delta') {
-        if (streamingModel.value) {
-          const index = String(Number(payload.index || 0))
-          const fragment = String(payload.name || '')
-          if (fragment) streamingModel.value.toolFragments[index] = (streamingModel.value.toolFragments[index] || '') + fragment
-          streamingModel.value.toolNames = Object.keys(streamingModel.value.toolFragments).sort((a, b) => Number(a) - Number(b)).map(key => streamingModel.value!.toolFragments[key]).filter(Boolean)
-          if (streamingModel.value.toolNames.length) streamingModel.value.content = ''
-        }
       } else if (event.event === 'usage') {
         if (streamingModel.value) streamingModel.value.usage = payload as Record<string, number>
       } else if (event.event === 'model.done') {
-        if (streamingModel.value) { streamingModel.value.phase = payload.error ? 'error' : 'done'; streamingModel.value.error = payload.error ? String(payload.error) : undefined }
+        if (payload.has_tool_calls) streamingModel.value = null
+        else if (streamingModel.value) { streamingModel.value.phase = payload.error ? 'error' : 'done'; streamingModel.value.error = payload.error ? String(payload.error) : undefined }
         scheduleLiveRefresh(sessionId, 60)
       } else if (event.event.startsWith('tool.') || event.event.startsWith('approval.')) {
         scheduleLiveRefresh(sessionId)
@@ -337,7 +315,9 @@ export const useChatStore = defineStore('chat', () => {
     if (!text || !connectionStore.isConnected || !selectedModel.value) return
     ensureSelection()
     if (!sessionsStore.currentSessionId) {
-      const session = await sessionsStore.createPersistedSession(text.slice(0, 20)); applySessionSelection(session.id)
+      const session = await sessionsStore.createPersistedSession(text.slice(0, 20))
+      if (newSessionAgents.value) await sessionsStore.setAgentsEnabled(session.id, true)
+      applySessionSelection(session.id)
     }
     const sessionId = sessionsStore.currentSessionId; if (!sessionId) return
     inputText.value = ''
@@ -417,8 +397,14 @@ export const useChatStore = defineStore('chat', () => {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
-  async function decideApproval(id: string, decision: 'approve' | 'reject', scope: 'once' | 'phase' | 'turn' = 'once') {
-    const response = await fetch(connectionStore.api(`/api/approvals/${encodeURIComponent(id)}/${decision}`), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scope, provider: selectedProvider.value, model: selectedModel.value, thinking: selectedThinking.value }) })
+  async function toggleAgents(enabled: boolean) {
+    const sessionId = sessionsStore.currentSessionId
+    if (!sessionId) { newSessionAgents.value = enabled; return }
+    await sessionsStore.setAgentsEnabled(sessionId, enabled)
+    // 配置变更立即写入 Session；后续模型调用从数据库读取最新值。
+  }
+  async function decideApproval(id: string, decision: 'approve' | 'reject', scope: 'once' | 'turn' = 'once') {
+    const response = await fetch(connectionStore.api(`/api/approvals/${encodeURIComponent(id)}/${decision}`), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: selectedProvider.value, model: selectedModel.value, thinking: selectedThinking.value, scope }) })
     if (!response.ok) throw new Error(await readHTTPError(response, '处理 Approval 失败'))
     if (sessionsStore.currentSessionId) await refreshAll(sessionsStore.currentSessionId)
   }
@@ -473,7 +459,7 @@ export const useChatStore = defineStore('chat', () => {
   return {
     timeline, runtimeState, streamingModel, input: inputText, inputText, isStreaming, isBusy, executionActive, sendingSteering, backgroundGenerating, runtimeActionPending, notice,
     selectedProvider, selectedModel, selectedThinking, thinkingOptions, capabilities,
-    loadTimeline, loadRuntime, refreshAll, refreshRunStatus, sendMessage, stopStream, stopGeneration, hardCancel,
+    loadTimeline, loadRuntime, refreshAll, refreshRunStatus, sendMessage, stopStream, stopGeneration, hardCancel, toggleAgents, agentsEnabled, newSessionAgents,
     pauseTurn, resumeTurn, stopTurn, startBuild, decideApproval, challengeApproval, activateArtifact, foldTurn, restoreFold, loadAgentTimeline, exportSession,
     openSession, newConversation,
   }

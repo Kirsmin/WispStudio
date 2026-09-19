@@ -69,6 +69,12 @@ func (s *Store) CreateArtifactVersion(sessionID, turnID, artifactType, name, con
 	if _, err := tx.Exec(`UPDATE artifacts SET active_version=?,updated_at=? WHERE id=?`, next, now, artifact.ID); err != nil {
 		return nil, nil, err
 	}
+	// Active Plan 和有效目标必须在同一事务中更新，避免 Build 看到半更新状态。
+	if artifactType == "plan" && name == "active" {
+		if _, err := tx.Exec(`UPDATE turns SET current_objective=?,user_decisions_json='[]' WHERE id=?`, content, turnID); err != nil {
+			return nil, nil, err
+		}
+	}
 	artifact.ActiveVersion = next
 	artifact.UpdatedAt = now
 	if err := tx.Commit(); err != nil {
@@ -108,6 +114,15 @@ func (s *Store) ActivateArtifactVersion(artifactID string, version int) error {
 	}
 	if _, err := tx.Exec(`UPDATE artifacts SET active_version=?,updated_at=? WHERE id=?`, version, stamp(time.Now().UTC()), artifactID); err != nil {
 		return err
+	}
+	if artifactType == "plan" && name == "active" {
+		var content string
+		if err := tx.QueryRow(`SELECT content FROM artifact_versions WHERE artifact_id=? AND version=?`, artifactID, version).Scan(&content); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE turns SET current_objective=?,user_decisions_json='[]' WHERE id=?`, content, turnID); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err

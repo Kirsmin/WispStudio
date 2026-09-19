@@ -11,10 +11,10 @@
         <div class="messages-inner">
           <div v-if="timeline.length === 0 && !streamingModel" class="empty-chat">
             <div class="empty-title">开始一个任务</div>
-            <div class="empty-sub">小任务直接规划，复杂任务才会展开代码库调查</div>
+            <div class="empty-sub">Wisp 会先规划，再由你决定是否开始执行</div>
           </div>
           <template v-for="item in displayTimeline" :key="item.key">
-            <ExecutionBlock v-if="item.type === 'execution'" :groups="item.groups" />
+            <ExecutionGroup v-if="item.type === 'execution'" :records="item.records" :complete="item.complete" />
             <TimelineItem v-else :record="item.record" />
           </template>
           <StreamingBlock v-if="streamingModel" :stream="streamingModel" />
@@ -38,10 +38,10 @@ import { useChatStore } from '../stores/chat'
 import type { TimelineRecord } from '../stores/chat'
 import { useSessionsStore } from '../stores/sessions'
 import Composer from './Composer.vue'
-import ExecutionBlock from './ExecutionBlock.vue'
 import RuntimeControls from './RuntimeControls.vue'
 import StreamingBlock from './StreamingBlock.vue'
 import TimelineItem from './TimelineItem.vue'
+import ExecutionGroup from './ExecutionGroup.vue'
 
 const connectionStore = useConnectionStore()
 const chatStore = useChatStore()
@@ -50,77 +50,100 @@ const { isConnected } = storeToRefs(connectionStore)
 const { timeline, streamingModel, backgroundGenerating } = storeToRefs(chatStore)
 const { currentSessionId } = storeToRefs(sessionsStore)
 const messagesRef = ref<HTMLDivElement | null>(null)
-
 type DisplayTimelineItem =
   | { type: 'record'; key: string; record: TimelineRecord }
-  | { type: 'execution'; key: string; groups: TimelineRecord[][] }
+  | { type: 'execution'; key: string; records: TimelineRecord[]; complete: boolean }
 
-function isInternal(record: TimelineRecord, toolModelCalls: Set<string>): boolean {
-  const kind = record.kind
-  if (kind === 'model.reasoning' || kind.startsWith('checkpoint.') || kind.startsWith('context.')) return true
-  if (kind === 'runtime.status' || kind === 'runtime.command' || kind === 'approval.decided') return true
-  if (kind.startsWith('agent.')) return true
-  if (kind === 'artifact.created') {
-    const type = String(record.data?.type || '')
-    return type !== 'plan'
-  }
-  if (kind.startsWith('artifact.')) return true
-  if (kind === 'assistant.message' && record.model_call_id && toolModelCalls.has(record.model_call_id) && !record.data?.runtime_generated) return true
-  if (kind === 'approval.requested') {
-    const id = String(record.data?.id || record.data?.approval_id || '')
-    const callId = String(record.data?.tool_call_id || '')
-    const approval = chatStore.runtimeState.approvals.find(item => item.id === id || item.tool_call_id === callId)
-    return Boolean(approval && approval.status !== 'pending')
-  }
-  return false
-}
-
+// 主聊天只呈现用户、真实回复、Active Plan、待审批和折叠执行过程。
+// reasoning / runtime / checkpoint / Context 等低层事件仅在调试抽屉读取。
 const displayTimeline = computed<DisplayTimelineItem[]>(() => {
   const items: DisplayTimelineItem[] = []
-  const toolModelCalls = new Set(timeline.value.filter(r => r.kind === 'tool.requested' && r.model_call_id).map(r => String(r.model_call_id)))
-  let execution: Extract<DisplayTimelineItem, { type: 'execution' }> | null = null
-  const toolGroups = new Map<string, TimelineRecord[]>()
-  const flushExecution = () => {
-    if (execution && execution.groups.length) items.push(execution)
-    execution = null; toolGroups.clear()
-  }
+  const toolModels = new Set(timeline.value.filter(record => record.kind === 'tool.requested').map(record => record.model_call_id))
+  const terminal = new Set(chatStore.runtimeState.turns.filter(turn =>
+    ['completed', 'failed', 'stopped', 'cancelled'].includes(turn.status)).map(turn => turn.id))
+  let group: Extract<DisplayTimelineItem, { type: 'execution' }> | null = null
   for (const record of timeline.value) {
-    if (record.kind.startsWith('tool.')) {
-      const callID = String(record.data?.tool_call_id || '')
-      if (!callID) continue
-      if (!execution) execution = { type: 'execution', key: `execution:${record.turn_id || ''}:${record.seq}`, groups: [] }
-      let group = toolGroups.get(callID)
-      if (!group) { group = []; toolGroups.set(callID, group); execution.groups.push(group) }
-      group.push(record)
+    const kind = record.kind
+    if (kind === 'user.message' || kind === 'user.steering') {
+      group = null
+      items.push({ type: 'record', key: record.id, record })
       continue
     }
-    if (isInternal(record, toolModelCalls)) continue
-    flushExecution()
-    items.push({ type: 'record', key: record.id, record })
+    if (kind.startsWith('tool.')) {
+      if (!group || !group.key.startsWith(`execution:${record.turn_id || ''}:`)) {
+        // 一个连续执行窗口只对应一个折叠卡片；不为 requested/started/result 分别创建节点。
+        group = { type: 'execution', key: `execution:${record.turn_id || ''}:${record.seq}`, records: [], complete: false }
+        items.push(group)
+      }
+      group.records.push(record)
+      group.complete = terminal.has(record.turn_id || '')
+      continue
+    }
+    if (kind === 'assistant.message') {
+      if (!record.content?.trim() || toolModels.has(record.model_call_id)) continue
+      group = null
+      items.push({ type: 'record', key: record.id, record })
+      continue
+    }
+    if (kind === 'artifact.version_created' && record.data?.type === 'plan') {
+      const artifact = chatStore.runtimeState.artifacts.find(item => item.id === record.data?.artifact_id)
+      if (artifact?.active_version === Number(record.data?.version)) {
+        group = null
+        items.push({ type: 'record', key: record.id, record })
+      }
+      continue
+    }
+    if (kind === 'approval.requested') {
+      const approval = chatStore.runtimeState.approvals.find(item => item.id === record.data?.id)
+      if (approval?.status === 'pending') {
+        group = null
+        items.push({ type: 'record', key: record.id, record })
+      }
+      continue
+    }
+    if (kind === 'runtime.error') {
+      group = null
+      items.push({ type: 'record', key: record.id, record })
+    }
   }
-  flushExecution()
   return items
 })
-
 let stickToBottom = true
 let scrollFrame = 0
+
 function openConnectDialog() { connectionStore.showConnectDialog = true }
-function handleScroll() { const element = messagesRef.value; if (element) stickToBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 120 }
-async function scrollToBottomIfNeeded() { if (!stickToBottom) return; await nextTick(); const element = messagesRef.value; if (element) element.scrollTop = element.scrollHeight }
-function queueScrollToBottom() { if (!stickToBottom) return; if (scrollFrame) cancelAnimationFrame(scrollFrame); scrollFrame = requestAnimationFrame(() => { scrollFrame = 0; void scrollToBottomIfNeeded() }) }
+function handleScroll() {
+  const element = messagesRef.value; if (!element) return
+  stickToBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 120
+}
+async function scrollToBottomIfNeeded() {
+  if (!stickToBottom) return
+  await nextTick(); const element = messagesRef.value; if (element) element.scrollTop = element.scrollHeight
+}
+function queueScrollToBottom() {
+  if (!stickToBottom) return
+  if (scrollFrame) cancelAnimationFrame(scrollFrame)
+  scrollFrame = requestAnimationFrame(() => { scrollFrame = 0; void scrollToBottomIfNeeded() })
+}
 watch(currentSessionId, () => { stickToBottom = true })
-watch(() => [timeline.value.length, timeline.value[timeline.value.length - 1]?.seq || 0, streamingModel.value?.content.length || 0], queueScrollToBottom, { flush: 'post' })
+watch(() => [timeline.value.length, timeline.value[timeline.value.length - 1]?.seq || 0, streamingModel.value?.content.length || 0, streamingModel.value?.reasoning.length || 0], queueScrollToBottom, { flush: 'post' })
 onBeforeUnmount(() => { if (scrollFrame) cancelAnimationFrame(scrollFrame) })
 </script>
 
 <style scoped>
 .chat-area { flex: 1; display: flex; flex-direction: column; background: var(--bg); overflow: hidden; min-width: 0; }
 .not-connected { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
-.welcome-icon { font-size: 32px; color: var(--accent); line-height: 1; }.welcome-title { font-size: 26px; font-weight: 600; color: var(--text); }
-.not-connected-text { font-size: 14px; color: var(--text-2); margin-bottom: 8px; }.connect-btn { min-width: 132px; font-weight: 500; }
-.empty-chat { padding: 72px 0 40px; text-align: center; }.empty-title { font-size: 18px; font-weight: 600; color: var(--text); margin-bottom: 6px; }.empty-sub { font-size: 13px; color: var(--text-2); }
+.welcome-icon { font-size: 32px; color: var(--accent); line-height: 1; }
+.welcome-title { font-size: 26px; font-weight: 600; color: var(--text); }
+.not-connected-text { font-size: 14px; color: var(--text-2); margin-bottom: 8px; }
+.connect-btn { min-width: 132px; font-weight: 500; }
+.empty-chat { padding: 72px 0 40px; text-align: center; }
+.empty-title { font-size: 18px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+.empty-sub { font-size: 13px; color: var(--text-2); }
 .messages { flex: 1; overflow-y: auto; padding: 22px 20px 8px; overscroll-behavior: contain; scrollbar-gutter: stable; }
-.messages-inner { max-width: 780px; margin: 0 auto; }.messages-inner :deep(.timeline-item), .messages-inner :deep(.execution) { content-visibility: auto; contain-intrinsic-size: 90px; }
-.background-note { margin: 6px 0 16px; color: var(--text-3); font-size: 12px; display: flex; align-items: center; gap: 7px; }.background-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+.messages-inner { max-width: 780px; margin: 0 auto; }
+.messages-inner :deep(.timeline-item), .messages-inner :deep(.tool-block) { content-visibility: auto; contain-intrinsic-size: 90px; }
+.background-note { margin: 6px 0 16px; color: var(--text-3); font-size: 12px; display: flex; align-items: center; gap: 7px; }
+.background-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
 </style>

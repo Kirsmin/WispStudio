@@ -11,10 +11,7 @@ import (
 	"wisp/internal/store"
 )
 
-const (
-	primaryConfig = "config.toml.local"
-	legacyConfig  = "config.toml"
-)
+const primaryConfig = "config.toml.local"
 
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
@@ -24,9 +21,6 @@ func fileExists(path string) bool {
 func resolveConfigPath() string {
 	if fileExists(primaryConfig) {
 		return primaryConfig
-	}
-	if fileExists(legacyConfig) {
-		return legacyConfig
 	}
 	return ""
 }
