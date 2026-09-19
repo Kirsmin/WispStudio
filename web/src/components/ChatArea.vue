@@ -100,7 +100,7 @@ watch([timeline, streamingModel], () => { void scrollToBottomIfNeeded() }, { dee
 .empty-title { font-size: 18px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
 .empty-sub { font-size: 13px; color: var(--text-2); }
 .messages { flex: 1; overflow-y: auto; padding: 24px 20px 8px; }
-.messages-inner { max-width: 760px; margin: 0 auto; }
+.messages-inner { max-width: 840px; margin: 0 auto; }
 .background-note { margin: 6px 0 16px; color: var(--text-3); font-size: 12px; display: flex; align-items: center; gap: 7px; }
 .background-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }

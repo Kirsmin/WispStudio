@@ -241,65 +241,211 @@ func (c *ContextCompiler) previousTurnProjection(current *store.Turn) ([]openai.
 			}
 			continue
 		}
-		for _, r := range byTurn[turn.ID] {
-			switch r.Kind {
-			case store.EventUserMessage, store.EventUserSteering:
-				out = append(out, openai.ChatMessage{Role: "user", Content: r.Content})
-			case store.EventAssistantMessage:
-				var meta struct {
-					Child bool `json:"child"`
-				}
-				_ = json.Unmarshal(r.Data, &meta)
-				if !meta.Child {
-					out = append(out, openai.ChatMessage{Role: "assistant", Content: r.Content})
-				}
-			}
-		}
+
+		// 非 Fold 的历史 Turn 保留真实 Tool 对话，而不是只投影 user/assistant 文本。
+		// DeepSeek 思考模式在请求携带 tools 时要求把历史 assistant 的
+		// reasoning_content 原样回传；完整投影也能保证 reasoning/tool_calls/tool
+		// 三者仍然处于同一协议序列中。
+		// activeAgentRunID 传空表示历史 Turn：保留所有非 Child 的顶层 Agent 调用，
+		// 包括 Plan -> Build transition 后产生的新顶层 AgentRun。
+		out = append(out, timelineMessages(byTurn[turn.ID], turn.SteeringCursor, "")...)
 	}
 	return out, nil
 }
 
-func agentRunTimelineMessages(records []store.Record, agentRunID string) []openai.ChatMessage {
-	toolCalls := map[string]bool{}
+type replayToolRequest struct {
+	ToolCallID string          `json:"tool_call_id"`
+	Name       string          `json:"name"`
+	Arguments  json.RawMessage `json:"arguments"`
+	AgentRunID string          `json:"agent_run_id"`
+}
+
+type replayModelMeta struct {
+	AgentRunID string `json:"agent_run_id"`
+	Child      bool   `json:"child"`
+}
+
+type replayModelCall struct {
+	Content   string
+	Reasoning string
+	ToolCalls []openai.ToolCall
+}
+
+type replayState struct {
+	Calls              map[string]*replayModelCall
+	IncludedModelCalls map[string]bool
+	ToolCallModel      map[string]string
+	ToolCallIDs        map[string]bool
+}
+
+func buildReplayState(records []store.Record, includeModel func(store.Record) bool, includeTool func(replayToolRequest) bool) replayState {
+	state := replayState{
+		Calls:              map[string]*replayModelCall{},
+		IncludedModelCalls: map[string]bool{},
+		ToolCallModel:      map[string]string{},
+		ToolCallIDs:        map[string]bool{},
+	}
+	ensure := func(id string) *replayModelCall {
+		call := state.Calls[id]
+		if call == nil {
+			call = &replayModelCall{}
+			state.Calls[id] = call
+		}
+		return call
+	}
+
+	// 先收集模型文本与 reasoning，再收集 ToolCall。这样即使 Timeline 中
+	// assistant.message 位于 tool.requested 之前，也能在回放时还原为同一条消息。
 	for _, r := range records {
+		if r.ModelCallID == "" || !includeModel(r) {
+			continue
+		}
+		if r.Kind != store.EventModelReasoning && r.Kind != store.EventAssistantMessage {
+			continue
+		}
+		state.IncludedModelCalls[r.ModelCallID] = true
+		switch r.Kind {
+		case store.EventModelReasoning:
+			ensure(r.ModelCallID).Reasoning += r.Content
+		case store.EventAssistantMessage:
+			ensure(r.ModelCallID).Content += r.Content
+		}
+	}
+	for i, r := range records {
 		if r.Kind != store.EventToolRequested {
 			continue
 		}
-		var d struct {
-			ToolCallID string `json:"tool_call_id"`
-			AgentRunID string `json:"agent_run_id"`
+		d, ok := parseReplayToolRequest(r)
+		if !ok || d.ToolCallID == "" {
+			continue
 		}
-		if json.Unmarshal(r.Data, &d) == nil && d.AgentRunID == agentRunID {
-			toolCalls[d.ToolCallID] = true
+		modelCallID := r.ModelCallID
+		if modelCallID == "" {
+			modelCallID = inferToolModelCallID(records, i, includeModel)
+		}
+		// 若能关联到一个已确认属于当前投影的 model_call，就以 model_call 为准。
+		// 这能正确保留 Plan -> Build transition 后的顶层 ToolCall，同时排除
+		// Explorer/Explain 等 Child Agent 的 ToolCall。无法关联时才退回 agent_run_id。
+		if modelCallID == "" || !state.IncludedModelCalls[modelCallID] {
+			if !includeTool(d) {
+				continue
+			}
+		}
+		state.ToolCallIDs[d.ToolCallID] = true
+		state.ToolCallModel[d.ToolCallID] = modelCallID
+		if modelCallID != "" {
+			ensure(modelCallID).ToolCalls = append(ensure(modelCallID).ToolCalls, openai.ToolCall{
+				ID: d.ToolCallID, Type: "function",
+				Function: openai.ToolFunction{Name: d.Name, Arguments: string(d.Arguments)},
+			})
 		}
 	}
+	return state
+}
+
+func inferToolModelCallID(records []store.Record, index int, includeModel func(store.Record) bool) string {
+	for i := index - 1; i >= 0; i-- {
+		r := records[i]
+		if (r.Kind == store.EventAssistantMessage || r.Kind == store.EventModelReasoning) && r.ModelCallID != "" && includeModel(r) {
+			return r.ModelCallID
+		}
+		// 一次新的 Tool 请求若前面已经跨过上一轮 Tool 结果或新的用户输入，
+		// 就不能再把更早的 model_call_id 猜到当前请求上。
+		if isTerminalToolRecord(r.Kind) || r.Kind == store.EventToolRequested || r.Kind == store.EventUserMessage || r.Kind == store.EventUserSteering {
+			break
+		}
+	}
+	return ""
+}
+
+func parseReplayToolRequest(r store.Record) (replayToolRequest, bool) {
+	var d replayToolRequest
+	if json.Unmarshal(r.Data, &d) != nil {
+		return d, false
+	}
+	return d, true
+}
+
+func parseReplayModelMeta(r store.Record) replayModelMeta {
+	var meta replayModelMeta
+	_ = json.Unmarshal(r.Data, &meta)
+	return meta
+}
+
+func isTerminalToolRecord(kind string) bool {
+	return kind == store.EventToolCompleted || kind == store.EventToolFailed || kind == store.EventToolRejected || kind == store.EventToolCancelled
+}
+
+func replayAssistantMessage(call *replayModelCall) openai.ChatMessage {
+	if call == nil {
+		return openai.ChatMessage{Role: "assistant"}
+	}
+	return openai.ChatMessage{
+		Role:             "assistant",
+		Content:          call.Content,
+		ReasoningContent: call.Reasoning,
+		ToolCalls:        append([]openai.ToolCall(nil), call.ToolCalls...),
+	}
+}
+
+func agentRunTimelineMessages(records []store.Record, agentRunID string) []openai.ChatMessage {
+	includeModel := func(r store.Record) bool {
+		meta := parseReplayModelMeta(r)
+		return meta.AgentRunID == agentRunID
+	}
+	includeTool := func(d replayToolRequest) bool { return d.AgentRunID == agentRunID }
+	state := buildReplayState(records, includeModel, includeTool)
+	emittedCalls := map[string]bool{}
 	var out []openai.ChatMessage
+
 	for _, r := range records {
 		switch r.Kind {
+		case store.EventModelReasoning:
+			// reasoning_content 与 assistant 消息一起回放，不单独生成协议消息。
+			continue
 		case store.EventAssistantMessage:
-			var meta struct {
-				AgentRunID string `json:"agent_run_id"`
+			if !includeModel(r) {
+				continue
 			}
-			if json.Unmarshal(r.Data, &meta) == nil && meta.AgentRunID == agentRunID {
+			if r.ModelCallID == "" {
 				out = append(out, openai.ChatMessage{Role: "assistant", Content: r.Content})
+				continue
 			}
+			if emittedCalls[r.ModelCallID] {
+				continue
+			}
+			out = append(out, replayAssistantMessage(state.Calls[r.ModelCallID]))
+			emittedCalls[r.ModelCallID] = true
 		case store.EventToolRequested:
-			var d struct {
-				ToolCallID string          `json:"tool_call_id"`
-				Name       string          `json:"name"`
-				Arguments  json.RawMessage `json:"arguments"`
-				AgentRunID string          `json:"agent_run_id"`
+			d, ok := parseReplayToolRequest(r)
+			if !ok || !includeTool(d) || d.ToolCallID == "" {
+				continue
 			}
-			if json.Unmarshal(r.Data, &d) == nil && d.AgentRunID == agentRunID {
-				out = append(out, openai.ChatMessage{Role: "assistant", ToolCalls: []openai.ToolCall{{ID: d.ToolCallID, Type: "function", Function: openai.ToolFunction{Name: d.Name, Arguments: string(d.Arguments)}}}})
+			modelCallID := state.ToolCallModel[d.ToolCallID]
+			if modelCallID != "" {
+				if emittedCalls[modelCallID] {
+					continue
+				}
+				out = append(out, replayAssistantMessage(state.Calls[modelCallID]))
+				emittedCalls[modelCallID] = true
+				continue
 			}
+			// 兼容没有 model_call_id 的旧 Timeline。此时至少保持 Tool 协议完整；
+			// 新版本记录的 ToolRequested 都会带 model_call_id。
+			out = append(out, openai.ChatMessage{Role: "assistant", ToolCalls: []openai.ToolCall{{
+				ID: d.ToolCallID, Type: "function", Function: openai.ToolFunction{Name: d.Name, Arguments: string(d.Arguments)},
+			}}})
 		case store.EventToolCompleted, store.EventToolFailed, store.EventToolRejected, store.EventToolCancelled:
 			var d struct {
 				ToolCallID string          `json:"tool_call_id"`
 				Result     json.RawMessage `json:"result"`
 			}
-			if json.Unmarshal(r.Data, &d) == nil && toolCalls[d.ToolCallID] {
-				out = append(out, openai.ChatMessage{Role: "tool", ToolCallID: d.ToolCallID, Content: string(d.Result)})
+			if json.Unmarshal(r.Data, &d) == nil && state.ToolCallIDs[d.ToolCallID] {
+				content := string(d.Result)
+				if content == "" || content == "null" {
+					content = r.Content
+				}
+				out = append(out, openai.ChatMessage{Role: "tool", ToolCallID: d.ToolCallID, Content: content})
 			}
 		}
 	}
@@ -307,20 +453,23 @@ func agentRunTimelineMessages(records []store.Record, agentRunID string) []opena
 }
 
 func timelineMessages(records []store.Record, steeringCursor int64, activeAgentRunID string) []openai.ChatMessage {
-	var out []openai.ChatMessage
-	childCalls := map[string]bool{}
-	for _, r := range records {
-		if r.Kind != store.EventToolRequested {
-			continue
+	includeModel := func(r store.Record) bool {
+		meta := parseReplayModelMeta(r)
+		if meta.Child {
+			return false
 		}
-		var d struct {
-			ToolCallID string `json:"tool_call_id"`
-			AgentRunID string `json:"agent_run_id"`
-		}
-		if json.Unmarshal(r.Data, &d) == nil && d.AgentRunID != "" && d.AgentRunID != activeAgentRunID {
-			childCalls[d.ToolCallID] = true
-		}
+		return meta.AgentRunID == "" || activeAgentRunID == "" || meta.AgentRunID == activeAgentRunID
 	}
+	includeTool := func(d replayToolRequest) bool {
+		if activeAgentRunID == "" {
+			return d.AgentRunID == ""
+		}
+		return d.AgentRunID == "" || d.AgentRunID == activeAgentRunID
+	}
+	state := buildReplayState(records, includeModel, includeTool)
+	emittedCalls := map[string]bool{}
+	var out []openai.ChatMessage
+
 	for _, r := range records {
 		switch r.Kind {
 		case store.EventUserMessage:
@@ -329,31 +478,44 @@ func timelineMessages(records []store.Record, steeringCursor int64, activeAgentR
 			if r.Seq <= steeringCursor {
 				out = append(out, openai.ChatMessage{Role: "user", Content: "[Steering]\n" + r.Content})
 			}
+		case store.EventModelReasoning:
+			continue
 		case store.EventAssistantMessage:
-			var meta struct {
-				Child bool `json:"child"`
-			}
-			_ = json.Unmarshal(r.Data, &meta)
-			if meta.Child {
+			if !includeModel(r) {
 				continue
 			}
-			out = append(out, openai.ChatMessage{Role: "assistant", Content: r.Content})
+			if r.ModelCallID == "" {
+				out = append(out, openai.ChatMessage{Role: "assistant", Content: r.Content})
+				continue
+			}
+			if emittedCalls[r.ModelCallID] {
+				continue
+			}
+			out = append(out, replayAssistantMessage(state.Calls[r.ModelCallID]))
+			emittedCalls[r.ModelCallID] = true
 		case store.EventToolRequested:
-			var d struct {
-				ToolCallID string          `json:"tool_call_id"`
-				Name       string          `json:"name"`
-				Arguments  json.RawMessage `json:"arguments"`
-				AgentRunID string          `json:"agent_run_id"`
+			d, ok := parseReplayToolRequest(r)
+			if !ok || !includeTool(d) || d.ToolCallID == "" {
+				continue
 			}
-			if json.Unmarshal(r.Data, &d) == nil && d.ToolCallID != "" && !childCalls[d.ToolCallID] {
-				out = append(out, openai.ChatMessage{Role: "assistant", ToolCalls: []openai.ToolCall{{ID: d.ToolCallID, Type: "function", Function: openai.ToolFunction{Name: d.Name, Arguments: string(d.Arguments)}}}})
+			modelCallID := state.ToolCallModel[d.ToolCallID]
+			if modelCallID != "" {
+				if emittedCalls[modelCallID] {
+					continue
+				}
+				out = append(out, replayAssistantMessage(state.Calls[modelCallID]))
+				emittedCalls[modelCallID] = true
+				continue
 			}
+			out = append(out, openai.ChatMessage{Role: "assistant", ToolCalls: []openai.ToolCall{{
+				ID: d.ToolCallID, Type: "function", Function: openai.ToolFunction{Name: d.Name, Arguments: string(d.Arguments)},
+			}}})
 		case store.EventToolCompleted, store.EventToolFailed, store.EventToolRejected, store.EventToolCancelled:
 			var d struct {
 				ToolCallID string          `json:"tool_call_id"`
 				Result     json.RawMessage `json:"result"`
 			}
-			if json.Unmarshal(r.Data, &d) == nil && d.ToolCallID != "" && !childCalls[d.ToolCallID] {
+			if json.Unmarshal(r.Data, &d) == nil && d.ToolCallID != "" && state.ToolCallIDs[d.ToolCallID] {
 				content := string(d.Result)
 				if content == "" || content == "null" {
 					content = r.Content

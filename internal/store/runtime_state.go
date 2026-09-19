@@ -361,10 +361,8 @@ func (s *Store) AgentRunTimeline(runID string) ([]Record, error) {
 	toolIDs := map[string]bool{}
 	var out []Record
 	for _, r := range records {
-		if callIDs[r.ModelCallID] {
-			out = append(out, r)
-			continue
-		}
+		belongsToModelCall := callIDs[r.ModelCallID]
+		belongsToToolCall := false
 		if r.Kind == EventToolRequested {
 			var d struct {
 				AgentRunID string `json:"agent_run_id"`
@@ -372,8 +370,13 @@ func (s *Store) AgentRunTimeline(runID string) ([]Record, error) {
 			}
 			if json.Unmarshal(r.Data, &d) == nil && d.AgentRunID == runID {
 				toolIDs[d.ToolCallID] = true
-				out = append(out, r)
+				belongsToToolCall = true
 			}
+		}
+		// 新版 tool.requested 会携带 model_call_id；仍需先记录 tool_call_id，
+		// 否则后续 started/completed 事件会从 Child Timeline 中丢失。
+		if belongsToModelCall || belongsToToolCall {
+			out = append(out, r)
 		}
 	}
 	for _, r := range records {
