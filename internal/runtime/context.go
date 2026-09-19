@@ -67,7 +67,7 @@ func (c *ContextCompiler) Compile(input CompileInput) (CompiledContext, error) {
 	if turn == nil {
 		return CompiledContext{}, fmt.Errorf("缺少 Turn")
 	}
-	definitions := c.tools.Definitions(input.Profile.Tools)
+	definitions := openai.NormalizeToolDefinitions(c.tools.Definitions(input.Profile.Tools))
 	var prefix []openai.ChatMessage
 	kernel := strings.TrimSpace(c.cfg.SystemPrompt)
 	if kernel == "" {
@@ -76,7 +76,7 @@ func (c *ContextCompiler) Compile(input CompileInput) (CompiledContext, error) {
 	prefix = append(prefix, openai.ChatMessage{Role: "system", Content: "<WispKernel>\n" + kernel + "\n</WispKernel>"})
 	prefix = append(prefix, openai.ChatMessage{Role: "system", Content: "<AgentProfile id=\"" + input.Profile.ID + "\">\n" + input.Profile.Prompt + "\n</AgentProfile>"})
 	prefix = append(prefix, openai.ChatMessage{Role: "system", Content: `<RuntimeProtocol>
-Timeline 是持久事实，Tool Result 才代表真实副作用。可以连续调用工具；每个 Tool 完成后 Runtime 会在安全点处理 steering/pause/stop/approval。不要伪造工具结果、Approval 或 Artifact 版本。
+Timeline 是持久事实，Tool Result 才代表真实副作用。每轮最多提出一个 ToolCall，等待结果后再决定下一步；Runtime 按串行 Action Loop 执行。每个 Tool 完成后 Runtime 会在安全点处理 steering/pause/stop/approval。不要伪造工具结果、Approval 或 Artifact 版本。
 </RuntimeProtocol>`})
 	hard, scoped := c.resolver.Resolve()
 	if len(hard) > 0 || len(scoped) > 0 {
@@ -194,10 +194,12 @@ Timeline 是持久事实，Tool Result 才代表真实副作用。可以连续�
 		if strings.TrimSpace(input.ExtraUser) != "" {
 			messages = append(messages, openai.ChatMessage{Role: "user", Content: input.ExtraUser})
 		}
+		messages = openai.NormalizeToolMessages(messages)
 		debug := map[string]any{"agent": input.Profile.ID, "agent_run_id": input.AgentRunID, "context_epoch": turn.ContextEpoch, "checkpoint_id": turn.ActiveCheckpoint, "active_artifacts": artifactRefs(artifacts), "timeline_after_seq": after}
 		debugJSON, _ := json.Marshal(debug)
 		return CompiledContext{Messages: messages, Tools: definitions, SystemPromptSnapshot: systemSnapshot(prefix), ContextHash: hashValue(messages), PrefixHash: prefixHash, DebugJSON: string(debugJSON), MaxSteeringSeq: maxSteer}, nil
 	}
+	messages = openai.NormalizeToolMessages(messages)
 	debug := map[string]any{"agent": input.Profile.ID, "agent_run_id": input.AgentRunID, "context_epoch": turn.ContextEpoch, "isolated": true}
 	debugJSON, _ := json.Marshal(debug)
 	return CompiledContext{Messages: messages, Tools: definitions, SystemPromptSnapshot: systemSnapshot(prefix), ContextHash: hashValue(messages), PrefixHash: prefixHash, DebugJSON: string(debugJSON), MaxSteeringSeq: turn.SteeringCursor}, nil

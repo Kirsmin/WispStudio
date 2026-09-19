@@ -201,15 +201,12 @@ func (c *Coordinator) runTurn(ctx context.Context, turnID string, selection Sele
 			return
 		}
 
-		// 第一版明确串行 Tool 调度：同一模型响应若给出多个 ToolCall，只执行第一个，
-		// 其余调用以结构化 rejected 结果返回，要求模型在下一轮重新提出。
-		for i, call := range out.ToolCalls {
-			c.recordToolRequested(turn, turn.ActiveAgentRunID, call)
-			if i > 0 {
-				c.recordToolResult(turn, call, ToolResult{Status: "rejected", Error: "Runtime 当前按串行 Action Loop 执行；请在下一轮重新提出该调用"})
-			}
-		}
+		// Runtime 是严格串行 Action Loop：一次模型响应只采纳第一个 ToolCall。
+		// 历史实现会先记录全部 ToolCall、再拒绝后续调用，导致重建上下文时出现
+		// assistant.tool_calls 与 tool 结果交错，从而被 OpenAI 兼容接口以 HTTP 400 拒绝。
+		// 未采纳的调用不进入 Timeline/上下文，模型会在拿到首个 ToolResult 后重新规划。
 		call := out.ToolCalls[0]
+		c.recordToolRequested(turn, turn.ActiveAgentRunID, call)
 		decision := c.permissions.Evaluate(profile, call.Name, c.tools)
 		switch decision.Action {
 		case "deny":
@@ -587,13 +584,8 @@ func (c *Coordinator) runChild(ctx context.Context, turn *store.Turn, child *sto
 		if len(out.ToolCalls) == 0 {
 			return strings.TrimSpace(out.Content), nil
 		}
-		for idx, call := range out.ToolCalls {
-			c.recordToolRequested(fresh, child.ID, call)
-			if idx > 0 {
-				c.recordToolResult(fresh, call, ToolResult{Status: "rejected", Error: "Child Runtime 串行执行工具"})
-			}
-		}
 		call := out.ToolCalls[0]
+		c.recordToolRequested(fresh, child.ID, call)
 		decision := c.permissions.Evaluate(profile, call.Name, c.tools)
 		if decision.Action != "allow" {
 			c.recordToolResult(fresh, call, ToolResult{Status: "rejected", Error: decision.Risk})

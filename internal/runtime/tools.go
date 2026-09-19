@@ -181,6 +181,15 @@ func decodeArgs(raw json.RawMessage, target any) error {
 	return nil
 }
 
+func skipWorkspaceNoiseDir(name string) bool {
+	switch name {
+	case ".git", "node_modules", ".gocache", ".gopath", ".npm-cache":
+		return true
+	default:
+		return false
+	}
+}
+
 func (t *ToolRuntime) listFiles(_ ToolContext, raw json.RawMessage) ToolResult {
 	var args struct {
 		Path string `json:"path"`
@@ -201,7 +210,7 @@ func (t *ToolRuntime) listFiles(_ ToolContext, raw json.RawMessage) ToolResult {
 		if walkErr != nil {
 			return nil
 		}
-		if path != root && d.IsDir() && (d.Name() == ".git" || d.Name() == "node_modules") {
+		if path != root && d.IsDir() && skipWorkspaceNoiseDir(d.Name()) {
 			return filepath.SkipDir
 		}
 		if path == root {
@@ -292,7 +301,7 @@ func (t *ToolRuntime) searchText(_ ToolContext, raw json.RawMessage) ToolResult 
 			return nil
 		}
 		if d.IsDir() {
-			if path != root && (d.Name() == ".git" || d.Name() == "node_modules") {
+			if path != root && skipWorkspaceNoiseDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil

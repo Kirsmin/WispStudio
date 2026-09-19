@@ -13,7 +13,10 @@
             <div class="empty-title">开始一个任务</div>
             <div class="empty-sub">Wisp 会先规划，再由你决定是否开始执行</div>
           </div>
-          <TimelineItem v-for="record in timeline" :key="record.id" :record="record" />
+          <template v-for="item in displayTimeline" :key="item.key">
+            <ToolCallBlock v-if="item.type === 'tool'" :records="item.records" />
+            <TimelineItem v-else :record="item.record" />
+          </template>
           <StreamingBlock v-if="streamingModel" :stream="streamingModel" />
           <div v-if="backgroundGenerating && !streamingModel" class="background-note">
             <span class="background-dot" /> Runtime 正在后台继续执行；刷新或切换页面不会取消任务。
@@ -29,14 +32,16 @@
 <script setup lang="ts">
 import { NButton } from 'naive-ui'
 import { storeToRefs } from 'pinia'
-import { nextTick, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 import { useChatStore } from '../stores/chat'
+import type { TimelineRecord } from '../stores/chat'
 import { useSessionsStore } from '../stores/sessions'
 import Composer from './Composer.vue'
 import RuntimeControls from './RuntimeControls.vue'
 import StreamingBlock from './StreamingBlock.vue'
 import TimelineItem from './TimelineItem.vue'
+import ToolCallBlock from './ToolCallBlock.vue'
 
 const connectionStore = useConnectionStore()
 const chatStore = useChatStore()
@@ -45,6 +50,30 @@ const { isConnected } = storeToRefs(connectionStore)
 const { timeline, streamingModel, backgroundGenerating } = storeToRefs(chatStore)
 const { currentSessionId } = storeToRefs(sessionsStore)
 const messagesRef = ref<HTMLDivElement | null>(null)
+type DisplayTimelineItem =
+  | { type: 'record'; key: string; record: TimelineRecord }
+  | { type: 'tool'; key: string; records: TimelineRecord[] }
+
+const displayTimeline = computed<DisplayTimelineItem[]>(() => {
+  const items: DisplayTimelineItem[] = []
+  const activeGroups = new Map<string, Extract<DisplayTimelineItem, { type: 'tool' }>>()
+  for (const record of timeline.value) {
+    const callID = record.kind.startsWith('tool.') ? String(record.data?.tool_call_id || '') : ''
+    if (!callID) {
+      items.push({ type: 'record', key: record.id, record })
+      continue
+    }
+    let group = activeGroups.get(callID)
+    if (!group || record.kind === 'tool.requested') {
+      group = { type: 'tool', key: `tool:${callID}:${record.seq}`, records: [] }
+      activeGroups.set(callID, group)
+      items.push(group)
+    }
+    group.records.push(record)
+    if (['tool.completed', 'tool.failed', 'tool.rejected', 'tool.cancelled'].includes(record.kind)) activeGroups.delete(callID)
+  }
+  return items
+})
 let stickToBottom = true
 
 function openConnectDialog() { connectionStore.showConnectDialog = true }
