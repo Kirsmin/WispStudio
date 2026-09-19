@@ -72,6 +72,12 @@ func NewToolRuntime(st *store.Store, workspaceRoot string) *ToolRuntime {
 }
 
 func objectSchema(properties string, required ...string) json.RawMessage {
+	// OpenAI function schemas require `required` to always be an array.
+	// A nil variadic slice marshals to JSON null, which makes the schema invalid
+	// for tools that have no required parameters (for example list_files).
+	if required == nil {
+		required = []string{}
+	}
 	req, _ := json.Marshal(required)
 	return json.RawMessage(`{"type":"object","properties":{` + properties + `},"required":` + string(req) + `,"additionalProperties":false}`)
 }
