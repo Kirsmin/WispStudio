@@ -1,83 +1,36 @@
+// Wisp 后端入口：本阶段仅加载配置并打开事件日志，不实现任何业务功能。
 package main
 
 import (
-	"fmt"
 	"log"
-	"net/http"
 	"os"
+	"path/filepath"
 
-	"wisp/internal/api"
 	"wisp/internal/config"
-	"wisp/internal/store"
+	"wisp/internal/eventlog"
 )
 
-const primaryConfig = "config.toml.local"
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
-}
-
-func resolveConfigPath() string {
-	if fileExists(primaryConfig) {
-		return primaryConfig
-	}
-	return ""
-}
-
 func main() {
-	if len(os.Args) > 1 {
-		if os.Args[1] != "sync" || len(os.Args) != 2 {
-			log.Fatalf("用法: wisp [sync]")
-		}
-		runSync()
-		return
-	}
-
-	path := resolveConfigPath()
-	if path == "" {
-		if err := config.WriteDefault(primaryConfig); err != nil {
-			log.Fatalf("生成默认配置失败: %v", err)
-		}
-		log.Printf("未检测到配置文件，已自动生成 %s", primaryConfig)
-		log.Printf("请编辑该文件填写 API Key 等配置后重新启动服务器")
-		return
-	}
-	cfg, err := config.Load(path)
+	// 加载配置（不存在时在与可执行文件同目录生成默认配置）
+	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
+	log.Printf("配置已加载: Port=%d Providers=%d", cfg.Server.Port, len(cfg.Providers))
 
-	router, err := api.NewRouter(cfg)
+	// 打开事件日志（数据文件放在可执行文件同目录的 Data/ 下）
+	exe, err := os.Executable()
 	if err != nil {
-		log.Fatalf("初始化服务器失败: %v", err)
+		log.Fatalf("定位可执行文件失败: %v", err)
 	}
-	defer router.Close()
-
-	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-	log.Printf("已加载配置: %s", path)
-	log.Printf("服务器启动: http://%s", addr)
-	if err := http.ListenAndServe(addr, router); err != nil {
-		log.Fatalf("服务器错误: %v", err)
+	dataDir := filepath.Join(filepath.Dir(exe), "Data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		log.Fatalf("创建数据目录失败: %v", err)
 	}
-}
-
-func runSync() {
-	dataDir := "Data"
-	if path := resolveConfigPath(); path != "" {
-		cfg, err := config.Load(path)
-		if err != nil {
-			log.Fatalf("加载配置失败: %v", err)
-		}
-		dataDir = cfg.Storage.DataDir
-	}
-	st, err := store.Open(dataDir)
+	store, err := eventlog.Open(filepath.Join(dataDir, "eventlog.db"), nil)
 	if err != nil {
-		log.Fatalf("打开 SQLite 失败: %v", err)
+		log.Fatalf("打开事件日志失败: %v", err)
 	}
-	defer st.Close()
-	if err := st.SyncJSONL(); err != nil {
-		log.Fatalf("导出失败: %v", err)
-	}
-	log.Printf("已导出 SQLite -> %s/Sync", dataDir)
+	defer store.Close()
+	log.Println("事件日志已就绪，地基启动完成（无业务功能）")
 }

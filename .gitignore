@@ -11,6 +11,7 @@ web/dist/
 .npm-cache/
 
 # 配置文件（含密钥）
+Config.local.toml
 config.toml
 config.toml.local
 
