@@ -2,7 +2,8 @@
 //
 // 事件只追加；单 writer goroutine 独占 seq 分配与写入，
 // 其他方通过 AppendEvent / AppendEvents 提交。
-// schema_v1 只全新建库，发现任何旧版/未知表结构直接报错退出，不做猜测性迁移。
+// schema_v1 只全新建库；v2 起仅允许纯增量加表（不改旧表旧数据），
+// 发现任何未知表结构直接报错退出，不做猜测性迁移。
 package eventlog
 
 import (
@@ -22,8 +23,9 @@ import (
 	"wisp/internal/ids"
 )
 
-// SchemaVersion 是当前库结构版本；仅支持全新建库，不支持迁移。
-const SchemaVersion = 1
+// SchemaVersion 是当前库结构版本。
+// v1 → v2 是纯增量：只新增 contexts / ctx_ops 两张表，不改旧表旧数据。
+const SchemaVersion = 2
 
 // CurrentVersion 是当前事件版本，新写入事件一律使用该版本。
 const CurrentVersion = 1
@@ -70,8 +72,12 @@ type EventInput struct {
 type opKind int
 
 const (
-	opAppend  opKind = iota // 批量追加事件（同一 turn 的批量事件在同一事务原子写入）
-	opMoveRef               // 更新 refs 并追加 ref.moved 事件
+	opAppend opKind = iota // 批量追加事件（同一 turn 的批量事件在同一事务原子写入）
+	opMoveRef              // 更新 refs 并追加 ref.moved 事件
+	opCreateContext        // 创建上下文：写 contexts 表并追加 ctx.created 事件
+	opAppendCtxOp          // 追加上下文编辑操作：写 ctx_ops 表并追加 ctx.op 事件
+	opAddLink              // 写入一条 links 关系（INSERT OR IGNORE）
+	opPutBlob              // 按内容哈希去重写入 blobs 表（供 RequestManifest 等引用）
 )
 
 // 写入请求，经缓冲 channel 提交给单 writer。
@@ -80,11 +86,20 @@ type writeReq struct {
 	inputs  []EventInput
 	refName string
 	target  string
+	ctxIn   ContextInput // opCreateContext 专用
+	opIn    CtxOpInput   // opAppendCtxOp 专用
+	linkSrc string       // opAddLink 专用
+	linkDst string       // opAddLink 专用
+	linkRel string       // opAddLink 专用
+	blob    []byte       // opPutBlob 专用
 	resp    chan writeResp
 }
 
 type writeResp struct {
 	events []Event
+	hash   string     // opPutBlob 返回的 blob 哈希
+	ctxRow ContextRow // opCreateContext 返回的行
+	opRow  CtxOpRow   // opAppendCtxOp 返回的行
 	err    error
 }
 
@@ -101,7 +116,11 @@ type Store struct {
 // Open 打开（必要时全新创建）事件日志数据库。
 // registry 用于读取时按 v 逐版本升级旧事件，可为 nil。
 func Open(path string, registry Registry) (*Store, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	dsn := path
+	if path != ":memory:" {
+		dsn += "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("eventlog: 打开数据库失败: %w", err)
 	}
@@ -119,7 +138,7 @@ func Open(path string, registry Registry) (*Store, error) {
 	return s, nil
 }
 
-// migrate 校验并初始化库结构：只允许 schema_v1 全新建库。
+// migrate 校验并初始化库结构：只允许全新建库与纯增量加表，不做猜测性迁移。
 func migrate(db *sql.DB) error {
 	var v int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
@@ -138,14 +157,30 @@ func migrate(db *sql.DB) error {
 		if _, err := db.Exec(schemaV1); err != nil {
 			return fmt.Errorf("eventlog: 创建 schema_v1 失败: %w", err)
 		}
+		if _, err := db.Exec(schemaV2); err != nil {
+			return fmt.Errorf("eventlog: 创建 schema_v2 失败: %w", err)
+		}
 		if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion)); err != nil {
 			return fmt.Errorf("eventlog: 写入 schema 版本失败: %w", err)
 		}
 		return nil
+	case v == 1:
+		// v1 → v2 纯增量：只新增 contexts / ctx_ops 两张表，不改旧表旧数据。
+		if _, err := db.Exec(schemaV2); err != nil {
+			return fmt.Errorf("eventlog: 增量创建 schema_v2 失败: %w", err)
+		}
+		if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion)); err != nil {
+			return fmt.Errorf("eventlog: 写入 schema 版本失败: %w", err)
+		}
+		v = SchemaVersion
+		fallthrough
 	case v == SchemaVersion:
 		var n int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'events'`).Scan(&n); err != nil || n != 1 {
-			return fmt.Errorf("eventlog: schema_v1 缺少 events 表，库结构不一致")
+			return fmt.Errorf("eventlog: schema_v%d 缺少 events 表，库结构不一致", SchemaVersion)
+		}
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('contexts', 'ctx_ops')`).Scan(&n); err != nil || n != 2 {
+			return fmt.Errorf("eventlog: schema_v%d 缺少 contexts/ctx_ops 表，库结构不一致", SchemaVersion)
 		}
 		return nil
 	default:
@@ -269,6 +304,16 @@ func (s *Store) apply(req writeReq) {
 	case opMoveRef:
 		ev, err := s.applyMoveRef(req.refName, req.target)
 		req.resp <- writeResp{events: []Event{ev}, err: err}
+	case opCreateContext:
+		row, err := s.applyCreateContext(req.ctxIn)
+		req.resp <- writeResp{ctxRow: row, err: err}
+	case opAppendCtxOp:
+		row, err := s.applyAppendCtxOp(req.opIn)
+		req.resp <- writeResp{opRow: row, err: err}
+	case opAddLink:
+		req.resp <- writeResp{err: s.applyAddLink(req.linkSrc, req.linkDst, req.linkRel)}
+	case opPutBlob:
+		req.resp <- writeResp{hash: blobHash(req.blob), err: s.applyPutBlob(req.blob)}
 	}
 }
 
@@ -366,6 +411,98 @@ func (s *Store) applyMoveRef(name, target string) (Event, error) {
 		return Event{}, err
 	}
 	return ev, nil
+}
+
+// applyCreateContext 在单个事务中写 contexts 表并追加 ctx.created 事件。
+func (s *Store) applyCreateContext(in ContextInput) (ContextRow, error) {
+	now := time.Now().UnixMilli()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return ContextRow{}, err
+	}
+	defer tx.Rollback()
+
+	row := ContextRow{
+		ID:         ids.NewContextID(),
+		BaseCtx:    in.BaseCtx,
+		ForkAt:     in.ForkAt,
+		CreatedSeq: s.lastSeq + 1,
+	}
+	raw, err := marshalAttrs(CtxCreatedAttrs{})
+	if err != nil {
+		return ContextRow{}, err
+	}
+	if _, err := tx.Exec(`INSERT INTO events
+		(id, seq, type, session_id, agent_id, turn_id, actor, parent_id, cause_id, subject_id, blob, attrs, ts, v)
+		VALUES(?, ?, ?, '', '', '', '', '', '', '', '', ?, ?, ?)`,
+		ids.NewEventID().String(), s.nextSeq(), TypeCtxCreated, raw, now, CurrentVersion); err != nil {
+		return ContextRow{}, fmt.Errorf("eventlog: 写入 ctx.created 事件失败: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO contexts(id, base_ctx, fork_at, created_seq) VALUES(?, ?, ?, ?)`,
+		row.ID.String(), row.BaseCtx.String(), row.ForkAt.String(), row.CreatedSeq); err != nil {
+		return ContextRow{}, fmt.Errorf("eventlog: 写入 contexts 失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return ContextRow{}, err
+	}
+	return row, nil
+}
+
+// applyAppendCtxOp 在单个事务中写 ctx_ops 表并追加 ctx.op 事件。
+func (s *Store) applyAppendCtxOp(in CtxOpInput) (CtxOpRow, error) {
+	now := time.Now().UnixMilli()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return CtxOpRow{}, err
+	}
+	defer tx.Rollback()
+
+	row := CtxOpRow{
+		ID:     ids.NewContextOpID(),
+		Ctx:    in.Ctx,
+		Seq:    s.lastSeq + 1,
+		Op:     in.Op,
+		Target: in.Target,
+		Anchor: in.Anchor,
+		OKey:   in.OKey,
+		NewID:  in.NewID,
+	}
+	raw, err := marshalAttrs(CtxOpAttrs{})
+	if err != nil {
+		return CtxOpRow{}, err
+	}
+	if _, err := tx.Exec(`INSERT INTO events
+		(id, seq, type, session_id, agent_id, turn_id, actor, parent_id, cause_id, subject_id, blob, attrs, ts, v)
+		VALUES(?, ?, ?, '', '', '', '', '', '', ?, '', ?, ?, ?)`,
+		ids.NewEventID().String(), s.nextSeq(), TypeCtxOp, row.ID.String(), raw, now, CurrentVersion); err != nil {
+		return CtxOpRow{}, fmt.Errorf("eventlog: 写入 ctx.op 事件失败: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO ctx_ops(id, ctx, seq, op, target, anchor, okey, new_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		row.ID.String(), row.Ctx.String(), row.Seq, row.Op, row.Target, row.Anchor, row.OKey, row.NewID.String()); err != nil {
+		return CtxOpRow{}, fmt.Errorf("eventlog: 写入 ctx_ops 失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return CtxOpRow{}, err
+	}
+	return row, nil
+}
+
+// applyAddLink 写入一条 links 关系，重复写入幂等。
+func (s *Store) applyAddLink(src, dst, rel string) error {
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO links(src, dst, rel) VALUES(?, ?, ?)`, src, dst, rel)
+	if err != nil {
+		return fmt.Errorf("eventlog: 写入 link 失败: %w", err)
+	}
+	return nil
+}
+
+// applyPutBlob 按内容哈希去重写入 blobs 表。
+func (s *Store) applyPutBlob(data []byte) error {
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO blobs(hash, data, redacted) VALUES(?, ?, 0)`, blobHash(data), data)
+	if err != nil {
+		return fmt.Errorf("eventlog: 写入 blob 失败: %w", err)
+	}
+	return nil
 }
 
 // nextSeq 分配下一个 seq，仅在 writer goroutine 中调用。
