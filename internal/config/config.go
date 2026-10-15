@@ -38,8 +38,9 @@ Path    = "/models"
 
 // Config 是根配置。
 type Config struct {
-	Server    ServerConfig
-	Providers []ProviderConfig
+	Server       ServerConfig
+	Providers    []ProviderConfig
+	ModelAliases []ModelAliasConfig // [[ModelAliases]] 段，新增模型的别名写在这里
 }
 
 // ServerConfig 服务配置。
@@ -81,6 +82,13 @@ func (m *ModelConfig) UnmarshalTOML(v any) error {
 	default:
 		return fmt.Errorf("config: 模型配置类型无法识别: %T", v)
 	}
+}
+
+// ModelAliasConfig 单个模型别名配置（[[ModelAliases]] 段）。
+type ModelAliasConfig struct {
+	ProviderID string // 模型所属 provider
+	ModelID    string // 模型 id
+	Alias      string // 显示别名，可中文
 }
 
 // DiscoveryConfig 模型自动发现配置。
@@ -149,6 +157,11 @@ func (c *Config) Validate() error {
 			deduped = append(deduped, m)
 		}
 		p.Models = deduped
+	}
+	for i, a := range c.ModelAliases {
+		if strings.Contains(a.ModelID, "/") || strings.Contains(a.ProviderID, "/") {
+			return fmt.Errorf("config: ModelAliases[%d] 的 id 不应包含 '/': %q/%q", i, a.ProviderID, a.ModelID)
+		}
 	}
 	return nil
 }

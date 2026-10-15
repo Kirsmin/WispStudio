@@ -1,13 +1,17 @@
-// Wisp 后端入口：本阶段仅加载配置并打开事件日志，不实现任何业务功能。
+// Wisp 后端入口：加载配置、打开事件日志、构建模型目录并触发自动发现。
 package main
 
 import (
+	"context"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"wisp/internal/config"
 	"wisp/internal/eventlog"
+	"wisp/internal/provider"
 )
 
 func main() {
@@ -32,5 +36,12 @@ func main() {
 		log.Fatalf("打开事件日志失败: %v", err)
 	}
 	defer store.Close()
-	log.Println("事件日志已就绪，地基启动完成（无业务功能）")
+	log.Println("事件日志已就绪")
+
+	// 构建模型目录并触发自动发现；单个 provider 发现失败只记日志，不阻塞启动
+	catalog := provider.NewCatalog(cfg, filepath.Join(filepath.Dir(exe), config.FileName))
+	discoverCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	catalog.DiscoverAll(discoverCtx, func(msg string, args ...any) { slog.Warn(msg, args...) })
+	log.Println("模型目录已就绪")
 }
