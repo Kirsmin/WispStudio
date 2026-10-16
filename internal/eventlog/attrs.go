@@ -141,8 +141,12 @@ type LLMRespondedAttrs struct {
 	DurationMs int64 `json:"duration_ms"`
 }
 
-// TurnStartedAttrs 是 turn.started 事件的附加属性，通常为空，保留扩展位。
-type TurnStartedAttrs struct{}
+// TurnStartedAttrs 是 turn.started 事件的附加属性。
+type TurnStartedAttrs struct {
+	// ContextID 是本回合编译所用的上下文 ID；恢复回合（含审批后继续）
+	// 需要用它重建编译入参，故随事件持久化，不依赖进程内存。
+	ContextID string `json:"context_id,omitempty"`
+}
 
 // TurnCompletedAttrs 是 turn.completed 事件的附加属性。
 type TurnCompletedAttrs struct {

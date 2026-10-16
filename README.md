@@ -8,10 +8,33 @@ Go + Vue 3 + TypeScript 的本地会话式 coding agent。Plan 和 Build 由 Run
 
 ```bash
 cd web && npm ci && npm run build
-cd .. && go run ./cmd/server
+cd .. && go build -o server ./cmd/server && ./server
 ```
 
-首次启动生成 `config.toml.local`，填写 `[[providers]]` 的 `base_url`、`api_key` 等设置后再次启动。默认地址为 `http://127.0.0.1:7860`，数据保存在 `Data/`。开发前端可在 `web/` 运行 `npm run dev`。
+首次启动会在**可执行文件同目录**生成 `Config.local.toml`（请勿提交版本库）：按 `[[Providers]]` 段填写 `BaseURL`、`Secret`、`Models`（模型 id 原样透传给服务商）后重启。默认监听 `http://127.0.0.1:8787`，事件日志在可执行文件同目录的 `Data/eventlog.db`，工具的工作区根也是可执行文件同目录。开发前端可在 `web/` 运行 `npm run dev`。
+
+## HTTP API
+
+最小 JSON 接口（仅本机监听）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/health` | 存活检查 |
+| GET | `/api/catalog` | 已配置 provider 与模型（含自动发现结果） |
+| POST | `/api/turns` | 启动回合，body `{"text","session_id?","model?"}`，返回 `session_id`/`context_id`/`turn_id`/`model` |
+| GET | `/api/sessions/{session_id}/events?after_seq=N&limit=M` | 增量读取事件流，返回 `events` 与 `next_seq` |
+| GET | `/api/turns/{turn_id}` | 回合状态（refs 指针 + 事件折叠），含 `pending_approvals` |
+| POST | `/api/turns/{turn_id}/approvals/{tool_call_id}` | 提交审批，body `{"decision":"approved"\|"rejected","reason?"}` |
+
+回合异步执行：启动后用返回的 `next_seq` 轮询事件流；`GET /api/turns/{turn_id}` 的 `ref` 取值 `running` / `waiting_approval:<审批ID>` / `completed` / `failed:<原因>`。需要审批的工具会先挂起，提交决定后自动继续。
+
+真实端点冒烟测试（默认跳过，设置密钥才执行）：
+
+```bash
+WISP_LIVE_API_KEY=sk-xxx go test ./internal/provider/ -run TestLiveToolCallWireFormat -v
+WISP_LIVE_API_KEY=sk-xxx go test ./internal/api/ -run TestLiveAPITurnWithRealModel -v
+```
+
 
 ## 工作方式
 
@@ -24,6 +47,6 @@ cd .. && go run ./cmd/server
 
 ## 数据与升级
 
-SQLite schema 为 v8。当前源码仅支持新建数据库和 **v7 → v8** 的保留数据升级；更早格式不再提供自动兼容。升级前备份 `Data/`，需要时可先用旧版本导出 Session。`go run ./cmd/server sync` 可将 SQLite 内容导出到 `Data/Sync/`。
+SQLite 是仅追加的事件日志（schema v2，只允许纯增量加表，不做猜测性迁移）；更早的 coordinator 版本数据库不再兼容，请更换 `Data/` 下的数据库文件。回合状态不存在任何可变字段表，全部由 refs 指针 + 事件折叠得出。
 
 配置和数据库不应提交到 Git；参见 `.gitignore`。

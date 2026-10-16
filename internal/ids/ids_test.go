@@ -2,7 +2,7 @@ package ids
 
 import "testing"
 
-// 前缀 → 实体类型的完整映射表，覆盖全部十种 ID。
+// 前缀 → 实体类型的完整映射表，覆盖全部实体 ID。
 var prefixWant = []struct {
 	prefix string
 	kind   Kind
@@ -17,6 +17,7 @@ var prefixWant = []struct {
 	{"ag", KindAgent},
 	{"ck", KindCheckpoint},
 	{"tn", KindTurn},
+	{"sess", KindSession},
 }
 
 // TestParse 校验每个前缀都能解析到正确的实体类型（最长前缀优先）。
@@ -97,6 +98,17 @@ func TestNewAndParseRoundTrip(t *testing.T) {
 	turnID := NewTurnID()
 	if kind, err := Parse(turnID.String()); err != nil || kind != KindTurn {
 		t.Errorf("Parse(%s) = %v, %v", turnID, kind, err)
+	}
+
+	sessionID := NewSessionID()
+	if kind, err := Parse(sessionID.String()); err != nil || kind != KindSession {
+		t.Errorf("Parse(%s) = %v, %v", sessionID, kind, err)
+	}
+	if _, err := ParseSessionID(sessionID.String()); err != nil {
+		t.Errorf("ParseSessionID(%s) 出错: %v", sessionID, err)
+	}
+	if _, err := ParseSessionID(turnID.String()); err == nil {
+		t.Errorf("ParseSessionID(%s) 应因前缀不符报错", turnID)
 	}
 }
 

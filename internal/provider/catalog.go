@@ -105,6 +105,54 @@ func (c *Catalog) Get(fullID ModelFullID) (Model, error) {
 		string(fullID), providerID, strings.Join(available, ", "))
 }
 
+// Endpoint 是模型对应的连接参数（发请求用）。
+type Endpoint struct {
+	FullID     ModelFullID // 模型全称 id
+	ProviderID string      // 服务商 ID
+	ModelID    string      // provider 侧模型 id（原样透传，不做映射）
+	BaseURL    string      // API 基础地址
+	Secret     string      // API 密钥
+}
+
+// Endpoint 按模型全称 id 返回连接参数；id 格式错误、provider 或模型不存在
+// 时返回明确错误。模型 id 一律原样透传，不做任何 provider 私有转换。
+func (c *Catalog) Endpoint(fullID ModelFullID) (Endpoint, error) {
+	if _, err := c.Get(fullID); err != nil {
+		return Endpoint{}, err
+	}
+	providerID, modelID := fullID.Split()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, err := c.findProvider(providerID)
+	if err != nil {
+		return Endpoint{}, err
+	}
+	return Endpoint{
+		FullID:     fullID,
+		ProviderID: providerID,
+		ModelID:    modelID,
+		BaseURL:    p.BaseURL,
+		Secret:     p.Secret,
+	}, nil
+}
+
+// DefaultModel 返回目录中的默认模型：第一个配置了模型（含自动发现）的
+// provider 的第一个模型。一个都没有时返回明确错误。
+func (c *Catalog) DefaultModel() (ModelFullID, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.cfg.Providers {
+		p := &c.cfg.Providers[i]
+		if len(p.Models) > 0 {
+			return Join(p.ProviderID, p.Models[0].ModelID), nil
+		}
+		if found := c.discovered[p.ProviderID]; len(found) > 0 {
+			return found[0], nil
+		}
+	}
+	return "", fmt.Errorf("provider: 没有可用模型（请在 %s 配置 [[Providers]].Models）", c.path)
+}
+
 // ListByProvider 列出某 provider 的全部模型（手动 Models 在前，发现的补齐去重）。
 func (c *Catalog) ListByProvider(providerID string) ([]Model, error) {
 	c.mu.Lock()

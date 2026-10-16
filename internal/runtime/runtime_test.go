@@ -131,13 +131,16 @@ func lastContentBefore(evs []eventlog.Event, seq int64) ids.EventID {
 }
 
 // 第一轮脚本：推理增量 + 正文增量 + 分片工具调用（read_file a.txt）。
+// 工具调用帧采用 OpenAI 兼容的嵌套 function 形态（与真实服务一致）：
+// 首帧给出 id/type/function.name，后续帧只累加 function.arguments。
 var e2eRound1 = []string{
 	`{"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"先看看"}}]}`,
 	`{"choices":[{"index":0,"delta":{"reasoning_content":"工具"}}]}`,
 	`{"choices":[{"index":0,"delta":{"content":"我来读"}}]}`,
 	`{"choices":[{"index":0,"delta":{"content":"文件。"}}]}`,
-	`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","name":"read_file","arguments":"{\"path\":"}]}}]}`,
-	`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"arguments":"\"a.txt\"}"}]}}]}`,
+	`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}]}}]}`,
+	`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}`,
+	`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}}]}}]}`,
 	`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
 }
 
@@ -215,6 +218,21 @@ func TestRunTurnEndToEnd(t *testing.T) {
 	resps := mustEventsOf(t, evs, eventlog.TypeLLMResponded)
 	if len(reqs) != 2 || len(resps) != 2 {
 		t.Fatalf("llm.requested/responded 数 = %d/%d, 期望 2/2", len(reqs), len(resps))
+	}
+	for i, reqEv := range reqs {
+		var attrs eventlog.LLMRequestedAttrs
+		if err := json.Unmarshal(reqEv.Attrs, &attrs); err != nil {
+			t.Fatalf("解析 llm.requested attrs 失败: %v", err)
+		}
+		// 事件里记全称 id，请求体里必须是服务商裸 id
+		if attrs.Model != "deepseek/deepseek-chat" || attrs.ProviderID != "deepseek" {
+			t.Fatalf("第 %d 个 llm.requested attrs 不正确: %+v", i, attrs)
+		}
+	}
+	for i, req := range fake.requests() {
+		if req.Model != "deepseek-chat" {
+			t.Fatalf("第 %d 次请求的服务商模型 id = %q, 期望裸 id deepseek-chat", i, req.Model)
+		}
 	}
 	for i, rsp := range resps {
 		if rsp.SubjectID != reqs[i].SubjectID {
@@ -510,11 +528,12 @@ func TestRunTurnApprovalSuspendResume(t *testing.T) {
 	}
 }
 
-// writeFileRound 是审批用例的第一轮脚本：shallow 分片的 write_file 调用。
+// writeFileRound 是审批用例的第一轮脚本：分片的 write_file 调用（嵌套 function）。
 var writeFileRound = []string{
 	`{"choices":[{"index":0,"delta":{"content":"我来写文件。"}}]}`,
-	`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_w","type":"function","name":"write_file","arguments":"{\"path\":\"b.txt\","}]}}]}`,
-	`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"arguments":"\"content\":\"审批后的内容\"}"}]}}]}`,
+	`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_w","type":"function","function":{"name":"write_file","arguments":""}}]}}]}`,
+	`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"b.txt\","}}]}}]}`,
+	`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"content\":\"审批后的内容\"}"}}]}}]}`,
 	`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`,
 }
 
@@ -678,4 +697,23 @@ func newTestRuntime(t *testing.T, store *eventlog.Store, workspace string, fake 
 		t.Fatalf("构造运行时失败: %v", err)
 	}
 	return rt
+}
+
+// TestWireModelID 校验发给服务商的模型 id 是从全称 id 剥离 provider 前缀的裸 id。
+func TestWireModelID(t *testing.T) {
+	cases := []struct {
+		fullID   string
+		provider string
+		want     string
+	}{
+		{"deepseek/deepseek-flash", "", "deepseek-flash"},
+		{"deepseek/deepseek-chat", "deepseek-chat", "deepseek-chat"},
+		{"openai/gpt-4o", "custom", "custom"},
+		{"bare-model", "", "bare-model"},
+	}
+	for _, tc := range cases {
+		if got := wireModelID(tc.fullID, tc.provider); got != tc.want {
+			t.Errorf("wireModelID(%q, %q) = %q, 期望 %q", tc.fullID, tc.provider, got, tc.want)
+		}
+	}
 }

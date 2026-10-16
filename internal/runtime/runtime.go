@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"wisp/internal/compile"
 	"wisp/internal/eventlog"
 	"wisp/internal/ids"
 	"wisp/internal/provider"
@@ -40,7 +41,8 @@ func TurnRefName(turnID string) string { return "turn/" + turnID }
 type Options struct {
 	WorkspaceRoot string           // 工作区根，文件操作一律限制在其内；空 = 当前目录
 	ProviderID    string           // 写入 llm.requested attrs 的服务商 ID
-	Model         string           // 模型全称 id（{ProviderID}/{ModelID}）
+	Model         string           // 模型全称 id（{ProviderID}/{ModelID}），写入事件
+	ProviderModel string           // 发给服务商的裸模型 id；空则从 Model 去掉 provider 前缀
 	Client        *provider.Client // OpenAI 兼容客户端；nil 时用默认客户端
 	MaxIterations int              // 回合最大迭代次数，防死循环；<= 0 用默认 64
 }
@@ -50,7 +52,8 @@ type Runtime struct {
 	store         *eventlog.Store
 	workspaceRoot string
 	providerID    string
-	model         string
+	model         string // 全称 id（事件用）
+	wireModel     string // 服务商侧裸模型 id（请求用）
 	client        *provider.Client
 	tools         *Registry
 	maxIterations int
@@ -78,10 +81,24 @@ func New(store *eventlog.Store, opts Options) (*Runtime, error) {
 		workspaceRoot: reg.workspaceRoot,
 		providerID:    opts.ProviderID,
 		model:         opts.Model,
+		wireModel:     wireModelID(opts.Model, opts.ProviderModel),
 		client:        client,
 		tools:         reg,
 		maxIterations: maxIter,
 	}, nil
+}
+
+// wireModelID 返回发给服务商的模型 id：优先用显式给定的裸 id，
+// 否则从全称 id（{ProviderID}/{ModelID}）去掉 provider 前缀。
+// 服务商只认裸 id，全称 id 仅用于事件记录。
+func wireModelID(fullID, providerModel string) string {
+	if v := strings.TrimSpace(providerModel); v != "" {
+		return v
+	}
+	if _, modelID, ok := strings.Cut(strings.TrimSpace(fullID), "/"); ok && modelID != "" {
+		return modelID
+	}
+	return fullID
 }
 
 // TurnParams 是一次回合执行/恢复的参数。
@@ -125,7 +142,7 @@ func (r *Runtime) ensureStarted(ctx context.Context, p TurnParams) error {
 		TurnID:    p.TurnID,
 		Actor:     actorRuntime,
 		SubjectID: p.TurnID,
-		Attrs:     eventlog.TurnStartedAttrs{},
+		Attrs:     eventlog.TurnStartedAttrs{ContextID: p.ContextID.String()},
 	}); err != nil {
 		return fmt.Errorf("runtime: 写 turn.started 失败: %w", err)
 	}
@@ -204,9 +221,10 @@ func (r *Runtime) loop(ctx context.Context, p TurnParams) error {
 	}
 }
 
-// sessionChainTail 返回会话内容链的尾事件 ID（无内容事件时为空串）。
-func (r *Runtime) sessionChainTail(ctx context.Context, sessionID string) (ids.EventID, error) {
-	evs, err := r.store.ListBySession(ctx, sessionID, 0, 0)
+// SessionChainTail 返回会话内容链的尾事件 ID（无内容事件时为空串）。
+// 上层为新回合 fork 上下文时以它为 ForkAt，保证历史连续。
+func SessionChainTail(ctx context.Context, store *eventlog.Store, sessionID string) (ids.EventID, error) {
+	evs, err := store.ListBySession(ctx, sessionID, 0, 0)
 	if err != nil {
 		return "", fmt.Errorf("runtime: 读取会话事件失败: %w", err)
 	}
@@ -217,6 +235,11 @@ func (r *Runtime) sessionChainTail(ctx context.Context, sessionID string) (ids.E
 		}
 	}
 	return tail, nil
+}
+
+// sessionChainTail 是 SessionChainTail 的运行时方法形式。
+func (r *Runtime) sessionChainTail(ctx context.Context, sessionID string) (ids.EventID, error) {
+	return SessionChainTail(ctx, r.store, sessionID)
 }
 
 // isContentEvent 判断事件是否为内容事件，规则与 compile 的可见性判断一致：
@@ -230,13 +253,16 @@ func isContentEvent(typ string) bool {
 	return false
 }
 
-// appendContentToCtx 把回合内新写的内容事件追加到回合上下文，
-// 使其在下一轮 compile 中可见；该事件已追加过（崩溃恢复后重放）则跳过。
-func (r *Runtime) appendContentToCtx(ctx context.Context, p TurnParams, evID ids.EventID) error {
+// publishToCtx 把内容事件追加到上下文，使其在后续 compile 中可见；
+// 该事件已追加过（崩溃恢复后重放）则跳过，保证幂等。
+func publishToCtx(ctx context.Context, store *eventlog.Store, ctxID ids.ContextID, evID ids.EventID) error {
 	if evID == "" {
 		return nil
 	}
-	ops, err := r.store.ListCtxOps(ctx, p.ContextID)
+	if ctxID == "" {
+		return fmt.Errorf("runtime: ContextID 不能为空")
+	}
+	ops, err := store.ListCtxOps(ctx, ctxID)
 	if err != nil {
 		return fmt.Errorf("runtime: 读取上下文操作失败: %w", err)
 	}
@@ -245,12 +271,132 @@ func (r *Runtime) appendContentToCtx(ctx context.Context, p TurnParams, evID ids
 			return nil
 		}
 	}
-	if _, err := r.store.AppendCtxOp(ctx, eventlog.CtxOpInput{
-		Ctx: p.ContextID, Op: eventlog.CtxOpAppend, NewID: evID,
+	if _, err := store.AppendCtxOp(ctx, eventlog.CtxOpInput{
+		Ctx: ctxID, Op: eventlog.CtxOpAppend, NewID: evID,
 	}); err != nil {
 		return fmt.Errorf("runtime: 把内容事件追加到上下文失败: %w", err)
 	}
 	return nil
+}
+
+// appendContentToCtx 是 publishToCtx 的运行时方法形式。
+func (r *Runtime) appendContentToCtx(ctx context.Context, p TurnParams, evID ids.EventID) error {
+	return publishToCtx(ctx, r.store, p.ContextID, evID)
+}
+
+// UserMessage 是一次用户输入的落盘参数。
+type UserMessage struct {
+	SessionID string        // 会话 ID
+	TurnID    string        // 归属回合 ID，可空
+	ContextID ids.ContextID // 追加到的上下文
+	Text      string        // 正文
+}
+
+// AppendUserMessage 写入 user 角色的 message.created（以会话内容链尾为
+// parent_id）并以 ctx_op.append 追加到指定上下文，返回落盘事件。
+// 上层启动新回合时：先取 SessionChainTail 建上下文，再调用本函数。
+func AppendUserMessage(ctx context.Context, store *eventlog.Store, m UserMessage) (eventlog.Event, error) {
+	if m.SessionID == "" {
+		return eventlog.Event{}, fmt.Errorf("runtime: SessionID 不能为空")
+	}
+	if m.ContextID == "" {
+		return eventlog.Event{}, fmt.Errorf("runtime: ContextID 不能为空")
+	}
+	tail, err := SessionChainTail(ctx, store, m.SessionID)
+	if err != nil {
+		return eventlog.Event{}, err
+	}
+	ev, err := store.AppendEvent(ctx, eventlog.EventInput{
+		Type:      eventlog.TypeMessageCreated,
+		SessionID: m.SessionID,
+		TurnID:    m.TurnID,
+		Actor:     actorUser,
+		SubjectID: ids.NewMessageID().String(),
+		ParentID:  tail.String(),
+		Blob:      []byte(m.Text),
+		Attrs:     eventlog.MessageCreatedAttrs{Role: string(compile.RoleUser)},
+	})
+	if err != nil {
+		return eventlog.Event{}, fmt.Errorf("runtime: 写用户消息失败: %w", err)
+	}
+	if err := publishToCtx(ctx, store, m.ContextID, ev.ID); err != nil {
+		return eventlog.Event{}, err
+	}
+	return ev, nil
+}
+
+// PendingApproval 是一次已请求但尚未裁决的审批。
+type PendingApproval struct {
+	ToolCallID ids.ToolCallID `json:"tool_call_id"`
+	Name       string         `json:"name"`
+}
+
+// TurnStatus 是回合的只读状态视图：refs 指针 + 事件 fold 得出，
+// 不读任何可变字段表，进程重启后依然可得。
+type TurnStatus struct {
+	TurnID    string        `json:"turn_id"`
+	SessionID string        `json:"session_id"`
+	ContextID ids.ContextID `json:"context_id,omitempty"`
+	Model     string        `json:"model,omitempty"`
+
+	// Ref 取值见 RefRunning / RefCompleted / "waiting_approval:<审批ID>" /
+	// "failed:<原因>"；空串表示回合尚未落盘任何事件。
+	Ref string `json:"ref"`
+
+	Started   bool   `json:"started"`
+	Completed bool   `json:"completed"`
+	Error     string `json:"error,omitempty"`
+
+	// PendingApprovals 是等待用户裁决的工具调用（含工具名）。
+	PendingApprovals []PendingApproval `json:"pending_approvals,omitempty"`
+}
+
+// Status 读取回合状态。回合不存在（无任何事件）时返回错误。
+//
+// 读取顺序为先指针后事件：每次 MoveRef 都发生在其对应事件之后，
+// 因此这样读到的事件一定不旧于指针，避免出现"指针已挂起等待审批、
+// 却看不到 approval.requested"（或"已完成却看不到 turn.completed"）的读偏斜。
+func Status(ctx context.Context, store *eventlog.Store, turnID string) (TurnStatus, error) {
+	if strings.TrimSpace(turnID) == "" {
+		return TurnStatus{}, fmt.Errorf("runtime: TurnID 不能为空")
+	}
+	target, err := store.GetRef(ctx, TurnRefName(turnID))
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return TurnStatus{}, fmt.Errorf("runtime: 读取回合指针失败: %w", err)
+	}
+	evs, err := store.ListByTurn(ctx, turnID, 0, 0)
+	if err != nil {
+		return TurnStatus{}, fmt.Errorf("runtime: 读取回合事件失败: %w", err)
+	}
+	if len(evs) == 0 {
+		return TurnStatus{}, fmt.Errorf("runtime: 回合不存在: %s", turnID)
+	}
+	st, err := foldTurn(ctx, store, evs)
+	if err != nil {
+		return TurnStatus{}, err
+	}
+	status := TurnStatus{
+		TurnID:    turnID,
+		SessionID: st.sessionID,
+		ContextID: st.contextID,
+		Model:     st.model,
+		Ref:       target,
+		Started:   st.started,
+		Completed: st.completed,
+		Error:     st.failure,
+	}
+	for _, c := range st.calls {
+		if st.isSettled(c) {
+			continue
+		}
+		ap := st.approvalFor(c.id)
+		if ap == nil || ap.decided != nil {
+			continue
+		}
+		status.PendingApprovals = append(status.PendingApprovals,
+			PendingApproval{ToolCallID: c.id, Name: c.name})
+	}
+	return status, nil
 }
 
 // DecideApproval 记录一次审批决定并把挂起等待审批的回合指针移回 running；

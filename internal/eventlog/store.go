@@ -115,14 +115,22 @@ type Store struct {
 
 // Open 打开（必要时全新创建）事件日志数据库。
 // registry 用于读取时按 v 逐版本升级旧事件，可为 nil。
+//
+// path 为 ":memory:" 时限制连接数为 1：内存库按连接隔离，多连接会各自
+// 看到空库（仅测试使用内存库；文件库为 WAL + busy_timeout，不受影响）。
 func Open(path string, registry Registry) (*Store, error) {
 	dsn := path
-	if path != ":memory:" {
+	if path == ":memory:" {
+		dsn = path
+	} else {
 		dsn += "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("eventlog: 打开数据库失败: %w", err)
+	}
+	if path == ":memory:" {
+		db.SetMaxOpenConns(1)
 	}
 	if err := migrate(db); err != nil {
 		db.Close()

@@ -37,6 +37,15 @@ type turnState struct {
 	completed bool
 	failure   string
 
+	// sessionID / contextID 来自 turn.started：恢复回合时重建编译入参。
+	sessionID string
+	contextID ids.ContextID
+
+	// model / providerID 来自最近一次 llm.requested：审批后继续时据此
+	// 重建 provider 客户端，不依赖进程内存。
+	model      string
+	providerID string
+
 	// chainTail 是回合内最后一个内容事件的 ID：新内容事件以它为
 	// parent_id，保证 compile 沿 parent_id 链能看见本条内容。
 	chainTail ids.EventID
@@ -56,6 +65,9 @@ func foldTurn(ctx context.Context, store *eventlog.Store, evs []eventlog.Event) 
 		approvals:       map[string]*approvalInfo{},
 	}
 	for _, ev := range evs {
+		if st.sessionID == "" {
+			st.sessionID = ev.SessionID
+		}
 		// 内容事件推进 parent_id 链尾（ListByTurn 已按 seq 升序）
 		if isContentEvent(ev.Type) {
 			st.chainTail = ev.ID
@@ -63,6 +75,16 @@ func foldTurn(ctx context.Context, store *eventlog.Store, evs []eventlog.Event) 
 		switch ev.Type {
 		case eventlog.TypeTurnStarted:
 			st.started = true
+			var attrs eventlog.TurnStartedAttrs
+			if json.Unmarshal(ev.Attrs, &attrs) == nil {
+				st.contextID = ids.ContextID(attrs.ContextID)
+			}
+		case eventlog.TypeLLMRequested:
+			var attrs eventlog.LLMRequestedAttrs
+			if json.Unmarshal(ev.Attrs, &attrs) == nil {
+				st.model = attrs.Model
+				st.providerID = attrs.ProviderID
+			}
 		case eventlog.TypeTurnCompleted:
 			var attrs eventlog.TurnCompletedAttrs
 			if json.Unmarshal(ev.Attrs, &attrs) == nil {
@@ -117,14 +139,20 @@ func foldTurn(ctx context.Context, store *eventlog.Store, evs []eventlog.Event) 
 	return st, nil
 }
 
+// isSettled 判断一次调用是否已结清：调用 SubjectID 命中 tool.returned，
+// 或其幂等键已命中（崩溃恢复时 subject 可能不同）。
+func (st *turnState) isSettled(c pendingCall) bool {
+	if st.settledSubjects[c.id.String()] {
+		return true
+	}
+	return c.idempotencyKey != "" && st.settledKeys[c.idempotencyKey]
+}
+
 // nextPending 返回第一个未结清的工具调用。
 // 崩溃恢复按幂等键判断：调用 SubjectID 或幂等键已有 tool.returned 即视为结清。
 func (st *turnState) nextPending() (pendingCall, bool) {
 	for _, c := range st.calls {
-		if st.settledSubjects[c.id.String()] {
-			continue
-		}
-		if c.idempotencyKey != "" && st.settledKeys[c.idempotencyKey] {
+		if st.isSettled(c) {
 			continue
 		}
 		return c, true

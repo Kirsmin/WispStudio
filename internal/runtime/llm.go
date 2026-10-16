@@ -23,7 +23,8 @@ func (r *Runtime) stepLLM(ctx context.Context, p TurnParams, tail ids.EventID) (
 	if err != nil {
 		return false, fmt.Errorf("compile 失败: %w", err)
 	}
-	req := BuildChatRequest(res, r.model, r.tools.Definitions())
+	// 请求用服务商侧裸模型 id；llm.requested attrs 里记录全称 id
+	req := BuildChatRequest(res, r.wireModel, r.tools.Definitions())
 
 	// llm.requested：blob 引用编译产出的 RequestManifest（回放用）
 	manifest, err := r.store.GetBlob(ctx, res.ManifestHash)
@@ -166,9 +167,9 @@ func (r *Runtime) recordToolCalls(ctx context.Context, p TurnParams, causeID ids
 			SubjectID: tcID.String(),
 			ParentID:  tail.String(),
 			CauseID:   causeID.String(),
-			Blob:      []byte(tc.Arguments),
+			Blob:      []byte(tc.Function.Arguments),
 			Attrs: eventlog.ToolCalledAttrs{
-				Name:           tc.Name,
+				Name:           tc.Function.Name,
 				ProviderID:     tc.ID,
 				IdempotencyKey: idempotencyKey(p.TurnID, tc, i),
 			},
@@ -198,9 +199,9 @@ func idempotencyKey(turnID string, tc provider.ToolCall, index int) string {
 	h.Write([]byte{0})
 	fmt.Fprintf(h, "%d", index)
 	h.Write([]byte{0})
-	h.Write([]byte(tc.Name))
+	h.Write([]byte(tc.Function.Name))
 	h.Write([]byte{0})
-	h.Write([]byte(tc.Arguments))
+	h.Write([]byte(tc.Function.Arguments))
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -229,7 +230,14 @@ func BuildChatRequest(res *compile.Result, model string, tools []provider.ToolDe
 				if pid == "" {
 					pid = res.ProviderMap[tc.ID]
 				}
-				tcs = append(tcs, provider.ToolCall{ID: pid, Type: "function", Name: tc.Name, Arguments: tc.Arguments})
+				tcs = append(tcs, provider.ToolCall{
+					ID:   pid,
+					Type: "function",
+					Function: provider.ToolCallFunction{
+						Name:      tc.Name,
+						Arguments: tc.Arguments,
+					},
+				})
 				j++
 			}
 			req.Messages = append(req.Messages, provider.Message{

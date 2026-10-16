@@ -185,10 +185,10 @@ func (a *toolCallAcc) add(deltas []ToolCallDelta) {
 		if d.Type != "" {
 			tc.Type = d.Type
 		}
-		if d.Name != "" {
-			tc.Name = d.Name
+		if d.Function.Name != "" {
+			tc.Function.Name = d.Function.Name
 		}
-		tc.Arguments += d.Arguments
+		tc.Function.Arguments += d.Function.Arguments
 	}
 }
 

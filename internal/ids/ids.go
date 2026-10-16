@@ -28,6 +28,7 @@ const (
 	KindAgent
 	KindCheckpoint
 	KindTurn
+	KindSession
 )
 
 // 前缀常量表（唯一允许出现简写的地方），按最长前缀优先匹配排序。
@@ -42,6 +43,7 @@ const (
 	prefixAgent      = "ag"
 	prefixCheckpoint = "ck"
 	prefixTurn       = "tn"
+	prefixSession    = "sess"
 )
 
 // prefixKind 将前缀映射到实体类型，顺序即最长前缀优先的匹配顺序。
@@ -59,6 +61,7 @@ var prefixKind = []struct {
 	{prefixAgent, KindAgent},
 	{prefixCheckpoint, KindCheckpoint},
 	{prefixTurn, KindTurn},
+	{prefixSession, KindSession},
 }
 
 func init() {
@@ -274,4 +277,21 @@ func ParseTurnID(s string) (TurnID, error) {
 		return "", err
 	}
 	return TurnID(s), nil
+}
+
+// SessionID 会话 ID。
+type SessionID string
+
+// NewSessionID 生成新会话 ID。
+func NewSessionID() SessionID { return SessionID(newID(prefixSession)) }
+
+// String 返回字符串形式。
+func (id SessionID) String() string { return string(id) }
+
+// ParseSessionID 校验并解析会话 ID。
+func ParseSessionID(s string) (SessionID, error) {
+	if err := checkPrefix(s, prefixSession); err != nil {
+		return "", err
+	}
+	return SessionID(s), nil
 }
