@@ -36,11 +36,22 @@ type Client struct {
 // Chat 发起 /chat/completions 对话；req.Stream 决定流式与否，两种路径都聚合为 Result。
 // 429/5xx/网络错误按指数退避重试，ctx 取消立即中止。
 func (c *Client) Chat(ctx context.Context, req ChatRequest) (*Result, error) {
+	return c.chat(ctx, req, nil)
+}
+
+// ChatStream 与 Chat 相同，但每收到一帧流式增量就调用 onDelta（可为 nil）。
+// onDelta 返回 error 会立即中止流并把该错误返回给调用方。
+func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onDelta func(StreamDelta) error) (*Result, error) {
+	return c.chat(ctx, req, onDelta)
+}
+
+// chat 是 Chat/ChatStream 的公共实现。
+func (c *Client) chat(ctx context.Context, req ChatRequest, onDelta func(StreamDelta) error) (*Result, error) {
 	start := time.Now()
 	attempts := c.maxRetries() + 1
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		res, retryAfter, err := c.doChat(ctx, req)
+		res, retryAfter, err := c.doChat(ctx, req, onDelta)
 		if err == nil {
 			res.Duration = time.Since(start)
 			return res, nil
@@ -61,7 +72,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*Result, error) {
 }
 
 // doChat 单次尝试；返回的 time.Duration 是服务端 Retry-After 提示（无则 0）。
-func (c *Client) doChat(ctx context.Context, req ChatRequest) (*Result, time.Duration, error) {
+func (c *Client) doChat(ctx context.Context, req ChatRequest, onDelta func(StreamDelta) error) (*Result, time.Duration, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, 0, &Error{Kind: KindRequest, Message: fmt.Sprintf("请求体编码失败: %v", err)}
@@ -101,6 +112,7 @@ func (c *Client) doChat(ctx context.Context, req ChatRequest) (*Result, time.Dur
 	}
 
 	res := &Result{}
+	acc := newToolCallAcc()
 	if req.Stream {
 		if err := readStream(resp.Body, func(ch streamChunk) error {
 			if ch.Usage != nil {
@@ -109,14 +121,27 @@ func (c *Client) doChat(ctx context.Context, req ChatRequest) (*Result, time.Dur
 			for _, choice := range ch.Choices {
 				res.Content += choice.Delta.Content
 				res.Reasoning += choice.Delta.ReasoningContent
+				acc.add(choice.Delta.ToolCalls)
 				if choice.FinishReason != "" {
 					res.FinishReason = choice.FinishReason
+				}
+			}
+			if onDelta != nil {
+				var d StreamDelta
+				for _, choice := range ch.Choices {
+					d.Content += choice.Delta.Content
+					d.Reasoning += choice.Delta.ReasoningContent
+					d.ToolCalls = append(d.ToolCalls, choice.Delta.ToolCalls...)
+				}
+				if err := onDelta(d); err != nil {
+					return err
 				}
 			}
 			return nil
 		}); err != nil {
 			return nil, 0, err
 		}
+		res.ToolCalls = acc.result()
 		return res, 0, nil
 	}
 
@@ -127,6 +152,7 @@ func (c *Client) doChat(ctx context.Context, req ChatRequest) (*Result, time.Dur
 	for _, choice := range out.Choices {
 		res.Content += choice.Message.Content
 		res.Reasoning += choice.Message.ReasoningContent
+		res.ToolCalls = append(res.ToolCalls, choice.Message.ToolCalls...)
 		if choice.FinishReason != "" {
 			res.FinishReason = choice.FinishReason
 		}
@@ -135,6 +161,47 @@ func (c *Client) doChat(ctx context.Context, req ChatRequest) (*Result, time.Dur
 		res.Usage = *out.Usage
 	}
 	return res, 0, nil
+}
+
+// toolCallAcc 按 index 聚合流式 tool_call 增量，保持出现顺序。
+type toolCallAcc struct {
+	order []int
+	byIdx map[int]*ToolCall
+}
+
+func newToolCallAcc() *toolCallAcc { return &toolCallAcc{byIdx: map[int]*ToolCall{}} }
+
+func (a *toolCallAcc) add(deltas []ToolCallDelta) {
+	for _, d := range deltas {
+		tc, ok := a.byIdx[d.Index]
+		if !ok {
+			tc = &ToolCall{}
+			a.byIdx[d.Index] = tc
+			a.order = append(a.order, d.Index)
+		}
+		if d.ID != "" {
+			tc.ID = d.ID
+		}
+		if d.Type != "" {
+			tc.Type = d.Type
+		}
+		if d.Name != "" {
+			tc.Name = d.Name
+		}
+		tc.Arguments += d.Arguments
+	}
+}
+
+// result 返回聚合后的工具调用列表（index 升序，即出现顺序）。
+func (a *toolCallAcc) result() []ToolCall {
+	if len(a.order) == 0 {
+		return nil
+	}
+	out := make([]ToolCall, 0, len(a.order))
+	for _, idx := range a.order {
+		out = append(out, *a.byIdx[idx])
+	}
+	return out
 }
 
 // errStreamDone 表示流正常结束（收到 [DONE]）。

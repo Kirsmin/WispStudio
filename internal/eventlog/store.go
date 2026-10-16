@@ -72,12 +72,12 @@ type EventInput struct {
 type opKind int
 
 const (
-	opAppend opKind = iota // 批量追加事件（同一 turn 的批量事件在同一事务原子写入）
-	opMoveRef              // 更新 refs 并追加 ref.moved 事件
-	opCreateContext        // 创建上下文：写 contexts 表并追加 ctx.created 事件
-	opAppendCtxOp          // 追加上下文编辑操作：写 ctx_ops 表并追加 ctx.op 事件
-	opAddLink              // 写入一条 links 关系（INSERT OR IGNORE）
-	opPutBlob              // 按内容哈希去重写入 blobs 表（供 RequestManifest 等引用）
+	opAppend        opKind = iota // 批量追加事件（同一 turn 的批量事件在同一事务原子写入）
+	opMoveRef                     // 更新 refs 并追加 ref.moved 事件
+	opCreateContext               // 创建上下文：写 contexts 表并追加 ctx.created 事件
+	opAppendCtxOp                 // 追加上下文编辑操作：写 ctx_ops 表并追加 ctx.op 事件
+	opAddLink                     // 写入一条 links 关系（INSERT OR IGNORE）
+	opPutBlob                     // 按内容哈希去重写入 blobs 表（供 RequestManifest 等引用）
 )
 
 // 写入请求，经缓冲 channel 提交给单 writer。
@@ -275,6 +275,16 @@ func (s *Store) submit(ctx context.Context, req writeReq) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// GetRef 读取命名引用的当前目标；不存在返回 sql.ErrNoRows。
+func (s *Store) GetRef(ctx context.Context, name string) (string, error) {
+	var target string
+	err := s.db.QueryRowContext(ctx, `SELECT target FROM refs WHERE name = ?`, name).Scan(&target)
+	if err != nil {
+		return "", err
+	}
+	return target, nil
 }
 
 // Close 关闭事件日志：停止接收新请求，排空队列后关闭数据库。
@@ -549,6 +559,23 @@ func (s *Store) ListBySession(ctx context.Context, sessionID string, afterSeq in
 		q += ` LIMIT ?`
 		args = append(args, limit)
 	}
+	return s.queryEvents(ctx, q, args...)
+}
+
+// ListByTurn 按回合读取 seq 大于 afterSeq 的事件（按 seq 升序，最多 limit 条）。
+// limit <= 0 表示不限制。读取时按 v 逐版本升级。
+func (s *Store) ListByTurn(ctx context.Context, turnID string, afterSeq int64, limit int) ([]Event, error) {
+	q := `SELECT ` + columns + ` FROM events WHERE turn_id = ? AND seq > ? ORDER BY seq ASC`
+	args := []any{turnID, afterSeq}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	return s.queryEvents(ctx, q, args...)
+}
+
+// queryEvents 执行事件查询并逐行升级版本。
+func (s *Store) queryEvents(ctx context.Context, q string, args ...any) ([]Event, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err

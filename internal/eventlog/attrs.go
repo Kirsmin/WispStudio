@@ -41,6 +41,36 @@ const (
 	// TypeLLMRequested 记录一次 LLM 请求，blob 字段引用 RequestManifest
 	// （编译产出的 [(id, blob_hash, revision)] 清单），供回放用。
 	TypeLLMRequested = "llm.requested"
+
+	// TypeLLMResponded 记录一次 LLM 响应完成，SubjectID = 请求 ID（对应
+	// llm.requested 的 SubjectID）。usage / finish_reason / 耗时是读取时
+	// 才解析的附加数据，故放 attrs。
+	TypeLLMResponded = "llm.responded"
+
+	// TypeTurnStarted 开始一个回合，SubjectID = 回合 ID。回合的当前状态
+	// 不存任何表，由 refs（turn/<id>）+ 事件折叠得出。
+	TypeTurnStarted = "turn.started"
+
+	// TypeTurnCompleted 结束一个回合（成功或失败），SubjectID = 回合 ID。
+	// 失败时 attrs.error 非空。
+	TypeTurnCompleted = "turn.completed"
+
+	// TypeMessageDelta 流式响应的一帧增量，SubjectID = 消息 ID（该轮
+	// assistant 消息），正文增量存 blobs。仅供增量展示与回放，
+	// 不属于内容事件，compile 忽略。
+	TypeMessageDelta = "message.delta"
+
+	// TypeApprovalRequested 请求用户批准一次工具调用，SubjectID = 审批 ID。
+	// attrs.tool_call_id 指向对应的 tool.called 条目。
+	TypeApprovalRequested = "approval.requested"
+
+	// TypeApprovalDecided 用户/上层对一次审批做出决定，SubjectID = 审批 ID
+	// （与 approval.requested 相同）。
+	TypeApprovalDecided = "approval.decided"
+
+	// TypeAgentSpawned 派生一个子 agent，SubjectID = 子 agent ID。
+	// 本阶段只定 attrs 结构，不产生实际派生行为。
+	TypeAgentSpawned = "agent.spawned"
 )
 
 // MessageCreatedAttrs 是 message.created 事件的附加属性。
@@ -59,11 +89,18 @@ type ToolCalledAttrs struct {
 	// ProviderID 是 provider 侧的 tool_use_id，仅用于内部 ToolCallID ↔
 	// provider tool_use_id 映射，绝不充当主键；为空表示尚未分配。
 	ProviderID string `json:"provider_id,omitempty"`
+
+	// IdempotencyKey 是本次调用的幂等键（同一逻辑调用跨崩溃恢复不变），
+	// 崩溃恢复据此判断调用是否已结清，绝不重复执行已落盘结果。
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 // ToolReturnedAttrs 是 tool.returned 事件的附加属性。
-// 结果正文存 blobs，此处通常为空，保留扩展位。
-type ToolReturnedAttrs struct{}
+// 结果正文存 blobs，此处只放幂等键（与 tool.called 相同）。
+type ToolReturnedAttrs struct {
+	// IdempotencyKey 与对应 tool.called 的幂等键一致。
+	IdempotencyKey string `json:"idempotency_key"`
+}
 
 // PromptInjectedAttrs 是 prompt.injected 事件的附加属性。
 // 提示词正文存 blobs，此处只放元数据。
@@ -79,3 +116,78 @@ type CtxCreatedAttrs struct{}
 // CtxOpAttrs 是 ctx.op 事件的附加属性。
 // op/target/anchor/okey/new_id 是 ctx_ops 表列，此处通常为空，保留扩展位。
 type CtxOpAttrs struct{}
+
+// LLMRequestedAttrs 是 llm.requested 事件的附加属性。
+// RequestManifest 由 blob 字段引用，此处只放请求元数据。
+type LLMRequestedAttrs struct {
+	// ProviderID 是模型服务商 ID。
+	ProviderID string `json:"provider_id"`
+
+	// Model 是模型全称 id（{ProviderID}/{ModelID}）。
+	Model string `json:"model"`
+}
+
+// LLMRespondedAttrs 是 llm.responded 事件的附加属性。
+type LLMRespondedAttrs struct {
+	// PromptTokens / CompletionTokens / TotalTokens 是 token 用量。
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+
+	// FinishReason 是 provider 侧的结束原因。
+	FinishReason string `json:"finish_reason,omitempty"`
+
+	// DurationMs 是请求耗时（含重试），毫秒。
+	DurationMs int64 `json:"duration_ms"`
+}
+
+// TurnStartedAttrs 是 turn.started 事件的附加属性，通常为空，保留扩展位。
+type TurnStartedAttrs struct{}
+
+// TurnCompletedAttrs 是 turn.completed 事件的附加属性。
+type TurnCompletedAttrs struct {
+	// FinishReason 是最后一轮 LLM 响应的结束原因，失败时为空。
+	FinishReason string `json:"finish_reason,omitempty"`
+
+	// Error 非空表示回合以失败结束。
+	Error string `json:"error,omitempty"`
+}
+
+// MessageDeltaAttrs 是 message.delta 事件的附加属性。
+// delta 正文存 blobs，此处标明增量类别。
+type MessageDeltaAttrs struct {
+	// Kind 是增量类别："content"（正文）或 "reasoning"（推理内容）。
+	Kind string `json:"kind"`
+}
+
+// ApprovalRequestedAttrs 是 approval.requested 事件的附加属性。
+type ApprovalRequestedAttrs struct {
+	// ToolCallID 是等待审批的工具调用 ID（tool.called 的 SubjectID）。
+	ToolCallID string `json:"tool_call_id"`
+
+	// Name 是工具名（冗余存放，便于审批界面直接展示）。
+	Name string `json:"name"`
+}
+
+// ApprovalDecidedAttrs 是 approval.decided 事件的附加属性。
+type ApprovalDecidedAttrs struct {
+	// Decision 是决定："approved"（批准）或 "rejected"（拒绝）。
+	Decision string `json:"decision"`
+
+	// Reason 是拒绝理由或备注，可空。
+	Reason string `json:"reason,omitempty"`
+}
+
+// AgentSpawnedAttrs 是 agent.spawned 事件的附加属性。
+// 本阶段只定结构：子 agent 的三种派生方式（空上下文/完整分叉/摘要分叉）。
+type AgentSpawnedAttrs struct {
+	// ParentAgent 是父 agent ID。
+	ParentAgent string `json:"parent_agent"`
+
+	// Seed 是派生方式："empty"（空上下文）|"fork"（完整分叉）|"summary"（摘要分叉）。
+	Seed string `json:"seed"`
+
+	// SeedRef 是派生源引用（fork 时为源上下文 ID，summary 时为摘要事件 ID），
+	// empty 方式下为空。
+	SeedRef string `json:"seed_ref,omitempty"`
+}

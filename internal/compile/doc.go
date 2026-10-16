@@ -21,9 +21,11 @@
 //     dst=tool.called 事件 ID）。组内任一被 hide 则整组隐藏（渲染时整组
 //     丢弃、不留占位符）；孤儿 returned（其 called 不在编译列表中）丢弃；
 //     孤儿 called 补占位结果 "omitted" 并产生 warning。
-//  5. validate 不变量：消息列表非空、首条非 assistant、角色严格交替、
-//     工具调用 ID 与结果一一配对（每个 tool_use 恰有一个 tool_result
-//     且出现在其后）。任何一条不满足都返回 error，绝不静默放过。
+//  5. validate 不变量：消息列表非空、首条非 assistant、
+//     assistant 正文消息可紧跟工具调用消息（视为同一逻辑 assistant
+//     消息，构造 provider 请求时由 runtime 合并为一条）、user 工具结果
+//     可相邻、工具调用 ID 与结果一一配对（每个 tool_use 恰有一个
+//     tool_result 且出现在其后）。任何一条不满足都返回 error，绝不静默放过。
 //  6. render：隐藏的非工具条目渲染为同角色占位消息 "[已隐藏]"；
 //     内部 ToolCallID ↔ provider tool_use_id 的映射存于
 //     tool.called.attrs.provider_id（不当主键），编译结果在

@@ -664,7 +664,23 @@ func render(ctx context.Context, store *eventlog.Store, list *entryList, res *Re
 	return nil
 }
 
-// validate 校验编译不变量：非空、首条非 assistant、角色严格交替、
+// sameRoleAdjacent 判断同角色相邻是否合法：
+//   - assistant：后一条必须是工具调用（正文+工具调用、或多个并行调用
+//     视为同一逻辑 assistant 消息）；正文后紧跟正文仍非法。
+//   - user：后一条必须是工具结果（一次调用的多条结果相邻合法）；
+//     正文后紧跟正文仍非法。
+func sameRoleAdjacent(prev, cur Message) bool {
+	switch cur.Role {
+	case RoleAssistant:
+		return cur.ToolCall != nil
+	case RoleUser:
+		return cur.ToolResultFor != ""
+	}
+	return false
+}
+
+// validate 校验编译不变量：非空、首条非 assistant、assistant 正文消息可
+// 紧跟工具调用消息（同一逻辑 assistant 消息）、user 工具结果可相邻、
 // 工具调用与结果一一配对。任何一条不满足都返回 error。
 func validate(msgs []Message) error {
 	if len(msgs) == 0 {
@@ -674,8 +690,8 @@ func validate(msgs []Message) error {
 		return fmt.Errorf("compile: 首条消息为 assistant，违反不变量")
 	}
 	for i := 1; i < len(msgs); i++ {
-		if msgs[i].Role == msgs[i-1].Role {
-			return fmt.Errorf("compile: 第 %d、%d 条消息角色均为 %s，违反角色交替", i-1, i, msgs[i].Role)
+		if msgs[i].Role == msgs[i-1].Role && !sameRoleAdjacent(msgs[i-1], msgs[i]) {
+			return fmt.Errorf("compile: 第 %d、%d 条消息角色均为 %s，违反角色分段规则", i-1, i, msgs[i].Role)
 		}
 	}
 	calls := map[ids.ToolCallID]int{}

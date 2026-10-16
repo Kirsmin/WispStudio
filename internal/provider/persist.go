@@ -87,9 +87,9 @@ func (c *Catalog) AddModel(providerID, modelID, alias string) error {
 // upsertModelsLine 在文本行中找到 providerID 对应 [[Providers]] 块的 Models 行并整体替换；
 // 块内无 Models 行时插到 ProviderID 行之后。其余行原样保留。
 func upsertModelsLine(lines []string, providerID string, models []config.ModelConfig) ([]string, error) {
-	inBlock := false      // 当前处于某个 [[Providers]] 块内
-	isTarget := false     // 当前块就是目标 provider
-	providerIdx := -1     // 目标块的 ProviderID 行号
+	inBlock := false  // 当前处于某个 [[Providers]] 块内
+	isTarget := false // 当前块就是目标 provider
+	providerIdx := -1 // 目标块的 ProviderID 行号
 	replace := func(idx int) []string {
 		indent := lines[idx][:len(lines[idx])-len(strings.TrimLeft(lines[idx], " \t"))]
 		out := append([]string{}, lines...)

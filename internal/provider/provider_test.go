@@ -147,8 +147,8 @@ func TestChatRetryExhaustedOnServerError(t *testing.T) {
 // 校验错误分类：状态码与 ctx 取消都映射到正确的 ErrorKind，且不再重试。
 func TestChatErrorClassification(t *testing.T) {
 	cases := []struct {
-		name    string
-		status  int
+		name     string
+		status   int
 		wantKind ErrorKind
 	}{
 		{"认证失败 401", 401, KindAuth},
