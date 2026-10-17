@@ -84,6 +84,10 @@ type SessionCreatedAttrs struct {
 type MessageCreatedAttrs struct {
 	// Role 是消息角色，取值 "user" / "assistant"。
 	Role string `json:"role"`
+
+	// Truncated 表示正文来自中断/失败的流式响应，是不完整内容；
+	// 回合失败路径据此补写已累积的 assistant 消息，保证会话可继续。
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // ToolCalledAttrs 是 tool.called 事件的附加属性。

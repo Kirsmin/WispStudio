@@ -57,6 +57,29 @@ func (r *Runtime) stepLLM(ctx context.Context, p TurnParams, tail ids.EventID) (
 		return r.appendDelta(ctx, p, msgID, &content, &reasoning, d)
 	})
 	if err != nil {
+		// 中断/报错/超时：把已累积的正文补写为截断的 message.created 并追加
+		// 到上下文，否则 compile 会把回合投影成相邻两条 user 消息而报废会话。
+		// 写入用剥离取消的 context，停止请求也能保住已收到的内容。
+		if content.Len() > 0 {
+			writeCtx := context.WithoutCancel(ctx)
+			msgEv, werr := r.writer.AppendEvent(writeCtx, eventlog.EventInput{
+				Type:      eventlog.TypeMessageCreated,
+				SessionID: p.SessionID,
+				TurnID:    p.TurnID,
+				Actor:     actorRuntime,
+				SubjectID: msgID.String(),
+				ParentID:  tail.String(),
+				CauseID:   reqEv.ID.String(),
+				Blob:      []byte(content.String()),
+				Attrs:     eventlog.MessageCreatedAttrs{Role: string(compile.RoleAssistant), Truncated: true},
+			})
+			if werr != nil {
+				return false, fmt.Errorf("runtime: 写截断 message.created 失败: %w", werr)
+			}
+			if werr := r.appendContentToCtx(writeCtx, p, msgEv.ID); werr != nil {
+				return false, werr
+			}
+		}
 		return false, fmt.Errorf("LLM 请求失败: %w", err)
 	}
 
