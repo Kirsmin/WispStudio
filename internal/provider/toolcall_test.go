@@ -26,7 +26,7 @@ func TestToolCallNestedRequestWireFormat(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, MaxRetries: 0}
-	if _, err := c.Chat(context.Background(), ChatRequest{
+	if _, err := c.ChatStream(context.Background(), ChatRequest{
 		Model: "m",
 		Messages: []Message{{
 			Role:    "assistant",
@@ -36,7 +36,7 @@ func TestToolCallNestedRequestWireFormat(t *testing.T) {
 				Function: ToolCallFunction{Name: "read_file", Arguments: `{"path":"a.txt"}`},
 			}},
 		}},
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("Chat 失败: %v", err)
 	}
 
@@ -154,7 +154,7 @@ func TestChatStreamFlatToolCallsTolerated(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, MaxRetries: 0}
-	res, err := c.Chat(context.Background(), ChatRequest{Model: "m", Stream: true})
+	res, err := c.ChatStream(context.Background(), ChatRequest{Model: "m", Stream: true}, nil)
 	if err != nil {
 		t.Fatalf("Chat 失败: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestChatNonStreamNestedToolCalls(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, MaxRetries: 0}
-	res, err := c.Chat(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "q"}}})
+	res, err := c.ChatStream(context.Background(), ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "q"}}}, nil)
 	if err != nil {
 		t.Fatalf("Chat 失败: %v", err)
 	}

@@ -69,7 +69,7 @@ func foldTurn(ctx context.Context, store *eventlog.Store, evs []eventlog.Event) 
 			st.sessionID = ev.SessionID
 		}
 		// 内容事件推进 parent_id 链尾（ListByTurn 已按 seq 升序）
-		if isContentEvent(ev.Type) {
+		if eventlog.IsContentType(ev.Type) {
 			st.chainTail = ev.ID
 		}
 		switch ev.Type {

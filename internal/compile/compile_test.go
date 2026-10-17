@@ -14,7 +14,7 @@ import (
 // 测试辅助：打开内存事件日志。
 func openStore(t *testing.T) *eventlog.Store {
 	t.Helper()
-	s, err := eventlog.Open(":memory:", nil)
+	s, err := eventlog.Open(":memory:")
 	if err != nil {
 		t.Fatalf("打开事件日志失败: %v", err)
 	}
@@ -60,24 +60,6 @@ func (c *chain) msgAs(t *testing.T, s *eventlog.Store, subject, role, text strin
 	}
 	c.last = ev.ID
 	return ev
-}
-
-// prompt 追加一条 prompt.injected 事件。
-func (c *chain) prompt(t *testing.T, s *eventlog.Store, text string) (eventlog.Event, string) {
-	t.Helper()
-	subject := ids.NewPromptID().String()
-	ev, err := s.AppendEvent(context.Background(), eventlog.EventInput{
-		Type:      eventlog.TypePromptInjected,
-		SubjectID: subject,
-		ParentID:  c.last.String(),
-		Blob:      []byte(text),
-		Attrs:     eventlog.PromptInjectedAttrs{Source: "test"},
-	})
-	if err != nil {
-		t.Fatalf("追加 prompt.injected 失败: %v", err)
-	}
-	c.last = ev.ID
-	return ev, subject
 }
 
 // call 追加一条 tool.called 事件（不自动补结果）。
@@ -668,28 +650,6 @@ func TestCompileProviderMap(t *testing.T) {
 	}
 	if found == nil || found.ProviderID != "toolu_01ABC" {
 		t.Fatalf("ToolCall.ProviderID 映射丢失: %+v", found)
-	}
-}
-
-// TestCompilePromptInjected 覆盖 prompt.injected 渲染为 user 消息的场景。
-func TestCompilePromptInjected(t *testing.T) {
-	s := openStore(t)
-	var c chain
-	c.msg(t, s, "user", "问题")
-	c.msg(t, s, "assistant", "初步回答")
-	e2, _ := c.prompt(t, s, "系统提示词注入")
-
-	ctx, err := s.CreateContext(context.Background(), eventlog.ContextInput{ForkAt: e2.ID})
-	if err != nil {
-		t.Fatalf("创建上下文失败: %v", err)
-	}
-	res, err := Compile(context.Background(), s, ctx.ID)
-	if err != nil {
-		t.Fatalf("编译失败: %v", err)
-	}
-	assertInvariants(t, res.Messages)
-	if got, want := join(summarize(res.Messages)), "user:问题 | assistant:初步回答 | user:系统提示词注入"; got != want {
-		t.Fatalf("消息列表 = %q, 期望 %q", got, want)
 	}
 }
 

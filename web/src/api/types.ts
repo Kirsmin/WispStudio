@@ -5,7 +5,6 @@ export interface EventDTO {
   Seq: number
   Type: string
   SessionID: string
-  AgentID: string
   TurnID: string
   Actor: string
   ParentID: string
@@ -14,7 +13,6 @@ export interface EventDTO {
   Blob: string
   Attrs: Record<string, unknown>
   TS: number
-  V: number
   BlobText?: string
 }
 

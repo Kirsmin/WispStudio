@@ -6,31 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"wisp/internal/ids"
 )
-
-// schemaV2 相对 schema_v1 是纯增量：只新增 contexts / ctx_ops 两张表，
-// 不改动任何旧表与旧数据；v1 库打开时自动补建并升级版本号。
-const schemaV2 = `
-CREATE TABLE IF NOT EXISTS contexts (
-    id          TEXT PRIMARY KEY,
-    base_ctx    TEXT NOT NULL DEFAULT '',
-    fork_at     TEXT NOT NULL DEFAULT '',
-    created_seq INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS ctx_ops (
-    id     TEXT PRIMARY KEY,
-    ctx    TEXT NOT NULL,
-    seq    INTEGER NOT NULL,
-    op     TEXT NOT NULL,
-    target TEXT NOT NULL DEFAULT '',
-    anchor TEXT NOT NULL DEFAULT '',
-    okey   TEXT NOT NULL DEFAULT '',
-    new_id TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_ctx_ops_ctx ON ctx_ops(ctx, seq);
-`
 
 // ContextRow 是 contexts 表的一行，即一个上下文。
 // 上下文构成 base_ctx 链：子上下文继承基线的历史与全部 ctx_ops。
@@ -249,6 +228,46 @@ func (s *Store) GetBlob(ctx context.Context, hash string) ([]byte, error) {
 		return nil, fmt.Errorf("eventlog: 读取 blob %s 失败: %w", hash, err)
 	}
 	return data, nil
+}
+
+// GetBlobs 批量读取附件内容；按批查询，避免编译时逐条读取。
+// 不存在的哈希不会出现在返回 map 中，由调用方决定是否报错。
+func (s *Store) GetBlobs(ctx context.Context, hashes []string) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(hashes))
+	const batch = 500
+	for start := 0; start < len(hashes); start += batch {
+		end := min(start+batch, len(hashes))
+		args := make([]any, 0, end-start)
+		marks := make([]string, 0, end-start)
+		for _, hash := range hashes[start:end] {
+			if hash == "" {
+				continue
+			}
+			marks = append(marks, "?")
+			args = append(args, hash)
+		}
+		if len(args) == 0 {
+			continue
+		}
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT hash, data FROM blobs WHERE hash IN (`+strings.Join(marks, ",")+`)`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("eventlog: 批量读取 blob 失败: %w", err)
+		}
+		for rows.Next() {
+			var hash string
+			var data []byte
+			if err := rows.Scan(&hash, &data); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[hash] = data
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // PutBlob 把内容按 sha256 去重写入 blobs 表，返回哈希引用。

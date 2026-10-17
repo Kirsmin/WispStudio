@@ -17,7 +17,7 @@ import (
 
 // TestConcurrentAppend 并发追加 1000 个事件，校验 seq 全局单调且连续。
 func TestConcurrentAppend(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "eventlog.db"), nil)
+	s, err := Open(filepath.Join(t.TempDir(), "eventlog.db"))
 	if err != nil {
 		t.Fatalf("Open 出错: %v", err)
 	}
@@ -88,15 +88,12 @@ func TestConcurrentAppend(t *testing.T) {
 		if events[i].Seq <= events[i-1].Seq {
 			t.Fatalf("seq 非单调递增: events[%d].Seq=%d, events[%d].Seq=%d", i, events[i].Seq, i-1, events[i-1].Seq)
 		}
-		if events[i].V != CurrentVersion {
-			t.Fatalf("事件版本 = %d, 期望 %d", events[i].V, CurrentVersion)
-		}
 	}
 }
 
 // TestBatchAtomic 校验同一 turn 的批量事件在同一事务原子写入且 seq 连续。
 func TestBatchAtomic(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "eventlog.db"), nil)
+	s, err := Open(filepath.Join(t.TempDir(), "eventlog.db"))
 	if err != nil {
 		t.Fatalf("Open 出错: %v", err)
 	}
@@ -150,67 +147,14 @@ func TestUnknownSchemaRejected(t *testing.T) {
 	}
 	db.Close()
 
-	if _, err := Open(path, nil); err == nil {
+	if _, err := Open(path); err == nil {
 		t.Fatal("发现旧版/未知表结构应报错退出")
-	}
-}
-
-// TestUpcast 校验读取时按 v 逐版本升级旧事件。
-func TestUpcast(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "eventlog.db")
-	s, err := Open(path, Registry{
-		"test.old": UpcasterFunc(func(v int, attrs json.RawMessage) (json.RawMessage, error) {
-			var m map[string]any
-			if err := json.Unmarshal(attrs, &m); err != nil {
-				return nil, err
-			}
-			m["upgraded"] = true
-			return json.Marshal(m)
-		}),
-	})
-	if err != nil {
-		t.Fatalf("Open 出错: %v", err)
-	}
-	defer s.Close()
-
-	// 手工插入一条 v0 旧事件（模拟旧版本写入的数据，永不迁移落库）
-	oldID := ids.NewEventID()
-	if _, err := s.db.Exec(`INSERT INTO events
-		(id, seq, type, session_id, agent_id, turn_id, actor, parent_id, cause_id, subject_id, blob, attrs, ts, v)
-		VALUES(?, 1, 'test.old', 'sess-old', '', '', '', '', '', '', '', '{"legacy":1}', 0, 0)`,
-		oldID.String()); err != nil {
-		t.Fatalf("插入旧事件出错: %v", err)
-	}
-
-	ev, err := s.Get(context.Background(), oldID)
-	if err != nil {
-		t.Fatalf("Get 出错: %v", err)
-	}
-	if ev.V != CurrentVersion {
-		t.Fatalf("升级后版本 = %d, 期望 %d", ev.V, CurrentVersion)
-	}
-	var attrs map[string]any
-	if err := json.Unmarshal(ev.Attrs, &attrs); err != nil {
-		t.Fatalf("解析 attrs 出错: %v", err)
-	}
-	if attrs["legacy"] != float64(1) || attrs["upgraded"] != true {
-		t.Fatalf("attrs 升级结果不正确: %v", attrs)
-	}
-
-	// 库中原始行仍是 v0，证明旧事件永不迁移
-	var rawV int
-	var rawAttrs string
-	if err := s.db.QueryRow(`SELECT v, attrs FROM events WHERE id = ?`, oldID.String()).Scan(&rawV, &rawAttrs); err != nil {
-		t.Fatalf("读取原始行出错: %v", err)
-	}
-	if rawV != 0 || rawAttrs != `{"legacy":1}` {
-		t.Fatalf("原始行被意外迁移: v=%d attrs=%s", rawV, rawAttrs)
 	}
 }
 
 // TestMoveRef 校验 refs 更新同时追加 ref.moved 事件。
 func TestMoveRef(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "eventlog.db"), nil)
+	s, err := Open(filepath.Join(t.TempDir(), "eventlog.db"))
 	if err != nil {
 		t.Fatalf("Open 出错: %v", err)
 	}
@@ -239,12 +183,4 @@ func TestMoveRef(t *testing.T) {
 	if ev2.Seq <= ev.Seq {
 		t.Fatalf("ref.moved 事件 seq 非递增: %d → %d", ev.Seq, ev2.Seq)
 	}
-}
-
-// UpcasterFunc 把函数适配为 Upcaster，便于测试。
-type UpcasterFunc func(v int, attrs json.RawMessage) (json.RawMessage, error)
-
-// Upcast 实现 Upcaster 接口。
-func (f UpcasterFunc) Upcast(v int, attrs json.RawMessage) (json.RawMessage, error) {
-	return f(v, attrs)
 }

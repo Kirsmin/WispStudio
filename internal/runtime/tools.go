@@ -71,9 +71,6 @@ func NewRegistry(workspaceRoot string) (*Registry, error) {
 	return reg, nil
 }
 
-// WorkspaceRoot 返回工作区根（绝对路径）。
-func (r *Registry) WorkspaceRoot() string { return r.workspaceRoot }
-
 func (r *Registry) add(spec ToolSpec) { r.tools[spec.Definition.Function.Name] = spec }
 
 // Definitions 返回全部内置工具的定义（按名排序），发给 provider。

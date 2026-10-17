@@ -56,7 +56,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		writeError(w, http.StatusBadRequest, "%v", err)
+		writeError(w, http.StatusInternalServerError, "保存配置失败: %v", err)
 		return
 	}
 

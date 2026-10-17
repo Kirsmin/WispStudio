@@ -29,7 +29,6 @@ type eventDTO struct {
 	Seq       int64           `json:"Seq"`
 	Type      string          `json:"Type"`
 	SessionID string          `json:"SessionID"`
-	AgentID   string          `json:"AgentID"`
 	TurnID    string          `json:"TurnID"`
 	Actor     string          `json:"Actor"`
 	ParentID  string          `json:"ParentID"`
@@ -38,7 +37,6 @@ type eventDTO struct {
 	Blob      string          `json:"Blob"`
 	Attrs     json.RawMessage `json:"Attrs"`
 	TS        int64           `json:"TS"`
-	V         int             `json:"V"`
 	BlobText  string          `json:"BlobText,omitempty"`
 }
 
@@ -49,7 +47,6 @@ func (s *Server) projectEvent(ctx context.Context, ev eventlog.Event) eventDTO {
 		Seq:       ev.Seq,
 		Type:      ev.Type,
 		SessionID: ev.SessionID,
-		AgentID:   ev.AgentID,
 		TurnID:    ev.TurnID,
 		Actor:     ev.Actor,
 		ParentID:  ev.ParentID,
@@ -58,7 +55,6 @@ func (s *Server) projectEvent(ctx context.Context, ev eventlog.Event) eventDTO {
 		Blob:      ev.Blob,
 		Attrs:     ev.Attrs,
 		TS:        ev.TS,
-		V:         ev.V,
 	}
 	if dto.Attrs == nil {
 		dto.Attrs = json.RawMessage(`{}`)

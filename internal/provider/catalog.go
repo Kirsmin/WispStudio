@@ -122,12 +122,17 @@ func (c *Catalog) findProvider(providerID string) (*config.ProviderConfig, error
 
 // Get 按全称 id 取模型；id 格式错误、provider 不存在、模型不存在均返回明确错误。
 func (c *Catalog) Get(fullID ModelFullID) (Model, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.getLocked(fullID)
+}
+
+// getLocked 是 Get 的持锁版本；调用方需已持锁。
+func (c *Catalog) getLocked(fullID ModelFullID) (Model, error) {
 	providerID, modelID := fullID.Split()
 	if providerID == "" || modelID == "" {
 		return Model{}, fmt.Errorf("provider: 模型全称 id 格式应为 {ProviderID}/{ModelID}: %q", string(fullID))
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	p, err := c.findProvider(providerID)
 	if err != nil {
 		return Model{}, err
@@ -171,12 +176,12 @@ type Endpoint struct {
 // Endpoint 按模型全称 id 返回连接参数；id 格式错误、provider 或模型不存在
 // 时返回明确错误。模型 id 一律原样透传，不做任何 provider 私有转换。
 func (c *Catalog) Endpoint(fullID ModelFullID) (Endpoint, error) {
-	if _, err := c.Get(fullID); err != nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, err := c.getLocked(fullID); err != nil {
 		return Endpoint{}, err
 	}
 	providerID, modelID := fullID.Split()
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	p, err := c.findProvider(providerID)
 	if err != nil {
 		return Endpoint{}, err

@@ -22,7 +22,7 @@
 //     turn.completed 并把指针移到 completed。
 //
 // 内容可见性：每个内容事件（message.created / tool.called /
-// tool.returned / prompt.injected）都以「当前内容链尾」为 parent_id，
+// tool.returned）都以「当前内容链尾」为 parent_id，
 // 并立即以 ctx_op.append 追加到回合上下文，使下一轮 compile 能看见
 // 本轮新产生的内容；链尾由事件 fold 得出，追加前查 ctx_ops 去重，
 // 因此崩溃后重放不会重复追加。
@@ -34,7 +34,4 @@
 //
 // 文件操作一律 securePath：只允许工作区相对路径，词法限制在
 // workspaceRoot 内，并对已存在路径解析符号链接防 ../ 逃逸。
-//
-// 子 agent 派生本阶段不实现，仅约定 agent.spawned 事件 attrs 结构：
-// { parent_agent, seed: "empty"|"fork"|"summary", seed_ref }。
 package runtime

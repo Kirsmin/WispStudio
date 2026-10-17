@@ -33,20 +33,11 @@ type Client struct {
 	MaxRetries int           // 429/5xx/网络错误最大重试次数，负数用默认 3
 }
 
-// Chat 发起 /chat/completions 对话；req.Stream 决定流式与否，两种路径都聚合为 Result。
-// 429/5xx/网络错误按指数退避重试，ctx 取消立即中止。
-func (c *Client) Chat(ctx context.Context, req ChatRequest) (*Result, error) {
-	return c.chat(ctx, req, nil)
-}
-
-// ChatStream 与 Chat 相同，但每收到一帧流式增量就调用 onDelta（可为 nil）。
+// ChatStream 发起 /chat/completions 对话；req.Stream 决定流式与否，
+// 每收到一帧流式增量就调用 onDelta（可为 nil），最终聚合为 Result。
 // onDelta 返回 error 会立即中止流并把该错误返回给调用方。
+// 429/5xx/网络错误按指数退避重试，ctx 取消立即中止。
 func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onDelta func(StreamDelta) error) (*Result, error) {
-	return c.chat(ctx, req, onDelta)
-}
-
-// chat 是 Chat/ChatStream 的公共实现。
-func (c *Client) chat(ctx context.Context, req ChatRequest, onDelta func(StreamDelta) error) (*Result, error) {
 	start := time.Now()
 	attempts := c.maxRetries() + 1
 	var lastErr error

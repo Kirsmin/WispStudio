@@ -45,7 +45,7 @@ func main() {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		log.Fatalf("创建数据目录失败: %v", err)
 	}
-	store, err := eventlog.Open(filepath.Join(dataDir, "eventlog.db"), nil)
+	store, err := eventlog.Open(filepath.Join(dataDir, "eventlog.db"))
 	if err != nil {
 		log.Fatalf("打开事件日志失败: %v", err)
 	}

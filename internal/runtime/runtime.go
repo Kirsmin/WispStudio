@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"wisp/internal/compile"
 	"wisp/internal/eventlog"
@@ -50,12 +51,13 @@ func TurnRefName(turnID string) string { return "turn/" + turnID }
 
 // Options 是 Runtime 的构造参数。
 type Options struct {
-	WorkspaceRoot string           // 工作区根，文件操作一律限制在其内；空 = 当前目录
-	ProviderID    string           // 写入 llm.requested attrs 的服务商 ID
-	Model         string           // 模型全称 id（{ProviderID}/{ModelID}），写入事件
-	ProviderModel string           // 发给服务商的裸模型 id；空则从 Model 去掉 provider 前缀
-	Client        *provider.Client // OpenAI 兼容客户端；nil 时用默认客户端
-	MaxIterations int              // 回合最大迭代次数，防死循环；<= 0 用默认 64
+	WorkspaceRoot string              // 工作区根，文件操作一律限制在其内；空 = 当前目录
+	ProviderID    string              // 写入 llm.requested attrs 的服务商 ID
+	Model         string              // 模型全称 id（{ProviderID}/{ModelID}），写入事件
+	ProviderModel string              // 发给服务商的裸模型 id；空则从 Model 去掉 provider 前缀
+	Client        *provider.Client    // OpenAI 兼容客户端；nil 时用默认客户端
+	MaxIterations int                 // 回合最大迭代次数，防死循环；<= 0 用默认 64
+	OnCompile     func(time.Duration) // 编译耗时观察者，可为 nil（压测/诊断用）
 }
 
 // Runtime 是事件驱动运行时：无自有可变状态，一切状态由事件日志折叠得出。
@@ -69,6 +71,7 @@ type Runtime struct {
 	client        *provider.Client
 	tools         *Registry
 	maxIterations int
+	onCompile     func(time.Duration)
 
 	// interrupted 标记本回合被上层要求停止；failTurn 据此写“停止”终态，
 	// 而不是普通失败，且用不受取消影响的 context 完成最后一次写入。
@@ -103,6 +106,7 @@ func New(store *eventlog.Store, opts Options) (*Runtime, error) {
 		client:        client,
 		tools:         reg,
 		maxIterations: maxIter,
+		onCompile:     opts.OnCompile,
 	}, nil
 }
 
@@ -249,7 +253,7 @@ func SessionChainTail(ctx context.Context, store *eventlog.Store, sessionID stri
 	}
 	tail := ids.EventID("")
 	for _, ev := range evs {
-		if isContentEvent(ev.Type) {
+		if eventlog.IsContentType(ev.Type) {
 			tail = ev.ID
 		}
 	}
@@ -259,17 +263,6 @@ func SessionChainTail(ctx context.Context, store *eventlog.Store, sessionID stri
 // sessionChainTail 是 SessionChainTail 的运行时方法形式。
 func (r *Runtime) sessionChainTail(ctx context.Context, sessionID string) (ids.EventID, error) {
 	return SessionChainTail(ctx, r.store, sessionID)
-}
-
-// isContentEvent 判断事件是否为内容事件，规则与 compile 的可见性判断一致：
-// 只有内容事件参与 parent_id 链与 ctx_op；message.delta 等仅作展示。
-func isContentEvent(typ string) bool {
-	switch typ {
-	case eventlog.TypeMessageCreated, eventlog.TypeToolCalled,
-		eventlog.TypeToolReturned, eventlog.TypePromptInjected:
-		return true
-	}
-	return false
 }
 
 // publishToCtx 把内容事件追加到上下文，使其在后续 compile 中可见；

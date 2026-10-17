@@ -2,8 +2,8 @@
 //
 // 事件只追加；单 writer goroutine 独占 seq 分配与写入，
 // 其他方通过 AppendEvent / AppendEvents 提交。
-// schema_v1 只全新建库；v2 起仅允许纯增量加表（不改旧表旧数据），
-// 发现任何未知表结构直接报错退出，不做猜测性迁移。
+// 只支持当前 schema：全新建库，或打开版本完全一致的库；
+// 其他版本直接报错，不做迁移或向前兼容。
 package eventlog
 
 import (
@@ -23,12 +23,8 @@ import (
 	"wisp/internal/ids"
 )
 
-// SchemaVersion 是当前库结构版本。
-// v1 → v2 是纯增量：只新增 contexts / ctx_ops 两张表，不改旧表旧数据。
-const SchemaVersion = 2
-
-// CurrentVersion 是当前事件版本，新写入事件一律使用该版本。
-const CurrentVersion = 1
+// SchemaVersion 是当前库结构版本。只接受全新库或完全一致的版本。
+const SchemaVersion = 3
 
 // 写入通道缓冲大小。
 const writeBuffer = 1024
@@ -42,7 +38,6 @@ type Event struct {
 	Seq       int64           // 单调递增序号，由单 writer 分配
 	Type      string          // 事件类型
 	SessionID string          // 会话 ID
-	AgentID   string          // 智能体 ID
 	TurnID    string          // 回合 ID
 	Actor     string          // 触发者
 	ParentID  string          // 父事件 ID
@@ -51,14 +46,12 @@ type Event struct {
 	Blob      string          // blobs 表哈希引用，空表示无附件
 	Attrs     json.RawMessage // 事件属性 JSON
 	TS        int64           // 写入时间（Unix 毫秒）
-	V         int             // 事件版本
 }
 
 // EventInput 是待追加的事件输入。
 type EventInput struct {
 	Type      string // 必填，事件类型
 	SessionID string
-	AgentID   string
 	TurnID    string
 	Actor     string
 	ParentID  string
@@ -106,7 +99,6 @@ type writeResp struct {
 // Store 是事件日志存储：读取接口 + Writer 的单 writer 实现。
 type Store struct {
 	db       *sql.DB
-	reg      Registry // 事件升级器注册表，可为 nil
 	ch       chan writeReq
 	hub      *Hub
 	closed   atomic.Bool
@@ -116,15 +108,12 @@ type Store struct {
 }
 
 // Open 打开（必要时全新创建）事件日志数据库。
-// registry 用于读取时按 v 逐版本升级旧事件，可为 nil。
 //
 // path 为 ":memory:" 时限制连接数为 1：内存库按连接隔离，多连接会各自
 // 看到空库（仅测试使用内存库；文件库为 WAL + busy_timeout，不受影响）。
-func Open(path string, registry Registry) (*Store, error) {
+func Open(path string) (*Store, error) {
 	dsn := path
-	if path == ":memory:" {
-		dsn = path
-	} else {
+	if path != ":memory:" {
 		dsn += "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
 	}
 	db, err := sql.Open("sqlite", dsn)
@@ -140,7 +129,6 @@ func Open(path string, registry Registry) (*Store, error) {
 	}
 	s := &Store{
 		db:  db,
-		reg: registry,
 		ch:  make(chan writeReq, writeBuffer),
 		hub: NewHub(),
 	}
@@ -156,43 +144,30 @@ func Open(path string, registry Registry) (*Store, error) {
 // Hub 返回事件通知中心。订阅方只在收到通知后回读日志。
 func (s *Store) Hub() *Hub { return s.hub }
 
-// migrate 校验并初始化库结构：只允许全新建库与纯增量加表，不做猜测性迁移。
+// migrate 校验并初始化库结构：只接受全新库或与 SchemaVersion 完全一致的库。
 func migrate(db *sql.DB) error {
 	var v int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		return fmt.Errorf("eventlog: 读取 schema 版本失败: %w", err)
 	}
-	switch {
-	case v == 0:
+	switch v {
+	case 0:
 		// 全新库才允许建表；存在任何未知表结构直接报错。
 		var n int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`).Scan(&n); err != nil {
 			return fmt.Errorf("eventlog: 检查已有表失败: %w", err)
 		}
 		if n > 0 {
-			return fmt.Errorf("eventlog: 数据库中已存在未知表结构（schema_v0），不做猜测性迁移，请更换数据库文件")
+			return fmt.Errorf("eventlog: 数据库中已存在未知表结构，请更换数据库文件")
 		}
-		if _, err := db.Exec(schemaV1); err != nil {
-			return fmt.Errorf("eventlog: 创建 schema_v1 失败: %w", err)
-		}
-		if _, err := db.Exec(schemaV2); err != nil {
-			return fmt.Errorf("eventlog: 创建 schema_v2 失败: %w", err)
+		if _, err := db.Exec(schema); err != nil {
+			return fmt.Errorf("eventlog: 创建 schema_v%d 失败: %w", SchemaVersion, err)
 		}
 		if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion)); err != nil {
 			return fmt.Errorf("eventlog: 写入 schema 版本失败: %w", err)
 		}
 		return nil
-	case v == 1:
-		// v1 → v2 纯增量：只新增 contexts / ctx_ops 两张表，不改旧表旧数据。
-		if _, err := db.Exec(schemaV2); err != nil {
-			return fmt.Errorf("eventlog: 增量创建 schema_v2 失败: %w", err)
-		}
-		if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion)); err != nil {
-			return fmt.Errorf("eventlog: 写入 schema 版本失败: %w", err)
-		}
-		v = SchemaVersion
-		fallthrough
-	case v == SchemaVersion:
+	case SchemaVersion:
 		var n int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'events'`).Scan(&n); err != nil || n != 1 {
 			return fmt.Errorf("eventlog: schema_v%d 缺少 events 表，库结构不一致", SchemaVersion)
@@ -202,18 +177,17 @@ func migrate(db *sql.DB) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("eventlog: 未知的 schema 版本 v%d，不支持迁移", v)
+		return fmt.Errorf("eventlog: 不支持的 schema 版本 v%d（当前 v%d），请更换数据库文件", v, SchemaVersion)
 	}
 }
 
-// schemaV1 建表语句：五张表，表名与列名一律小写下划线。
-const schemaV1 = `
+// schema 建表语句：表名与列名一律小写下划线。
+const schema = `
 CREATE TABLE events (
     id         TEXT PRIMARY KEY,
     seq        INTEGER NOT NULL UNIQUE,
     type       TEXT NOT NULL,
     session_id TEXT NOT NULL DEFAULT '',
-    agent_id   TEXT NOT NULL DEFAULT '',
     turn_id    TEXT NOT NULL DEFAULT '',
     actor      TEXT NOT NULL DEFAULT '',
     parent_id  TEXT NOT NULL DEFAULT '',
@@ -221,8 +195,7 @@ CREATE TABLE events (
     subject_id TEXT NOT NULL DEFAULT '',
     blob       TEXT NOT NULL DEFAULT '',
     attrs      TEXT NOT NULL DEFAULT '{}',
-    ts         INTEGER NOT NULL,
-    v          INTEGER NOT NULL
+    ts         INTEGER NOT NULL
 );
 CREATE INDEX idx_events_session ON events(session_id, seq);
 CREATE INDEX idx_events_turn ON events(turn_id, seq);
@@ -244,6 +217,24 @@ CREATE TABLE refs (
     name   TEXT PRIMARY KEY,
     target TEXT NOT NULL
 );
+
+CREATE TABLE contexts (
+    id          TEXT PRIMARY KEY,
+    base_ctx    TEXT NOT NULL DEFAULT '',
+    fork_at     TEXT NOT NULL DEFAULT '',
+    created_seq INTEGER NOT NULL
+);
+CREATE TABLE ctx_ops (
+    id     TEXT PRIMARY KEY,
+    ctx    TEXT NOT NULL,
+    seq    INTEGER NOT NULL,
+    op     TEXT NOT NULL,
+    target TEXT NOT NULL DEFAULT '',
+    anchor TEXT NOT NULL DEFAULT '',
+    okey   TEXT NOT NULL DEFAULT '',
+    new_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_ctx_ops_ctx ON ctx_ops(ctx, seq);
 `
 
 // AppendEvent 提交单个事件，阻塞直至写入完成或 ctx 取消。
@@ -376,14 +367,12 @@ func (s *Store) applyAppend(ins []EventInput) ([]Event, error) {
 			Seq:       s.nextSeq(),
 			Type:      in.Type,
 			SessionID: in.SessionID,
-			AgentID:   in.AgentID,
 			TurnID:    in.TurnID,
 			Actor:     in.Actor,
 			ParentID:  in.ParentID,
 			CauseID:   in.CauseID,
 			SubjectID: in.SubjectID,
 			TS:        now,
-			V:         CurrentVersion,
 		}
 		// 附件按内容哈希去重存入 blobs，events.blob 只存哈希引用
 		if len(in.Blob) > 0 {
@@ -404,10 +393,10 @@ func (s *Store) applyAppend(ins []EventInput) ([]Event, error) {
 		}
 		ev.Attrs = raw
 		if _, err := tx.Exec(`INSERT INTO events
-			(id, seq, type, session_id, agent_id, turn_id, actor, parent_id, cause_id, subject_id, blob, attrs, ts, v)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			ev.ID.String(), ev.Seq, ev.Type, ev.SessionID, ev.AgentID, ev.TurnID,
-			ev.Actor, ev.ParentID, ev.CauseID, ev.SubjectID, ev.Blob, ev.Attrs, ev.TS, ev.V); err != nil {
+			(id, seq, type, session_id, turn_id, actor, parent_id, cause_id, subject_id, blob, attrs, ts)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			ev.ID.String(), ev.Seq, ev.Type, ev.SessionID, ev.TurnID,
+			ev.Actor, ev.ParentID, ev.CauseID, ev.SubjectID, ev.Blob, ev.Attrs, ev.TS); err != nil {
 			return nil, fmt.Errorf("eventlog: 写入事件失败: %w", err)
 		}
 		events = append(events, ev)
@@ -437,7 +426,6 @@ func (s *Store) applyMoveRef(name, target string) (Event, error) {
 		Type:      "ref.moved",
 		SubjectID: name,
 		TS:        now,
-		V:         CurrentVersion,
 	}
 	attrs, err := json.Marshal(map[string]string{"name": name, "target": target})
 	if err != nil {
@@ -445,9 +433,9 @@ func (s *Store) applyMoveRef(name, target string) (Event, error) {
 	}
 	ev.Attrs = attrs
 	if _, err := tx.Exec(`INSERT INTO events
-		(id, seq, type, session_id, agent_id, turn_id, actor, parent_id, cause_id, subject_id, blob, attrs, ts, v)
-		VALUES(?, ?, ?, '', '', '', '', '', '', '', '', ?, ?, ?)`,
-		ev.ID.String(), ev.Seq, ev.Type, ev.Attrs, ev.TS, ev.V); err != nil {
+		(id, seq, type, actor, subject_id, attrs, ts)
+		VALUES(?, ?, ?, '', ?, ?, ?)`,
+		ev.ID.String(), ev.Seq, ev.Type, ev.SubjectID, ev.Attrs, ev.TS); err != nil {
 		return Event{}, fmt.Errorf("eventlog: 写入 ref.moved 事件失败: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -471,14 +459,14 @@ func (s *Store) applyCreateContext(in ContextInput) (ContextRow, error) {
 		ForkAt:     in.ForkAt,
 		CreatedSeq: s.lastSeq + 1,
 	}
-	raw, err := marshalAttrs(CtxCreatedAttrs{})
+	raw, err := marshalAttrs(nil)
 	if err != nil {
 		return ContextRow{}, err
 	}
 	if _, err := tx.Exec(`INSERT INTO events
-		(id, seq, type, session_id, agent_id, turn_id, actor, parent_id, cause_id, subject_id, blob, attrs, ts, v)
-		VALUES(?, ?, ?, '', '', '', '', '', '', '', '', ?, ?, ?)`,
-		ids.NewEventID().String(), s.nextSeq(), TypeCtxCreated, raw, now, CurrentVersion); err != nil {
+		(id, seq, type, actor, subject_id, attrs, ts)
+		VALUES(?, ?, ?, '', '', ?, ?)`,
+		ids.NewEventID().String(), s.nextSeq(), TypeCtxCreated, raw, now); err != nil {
 		return ContextRow{}, fmt.Errorf("eventlog: 写入 ctx.created 事件失败: %w", err)
 	}
 	if _, err := tx.Exec(`INSERT INTO contexts(id, base_ctx, fork_at, created_seq) VALUES(?, ?, ?, ?)`,
@@ -510,14 +498,14 @@ func (s *Store) applyAppendCtxOp(in CtxOpInput) (CtxOpRow, error) {
 		OKey:   in.OKey,
 		NewID:  in.NewID,
 	}
-	raw, err := marshalAttrs(CtxOpAttrs{})
+	raw, err := marshalAttrs(nil)
 	if err != nil {
 		return CtxOpRow{}, err
 	}
 	if _, err := tx.Exec(`INSERT INTO events
-		(id, seq, type, session_id, agent_id, turn_id, actor, parent_id, cause_id, subject_id, blob, attrs, ts, v)
-		VALUES(?, ?, ?, '', '', '', '', '', '', ?, '', ?, ?, ?)`,
-		ids.NewEventID().String(), s.nextSeq(), TypeCtxOp, row.ID.String(), raw, now, CurrentVersion); err != nil {
+		(id, seq, type, actor, subject_id, attrs, ts)
+		VALUES(?, ?, ?, '', ?, ?, ?)`,
+		ids.NewEventID().String(), s.nextSeq(), TypeCtxOp, row.ID.String(), raw, now); err != nil {
 		return CtxOpRow{}, fmt.Errorf("eventlog: 写入 ctx.op 事件失败: %w", err)
 	}
 	if _, err := tx.Exec(`INSERT INTO ctx_ops(id, ctx, seq, op, target, anchor, okey, new_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -558,8 +546,8 @@ func (s *Store) nextSeq() int64 {
 func scanEvent(row interface{ Scan(...any) error }) (Event, error) {
 	var ev Event
 	var id, attrs string
-	err := row.Scan(&id, &ev.Seq, &ev.Type, &ev.SessionID, &ev.AgentID, &ev.TurnID,
-		&ev.Actor, &ev.ParentID, &ev.CauseID, &ev.SubjectID, &ev.Blob, &attrs, &ev.TS, &ev.V)
+	err := row.Scan(&id, &ev.Seq, &ev.Type, &ev.SessionID, &ev.TurnID,
+		&ev.Actor, &ev.ParentID, &ev.CauseID, &ev.SubjectID, &ev.Blob, &attrs, &ev.TS)
 	if err != nil {
 		return Event{}, err
 	}
@@ -568,25 +556,33 @@ func scanEvent(row interface{ Scan(...any) error }) (Event, error) {
 	return ev, nil
 }
 
-const columns = `id, seq, type, session_id, agent_id, turn_id, actor, parent_id, cause_id, subject_id, blob, attrs, ts, v`
+// columns 带表别名 e，读取事件的查询必须给 events 表起别名 e。
+const columns = `e.id, e.seq, e.type, e.session_id, e.turn_id, e.actor, e.parent_id, e.cause_id, e.subject_id, e.blob, e.attrs, e.ts`
 
-// Get 按事件 ID 读取事件，读取时按 v 逐版本升级。
+// Get 按事件 ID 读取事件。
 func (s *Store) Get(ctx context.Context, id ids.EventID) (Event, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+columns+` FROM events WHERE id = ?`, id.String())
-	ev, err := scanEvent(row)
-	if err != nil {
-		return Event{}, err
+	return scanEvent(s.db.QueryRowContext(ctx, `SELECT `+columns+` FROM events e WHERE e.id = ?`, id.String()))
+}
+
+// LoadChain 从 forkAt 沿 parent_id 回溯，按 forkAt→根的顺序返回整条链。
+// 使用递归 CTE 一次查询完成；UNION 去重同时防御异常数据成环。
+func (s *Store) LoadChain(ctx context.Context, forkAt ids.EventID) ([]Event, error) {
+	if forkAt == "" {
+		return nil, nil
 	}
-	if err := s.upcast(&ev); err != nil {
-		return Event{}, err
-	}
-	return ev, nil
+	q := `WITH RECURSIVE chain(id) AS (
+		SELECT e.id FROM events e WHERE e.id = ?
+		UNION
+		SELECT e.parent_id FROM events e JOIN chain c ON e.id = c.id WHERE e.parent_id <> ''
+	)
+	SELECT ` + columns + ` FROM events e JOIN chain c ON e.id = c.id ORDER BY e.seq DESC`
+	return s.queryEvents(ctx, q, forkAt.String())
 }
 
 // ListBySession 按会话读取 seq 大于 afterSeq 的事件（按 seq 升序，最多 limit 条）。
-// limit <= 0 表示不限制。读取时按 v 逐版本升级。
+// limit <= 0 表示不限制。
 func (s *Store) ListBySession(ctx context.Context, sessionID string, afterSeq int64, limit int) ([]Event, error) {
-	q := `SELECT ` + columns + ` FROM events WHERE session_id = ? AND seq > ? ORDER BY seq ASC`
+	q := `SELECT ` + columns + ` FROM events e WHERE e.session_id = ? AND e.seq > ? ORDER BY e.seq ASC`
 	args := []any{sessionID, afterSeq}
 	if limit > 0 {
 		q += ` LIMIT ?`
@@ -596,9 +592,9 @@ func (s *Store) ListBySession(ctx context.Context, sessionID string, afterSeq in
 }
 
 // ListByTurn 按回合读取 seq 大于 afterSeq 的事件（按 seq 升序，最多 limit 条）。
-// limit <= 0 表示不限制。读取时按 v 逐版本升级。
+// limit <= 0 表示不限制。
 func (s *Store) ListByTurn(ctx context.Context, turnID string, afterSeq int64, limit int) ([]Event, error) {
-	q := `SELECT ` + columns + ` FROM events WHERE turn_id = ? AND seq > ? ORDER BY seq ASC`
+	q := `SELECT ` + columns + ` FROM events e WHERE e.turn_id = ? AND e.seq > ? ORDER BY e.seq ASC`
 	args := []any{turnID, afterSeq}
 	if limit > 0 {
 		q += ` LIMIT ?`
@@ -627,7 +623,7 @@ func (s *Store) ListSessionIDs(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
-// queryEvents 执行事件查询并逐行升级版本。
+// queryEvents 执行事件查询并逐行扫描。
 func (s *Store) queryEvents(ctx context.Context, q string, args ...any) ([]Event, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -638,9 +634,6 @@ func (s *Store) queryEvents(ctx context.Context, q string, args ...any) ([]Event
 	for rows.Next() {
 		ev, err := scanEvent(rows)
 		if err != nil {
-			return nil, err
-		}
-		if err := s.upcast(&ev); err != nil {
 			return nil, err
 		}
 		out = append(out, ev)

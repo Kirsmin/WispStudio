@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	"wisp/internal/compile"
 	"wisp/internal/eventlog"
@@ -19,7 +20,11 @@ import (
 // tail 是当前内容链尾事件 ID，新内容事件以它为 parent_id。
 // 返回 done=true 表示响应无工具调用，回合已完成（turn.completed 已写）。
 func (r *Runtime) stepLLM(ctx context.Context, p TurnParams, tail ids.EventID) (bool, error) {
-	res, err := compile.CompileWithWriter(ctx, r.store, r.writer, p.ContextID)
+	compileStart := time.Now()
+	res, err := compile.Compile(ctx, r.store, p.ContextID)
+	if r.onCompile != nil {
+		r.onCompile(time.Since(compileStart))
+	}
 	if err != nil {
 		return false, fmt.Errorf("compile 失败: %w", err)
 	}

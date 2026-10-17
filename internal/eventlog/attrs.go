@@ -3,8 +3,7 @@
 // 规则（与 eventlog 包注释一致）：
 //   - 每个事件类型一个结构体，只放“读取时才解析的附加数据”；
 //     被查询/索引的字段一律是表列（events 表列或 contexts/ctx_ops 表列）。
-//   - 结构体字段一旦发布不得改变语义，只增不改；
-//     语义演进靠事件 v 递增 + Upcaster 完成。
+//   - 不做版本兼容：字段语义变化时直接改结构体与读取代码。
 //   - 大块正文一律存 blobs（events.blob 存哈希引用），attrs 只留元数据。
 package eventlog
 
@@ -32,10 +31,6 @@ const (
 	// 结果正文存 blobs。与 tool.called 的分组关系由 links 表
 	// rel='result_of'（src=本事件 ID，dst=对应 tool.called 事件 ID）表达。
 	TypeToolReturned = "tool.returned"
-
-	// TypePromptInjected 注入一段提示词，SubjectID = 提示词 ID。
-	// 正文存 blobs；渲染为 user 角色消息。
-	TypePromptInjected = "prompt.injected"
 
 	// TypeCtxCreated 创建一个上下文，SubjectID = 上下文 ID。
 	// 被查询/索引的字段（base_ctx/fork_at）是 contexts 表列，attrs 通常为空。
@@ -75,10 +70,6 @@ const (
 	// TypeApprovalDecided 用户/上层对一次审批做出决定，SubjectID = 审批 ID
 	// （与 approval.requested 相同）。
 	TypeApprovalDecided = "approval.decided"
-
-	// TypeAgentSpawned 派生一个子 agent，SubjectID = 子 agent ID。
-	// 本阶段只定 attrs 结构，不产生实际派生行为。
-	TypeAgentSpawned = "agent.spawned"
 )
 
 // SessionCreatedAttrs 是 session.created 事件的附加属性。
@@ -116,21 +107,6 @@ type ToolReturnedAttrs struct {
 	// IdempotencyKey 与对应 tool.called 的幂等键一致。
 	IdempotencyKey string `json:"idempotency_key"`
 }
-
-// PromptInjectedAttrs 是 prompt.injected 事件的附加属性。
-// 提示词正文存 blobs，此处只放元数据。
-type PromptInjectedAttrs struct {
-	// Source 是注入来源，可空。
-	Source string `json:"source,omitempty"`
-}
-
-// CtxCreatedAttrs 是 ctx.created 事件的附加属性。
-// base_ctx/fork_at 是 contexts 表列，此处通常为空，保留扩展位。
-type CtxCreatedAttrs struct{}
-
-// CtxOpAttrs 是 ctx.op 事件的附加属性。
-// op/target/anchor/okey/new_id 是 ctx_ops 表列，此处通常为空，保留扩展位。
-type CtxOpAttrs struct{}
 
 // LLMRequestedAttrs 是 llm.requested 事件的附加属性。
 // RequestManifest 由 blob 字段引用，此处只放请求元数据。
@@ -197,20 +173,6 @@ type ApprovalDecidedAttrs struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// AgentSpawnedAttrs 是 agent.spawned 事件的附加属性。
-// 本阶段只定结构：子 agent 的三种派生方式（空上下文/完整分叉/摘要分叉）。
-type AgentSpawnedAttrs struct {
-	// ParentAgent 是父 agent ID。
-	ParentAgent string `json:"parent_agent"`
-
-	// Seed 是派生方式："empty"（空上下文）|"fork"（完整分叉）|"summary"（摘要分叉）。
-	Seed string `json:"seed"`
-
-	// SeedRef 是派生源引用（fork 时为源上下文 ID，summary 时为摘要事件 ID），
-	// empty 方式下为空。
-	SeedRef string `json:"seed_ref,omitempty"`
-}
-
 // RelResultOf 是 links 表中工具调用与结果的分组关系：
 // src = tool.returned 事件 ID，dst = tool.called 事件 ID。
 const RelResultOf = "result_of"
@@ -219,7 +181,7 @@ const RelResultOf = "result_of"
 // message.delta 等仅用于展示的事件不属于内容事件。
 func IsContentType(typ string) bool {
 	switch typ {
-	case TypeMessageCreated, TypeToolCalled, TypeToolReturned, TypePromptInjected:
+	case TypeMessageCreated, TypeToolCalled, TypeToolReturned:
 		return true
 	default:
 		return false

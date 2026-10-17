@@ -25,7 +25,7 @@ import (
 // openStore 打开内存事件日志并注册清理。
 func openStore(t *testing.T) *eventlog.Store {
 	t.Helper()
-	s, err := eventlog.Open(":memory:", nil)
+	s, err := eventlog.Open(":memory:")
 	if err != nil {
 		t.Fatalf("打开事件日志失败: %v", err)
 	}
@@ -123,7 +123,7 @@ func mustEventsOf(t *testing.T, evs []eventlog.Event, typ string) []eventlog.Eve
 func lastContentBefore(evs []eventlog.Event, seq int64) ids.EventID {
 	tail := ids.EventID("")
 	for _, ev := range evs {
-		if ev.Seq < seq && isContentEvent(ev.Type) {
+		if ev.Seq < seq && eventlog.IsContentType(ev.Type) {
 			tail = ev.ID
 		}
 	}

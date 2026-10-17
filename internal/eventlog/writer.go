@@ -25,9 +25,6 @@ type Writer interface {
 
 	// AddLink 写入一条关系，幂等。
 	AddLink(ctx context.Context, src, dst, rel string) error
-
-	// PutBlob 按内容哈希写入 blob，返回哈希引用。
-	PutBlob(ctx context.Context, data []byte) (string, error)
 }
 
 // 编译期确认 Store 实现 Writer。

@@ -36,6 +36,7 @@ type Config struct {
 	WorkspaceRoot string               // 工具工作区根，空 = 进程当前目录
 	DefaultModel  provider.ModelFullID // 请求未指定模型时的默认模型，空 = 目录内第一个
 	TurnTimeout   time.Duration        // 单回合超时，<=0 用默认 10 分钟
+	OnCompile     func(time.Duration)  // 编译耗时观察者，nil = 不观察
 	Logf          func(string, ...any) // 日志，nil = 丢弃
 	WebDist       string               // 前端构建产物目录，空 = 不托管静态页面
 }
@@ -212,6 +213,7 @@ func (s *Server) newRuntime(ep provider.Endpoint) (*runtime.Runtime, error) {
 		Model:         ep.FullID.String(),
 		ProviderModel: ep.ModelID, // 服务商只认裸 id，全称 id 仅用于事件
 		Client:        client,
+		OnCompile:     s.cfg.OnCompile,
 	})
 }
 

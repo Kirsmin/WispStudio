@@ -37,12 +37,12 @@ func TestChatStreamMultiChunk(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, Secret: "sk-test", MaxRetries: 0}
-	res, err := c.Chat(context.Background(), ChatRequest{
+	res, err := c.ChatStream(context.Background(), ChatRequest{
 		Model:           "deepseek-chat",
 		Stream:          true,
 		ReasoningEffort: "high", // 应原样出现在请求体中
 		Messages:        []Message{{Role: "user", Content: "hi"}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("Chat 失败: %v", err)
 	}
@@ -75,10 +75,10 @@ func TestChatNonStreamReasoningPassthrough(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, MaxRetries: 0}
-	res, err := c.Chat(context.Background(), ChatRequest{
+	res, err := c.ChatStream(context.Background(), ChatRequest{
 		Model:    "m",
 		Messages: []Message{{Role: "user", Content: "q"}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("Chat 失败: %v", err)
 	}
@@ -102,10 +102,10 @@ func TestChatRetryOnRateLimit(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, MaxRetries: 1}
-	res, err := c.Chat(context.Background(), ChatRequest{
+	res, err := c.ChatStream(context.Background(), ChatRequest{
 		Model:    "m",
 		Messages: []Message{{Role: "user", Content: "q"}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("重试后仍失败: %v", err)
 	}
@@ -128,10 +128,10 @@ func TestChatRetryExhaustedOnServerError(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, MaxRetries: 2} // 共 3 次尝试
-	_, err := c.Chat(context.Background(), ChatRequest{
+	_, err := c.ChatStream(context.Background(), ChatRequest{
 		Model:    "m",
 		Messages: []Message{{Role: "user", Content: "q"}},
-	})
+	}, nil)
 	var pe *Error
 	if !errors.As(err, &pe) {
 		t.Fatalf("应返回 *Error，实际 %T: %v", err, err)
@@ -170,10 +170,10 @@ func TestChatErrorClassification(t *testing.T) {
 			defer srv.Close()
 
 			c := &Client{BaseURL: srv.URL, MaxRetries: 0} // 关闭重试，验证单次分类
-			_, err := c.Chat(context.Background(), ChatRequest{
+			_, err := c.ChatStream(context.Background(), ChatRequest{
 				Model:    "m",
 				Messages: []Message{{Role: "user", Content: "q"}},
-			})
+			}, nil)
 			var pe *Error
 			if !errors.As(err, &pe) {
 				t.Fatalf("应返回 *Error，实际 %T: %v", err, err)
@@ -195,7 +195,7 @@ func TestChatErrorClassification(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		c := &Client{BaseURL: "http://127.0.0.1:1", MaxRetries: 3}
-		_, err := c.Chat(ctx, ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "q"}}})
+		_, err := c.ChatStream(ctx, ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: "q"}}}, nil)
 		var pe *Error
 		if !errors.As(err, &pe) || pe.Kind != KindCanceled {
 			t.Errorf("应分类为 KindCanceled，实际 %v (%v)", err, pe)

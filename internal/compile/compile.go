@@ -16,10 +16,6 @@ const (
 
 	// omittedResult 是孤儿 tool.called 的占位结果正文。
 	omittedResult = "omitted"
-
-	// relResultOf 是 links 表中工具调用与结果的分组关系：
-	// src = tool.returned 事件 ID，dst = tool.called 事件 ID。
-	relResultOf = "result_of"
 )
 
 // Role 是消息角色。
@@ -82,12 +78,6 @@ func (e *entry) key() string { return e.ev.Type + "|" + e.subject }
 // Compile 把指定上下文编译为发给 LLM 的消息列表，算法步骤见包注释。
 // 编译成功后会把 RequestManifest 序列化存入 blobs 表并返回其哈希。
 func Compile(ctx context.Context, store *eventlog.Store, ctxID ids.ContextID) (*Result, error) {
-	return CompileWithWriter(ctx, store, store, ctxID)
-}
-
-// CompileWithWriter 与 Compile 相同，但 RequestManifest 的 blob 写入经指定 Writer，
-// 供 runtime/API 确保所有写入都走 eventlog.Writer。
-func CompileWithWriter(ctx context.Context, store *eventlog.Store, writer eventlog.Writer, ctxID ids.ContextID) (*Result, error) {
 	// 1. ancestry：沿 base_ctx 链取 root→leaf 的上下文。
 	lineage, err := ancestry(ctx, store, ctxID)
 	if err != nil {
@@ -113,18 +103,23 @@ func CompileWithWriter(ctx context.Context, store *eventlog.Store, writer eventl
 		}
 	}
 
-	// 4. enforceBundles：tool.called 与 tool.returned 原子成组。
-	warnings, err := enforceBundles(ctx, store, list)
+	// 4. 批量读取正文 blob，并读取 result_of 链接建立工具调用分组。
+	blobs, err := loadBlobs(ctx, store, list)
 	if err != nil {
 		return nil, err
 	}
+	bundles, err := loadBundles(ctx, store, list)
+	if err != nil {
+		return nil, err
+	}
+	warnings := enforceBundles(list, bundles)
 
 	// 置顶分区：pinned 按 pinSeq 升序在前，其余保持相对顺序在后。
 	list.pinPartition()
 
 	// 6. render：渲染为消息列表，同时生成 RequestManifest。
 	res := &Result{ProviderMap: map[ids.ToolCallID]string{}}
-	if err := render(ctx, store, list, res); err != nil {
+	if err := render(list, bundles, blobs, res); err != nil {
 		return nil, err
 	}
 
@@ -138,10 +133,7 @@ func CompileWithWriter(ctx context.Context, store *eventlog.Store, writer eventl
 	if err != nil {
 		return nil, fmt.Errorf("compile: 序列化 RequestManifest 失败: %w", err)
 	}
-	if writer == nil {
-		writer = store
-	}
-	hash, err := writer.PutBlob(ctx, raw)
+	hash, err := store.PutBlob(ctx, raw)
 	if err != nil {
 		return nil, fmt.Errorf("compile: 写入 RequestManifest blob 失败: %w", err)
 	}
@@ -208,53 +200,38 @@ func ancestry(ctx context.Context, store *eventlog.Store, ctxID ids.ContextID) (
 	return lineage, nil
 }
 
-// isContentType 判断事件类型是否为内容事件。
-func isContentType(typ string) bool {
-	switch typ {
-	case eventlog.TypeMessageCreated, eventlog.TypeToolCalled,
-		eventlog.TypeToolReturned, eventlog.TypePromptInjected:
-		return true
-	}
-	return false
-}
-
 // loadBase 从 forkAt 事件沿 parent_id 回溯到根，收集内容事件：
 // 按 (事件类型, subject_id) 去重，同 subject 多版本取 seq 最大者，
 // 位置取最新版本在链上的时间位置（回溯序反转为时间序）。
+// 整条链由 Store.LoadChain 一次查询取出，避免逐事件 N 次查询。
 func loadBase(ctx context.Context, store *eventlog.Store, forkAt ids.EventID) (*entryList, error) {
 	list := newEntryList()
-	// walk 顺序为 forkAt→根（新→旧）；seenKey 记录去重键首次出现的位置
+	// LoadChain 顺序为 forkAt→根（新→旧）；order 记录去重键首次出现的位置。
 	var order []string
 	byKey := map[string]*entry{}
 
-	cur := forkAt
-	visited := map[ids.EventID]bool{}
-	for cur != "" {
-		if visited[cur] {
-			return nil, fmt.Errorf("compile: parent_id 链存在环: %s", cur)
+	evs, err := store.LoadChain(ctx, forkAt)
+	if err != nil {
+		return nil, fmt.Errorf("compile: 读取 parent_id 链失败: %w", err)
+	}
+	for _, ev := range evs {
+		if !eventlog.IsContentType(ev.Type) {
+			continue
 		}
-		visited[cur] = true
-		ev, err := store.Get(ctx, cur)
-		if err != nil {
-			return nil, fmt.Errorf("compile: 读取链上事件 %s 失败: %w", cur, err)
-		}
-		if isContentType(ev.Type) {
-			k := ev.Type + "|" + ev.SubjectID
-			if old, ok := byKey[k]; ok {
-				// 同 subject 多版本：取 seq 最大者，保留最早出现的位置
-				if ev.Seq > old.ev.Seq {
-					old.ev = ev
-				}
-			} else {
-				e := &entry{subject: ev.SubjectID, ev: ev}
-				byKey[k] = e
-				order = append(order, k)
+		k := ev.Type + "|" + ev.SubjectID
+		if old, ok := byKey[k]; ok {
+			// 同 subject 多版本：取 seq 最大者，保留最早出现的位置。
+			if ev.Seq > old.ev.Seq {
+				old.ev = ev
 			}
+			continue
 		}
-		cur = ids.EventID(ev.ParentID)
+		e := &entry{subject: ev.SubjectID, ev: ev}
+		byKey[k] = e
+		order = append(order, k)
 	}
 
-	// 反转为时间序（根→forkAt）
+	// 反转为时间序（根→forkAt）。
 	for i := len(order) - 1; i >= 0; i-- {
 		list.append(byKey[order[i]])
 	}
@@ -267,7 +244,7 @@ func getContent(ctx context.Context, store *eventlog.Store, id ids.EventID) (eve
 	if err != nil {
 		return eventlog.Event{}, fmt.Errorf("compile: 读取 ctx_op 引用的内容事件 %s 失败: %w", id, err)
 	}
-	if !isContentType(ev.Type) {
+	if !eventlog.IsContentType(ev.Type) {
 		return eventlog.Event{}, fmt.Errorf("compile: ctx_op 引用的事件 %s 类型 %q 不是内容事件", id, ev.Type)
 	}
 	return ev, nil
@@ -435,34 +412,74 @@ func (l *entryList) pinPartition() {
 	l.items = append(pinned, rest...)
 }
 
-// enforceBundles 让 tool.called 与 tool.returned 原子成组：
-// 组内任一被 hide 则整组隐藏；孤儿 returned 丢弃；孤儿 called 记 warning。
-func enforceBundles(ctx context.Context, store *eventlog.Store, list *entryList) ([]string, error) {
-	links, err := store.ListLinks(ctx, "", "", relResultOf)
+// loadBlobs 批量读取条目引用的正文 blob，避免 render 时逐条查询。
+func loadBlobs(ctx context.Context, store *eventlog.Store, list *entryList) (map[string][]byte, error) {
+	hashes := make([]string, 0, len(list.items))
+	for _, e := range list.items {
+		if e.ev.Blob != "" {
+			hashes = append(hashes, e.ev.Blob)
+		}
+	}
+	blobs, err := store.GetBlobs(ctx, hashes)
+	if err != nil {
+		return nil, fmt.Errorf("compile: 读取正文 blob 失败: %w", err)
+	}
+	return blobs, nil
+}
+
+// bundles 是 result_of 关系的预计算索引：按事件 ID 找条目，按链接找伙伴。
+// enforceBundles 与 render 共用一次查询结果，避免重复读 links 表。
+type bundles struct {
+	byEventID        map[string]*entry
+	partnerOf        map[*entry]*entry
+	returnedToCalled map[string][]string
+}
+
+// loadBundles 读取 result_of 链接并建立分组索引。
+func loadBundles(ctx context.Context, store *eventlog.Store, list *entryList) (*bundles, error) {
+	links, err := store.ListLinks(ctx, "", "", eventlog.RelResultOf)
 	if err != nil {
 		return nil, fmt.Errorf("compile: 读取 result_of 链接失败: %w", err)
 	}
-	byEventID := map[string]*entry{}
+	b := &bundles{
+		byEventID:        make(map[string]*entry, len(list.items)),
+		partnerOf:        map[*entry]*entry{},
+		returnedToCalled: map[string][]string{},
+	}
 	for _, e := range list.items {
-		byEventID[e.ev.ID.String()] = e
+		b.byEventID[e.ev.ID.String()] = e
 	}
-	// returnedEventID → calledEventID 列表
-	returnedToCalled := map[string][]string{}
 	for _, l := range links {
-		returnedToCalled[l.Src] = append(returnedToCalled[l.Src], l.Dst)
+		b.returnedToCalled[l.Src] = append(b.returnedToCalled[l.Src], l.Dst)
 	}
+	for rid, cids := range b.returnedToCalled {
+		r := b.byEventID[rid]
+		if r == nil {
+			continue
+		}
+		for _, cid := range cids {
+			if c := b.byEventID[cid]; c != nil {
+				b.partnerOf[r] = c
+				b.partnerOf[c] = r
+			}
+		}
+	}
+	return b, nil
+}
 
+// enforceBundles 让 tool.called 与 tool.returned 原子成组：
+// 组内任一被 hide 则整组隐藏；孤儿 returned 丢弃；孤儿 called 记 warning。
+func enforceBundles(list *entryList, b *bundles) []string {
 	var warnings []string
 	var orphanReturned []*entry
-	orphanCalled := map[*entry]bool{}
 
 	for _, e := range list.items {
 		if e.ev.Type != eventlog.TypeToolReturned {
 			continue
 		}
 		claimed := false
-		for _, cid := range returnedToCalled[e.ev.ID.String()] {
-			if _, ok := byEventID[cid]; ok {
+		for _, cid := range b.returnedToCalled[e.ev.ID.String()] {
+			if b.byEventID[cid] != nil {
 				claimed = true
 				break
 			}
@@ -472,48 +489,28 @@ func enforceBundles(ctx context.Context, store *eventlog.Store, list *entryList)
 		}
 	}
 
-	for _, e := range list.items {
-		if e.ev.Type != eventlog.TypeToolCalled {
-			continue
-		}
-		found := false
-		for rid := range returnedToCalled {
-			if byEventID[rid] == nil {
-				continue
-			}
-			for _, cid := range returnedToCalled[rid] {
-				if cid == e.ev.ID.String() {
-					found = true
-					break
-				}
-			}
-			if found {
-				break
-			}
-		}
-		if !found {
-			orphanCalled[e] = true
-			warnings = append(warnings,
-				fmt.Sprintf("compile: 工具调用 %s 缺少结果，已补占位结果 %q", e.subject, omittedResult))
-		}
-	}
-
-	// 组内任一被 hide 则整组隐藏
-	partnerOf := map[*entry]*entry{}
-	for rid, cids := range returnedToCalled {
-		r := byEventID[rid]
-		if r == nil {
+	claimedCalled := make(map[string]bool)
+	for rid, cids := range b.returnedToCalled {
+		if b.byEventID[rid] == nil {
 			continue
 		}
 		for _, cid := range cids {
-			if c := byEventID[cid]; c != nil {
-				partnerOf[r] = c
-				partnerOf[c] = r
+			if b.byEventID[cid] != nil {
+				claimedCalled[cid] = true
 			}
 		}
 	}
 	for _, e := range list.items {
-		if p := partnerOf[e]; p != nil && (e.hidden || p.hidden) {
+		if e.ev.Type != eventlog.TypeToolCalled || claimedCalled[e.ev.ID.String()] {
+			continue
+		}
+		warnings = append(warnings,
+			fmt.Sprintf("compile: 工具调用 %s 缺少结果，已补占位结果 %q", e.subject, omittedResult))
+	}
+
+	// 组内任一被 hide 则整组隐藏。
+	for _, e := range list.items {
+		if p := b.partnerOf[e]; p != nil && (e.hidden || p.hidden) {
 			e.hidden = true
 			p.hidden = true
 		}
@@ -522,8 +519,7 @@ func enforceBundles(ctx context.Context, store *eventlog.Store, list *entryList)
 	for _, e := range orphanReturned {
 		list.remove(e)
 	}
-	_ = orphanCalled // 孤儿 called 在 render 阶段补占位结果
-	return warnings, nil
+	return warnings
 }
 
 // entryRole 返回条目渲染时的角色。
@@ -531,7 +527,7 @@ func entryRole(e *entry) (Role, error) {
 	switch e.ev.Type {
 	case eventlog.TypeToolCalled:
 		return RoleAssistant, nil
-	case eventlog.TypeToolReturned, eventlog.TypePromptInjected:
+	case eventlog.TypeToolReturned:
 		return RoleUser, nil
 	case eventlog.TypeMessageCreated:
 		var attrs eventlog.MessageCreatedAttrs
@@ -547,52 +543,24 @@ func entryRole(e *entry) (Role, error) {
 	return "", fmt.Errorf("compile: 事件类型 %q 不是内容事件", e.ev.Type)
 }
 
-// blobText 读取事件正文 blob。
-func blobText(ctx context.Context, store *eventlog.Store, ev eventlog.Event) (string, error) {
+// blobText 从预加载的 blob 表取事件正文。
+func blobText(ev eventlog.Event, blobs map[string][]byte) (string, error) {
 	if ev.Blob == "" {
 		return "", nil
 	}
-	data, err := store.GetBlob(ctx, ev.Blob)
-	if err != nil {
-		return "", fmt.Errorf("compile: 读取事件 %s 的 blob 失败: %w", ev.ID, err)
+	data, ok := blobs[ev.Blob]
+	if !ok {
+		return "", fmt.Errorf("compile: 事件 %s 的 blob %s 不存在", ev.ID, ev.Blob)
 	}
 	return string(data), nil
 }
 
 // render 把条目列表渲染为消息列表，并生成 RequestManifest 与 provider 映射。
 // 隐藏的非工具条目渲染为同角色占位消息；隐藏的工具组整组丢弃。
-func render(ctx context.Context, store *eventlog.Store, list *entryList, res *Result) error {
+func render(list *entryList, b *bundles, blobs map[string][]byte, res *Result) error {
 	msgs := make([]Message, 0, len(list.items))
 	var manifest []ManifestItem
 	rendered := map[*entry]bool{}
-
-	// 建立 bundle 伙伴关系（与 enforceBundles 同一依据）
-	links, err := store.ListLinks(ctx, "", "", relResultOf)
-	if err != nil {
-		return fmt.Errorf("compile: 读取 result_of 链接失败: %w", err)
-	}
-	byEventID := map[string]*entry{}
-	for _, e := range list.items {
-		byEventID[e.ev.ID.String()] = e
-	}
-	// partnerOf 由 links 表 result_of 关系得出（与 enforceBundles 同一依据）
-	returnedToCalled := map[string][]string{}
-	for _, l := range links {
-		returnedToCalled[l.Src] = append(returnedToCalled[l.Src], l.Dst)
-	}
-	partnerOf := map[*entry]*entry{}
-	for rid, cids := range returnedToCalled {
-		r := byEventID[rid]
-		if r == nil {
-			continue
-		}
-		for _, cid := range cids {
-			if c := byEventID[cid]; c != nil {
-				partnerOf[r] = c
-				partnerOf[c] = r
-			}
-		}
-	}
 
 	for _, e := range list.items {
 		if rendered[e] {
@@ -606,7 +574,7 @@ func render(ctx context.Context, store *eventlog.Store, list *entryList, res *Re
 		// 隐藏条目：工具组整组丢弃（伙伴一同跳过），其余渲染同角色占位消息
 		if e.hidden {
 			if e.ev.Type == eventlog.TypeToolCalled || e.ev.Type == eventlog.TypeToolReturned {
-				if p := partnerOf[e]; p != nil {
+				if p := b.partnerOf[e]; p != nil {
 					rendered[p] = true
 				}
 				rendered[e] = true
@@ -618,8 +586,8 @@ func render(ctx context.Context, store *eventlog.Store, list *entryList, res *Re
 		}
 
 		switch e.ev.Type {
-		case eventlog.TypeMessageCreated, eventlog.TypePromptInjected:
-			text, err := blobText(ctx, store, e.ev)
+		case eventlog.TypeMessageCreated:
+			text, err := blobText(e.ev, blobs)
 			if err != nil {
 				return err
 			}
@@ -632,7 +600,7 @@ func render(ctx context.Context, store *eventlog.Store, list *entryList, res *Re
 			if err := json.Unmarshal(e.ev.Attrs, &attrs); err != nil {
 				return fmt.Errorf("compile: 解析 tool.called attrs 失败: %w", err)
 			}
-			args, err := blobText(ctx, store, e.ev)
+			args, err := blobText(e.ev, blobs)
 			if err != nil {
 				return err
 			}
@@ -648,9 +616,9 @@ func render(ctx context.Context, store *eventlog.Store, list *entryList, res *Re
 			manifest = append(manifest, ManifestItem{ID: e.subject, BlobHash: e.ev.Blob, Revision: e.ev.Seq})
 
 			// 结果：优先取伙伴条目；孤儿 called 补占位结果
-			p := partnerOf[e]
+			p := b.partnerOf[e]
 			if p != nil && !p.hidden {
-				text, err := blobText(ctx, store, p.ev)
+				text, err := blobText(p.ev, blobs)
 				if err != nil {
 					return err
 				}

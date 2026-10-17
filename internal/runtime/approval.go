@@ -9,10 +9,6 @@ import (
 	"wisp/internal/ids"
 )
 
-// relResultOf 是 links 表中工具调用与结果的分组关系：
-// src = tool.returned 事件 ID，dst = tool.called 事件 ID（与 compile 约定一致）。
-const relResultOf = "result_of"
-
 // settleCall 结清一次工具调用：需要审批的工具先走审批事件流，
 // 批准后执行并写 tool.returned（含幂等键与 result_of 链接）。
 // tail 是当前内容链尾事件 ID，结果事件以它为 parent_id。
@@ -83,7 +79,7 @@ func (r *Runtime) returnResult(ctx context.Context, p TurnParams, call pendingCa
 	if err != nil {
 		return fmt.Errorf("runtime: 写 tool.returned 失败: %w", err)
 	}
-	if err := r.writer.AddLink(ctx, ev.ID.String(), call.calledEventID.String(), relResultOf); err != nil {
+	if err := r.writer.AddLink(ctx, ev.ID.String(), call.calledEventID.String(), eventlog.RelResultOf); err != nil {
 		return fmt.Errorf("runtime: 写 result_of 链接失败: %w", err)
 	}
 	return r.appendContentToCtx(ctx, p, ev.ID)

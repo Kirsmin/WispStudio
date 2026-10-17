@@ -6,9 +6,9 @@
 //  1. ancestry：沿 contexts.base_ctx 链取 root→leaf 的上下文序列；
 //     链成环或上下文缺失直接报错。
 //  2. 基线内容：从叶子上下文的 fork_at 事件沿 events.parent_id 回溯到根，
-//     收集内容事件（message.created / tool.called / tool.returned /
-//     prompt.injected），按 (事件类型, subject_id) 去重，
-//     同 subject 多版本取 seq 最大者，位置取最新版本在链上的时间位置。
+//     收集内容事件（message.created / tool.called / tool.returned），
+//     按 (事件类型, subject_id) 去重，同 subject 多版本取 seq 最大者，
+//     位置取最新版本在链上的时间位置。整条链与正文 blob 均为批量读取。
 //  3. 逐层应用 ctx_ops（root 的操作用完再用 base 的，依此类推到叶子）：
 //     append 追加到末尾；insert(anchor+okey) 插入 anchor 组（组紧随
 //     anchor 条目，anchor 为空报错；组内按 okey 字典序，空 okey 排最后，
