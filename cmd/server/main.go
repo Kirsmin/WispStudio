@@ -80,6 +80,11 @@ func main() {
 		log.Fatalf("构造 HTTP API 失败: %v", err)
 	}
 
+	// 启动恢复：进程重启后重新拉起未完成的回合；失败只记日志，不阻塞启动。
+	if err := apiSrv.Recover(context.Background()); err != nil {
+		slog.Warn("启动恢复失败", "err", err)
+	}
+
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Server.Port)
 	httpSrv := &http.Server{
 		Addr:              addr,

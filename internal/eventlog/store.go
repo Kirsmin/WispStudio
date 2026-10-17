@@ -299,6 +299,30 @@ func (s *Store) GetRef(ctx context.Context, name string) (string, error) {
 	return target, nil
 }
 
+// RefRow 是 refs 表的一行；启动恢复据此遍历全部命名引用。
+type RefRow struct {
+	Name   string
+	Target string
+}
+
+// ListRefs 返回全部命名引用（按名称升序）。
+func (s *Store) ListRefs(ctx context.Context) ([]RefRow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name, target FROM refs ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("eventlog: 读取 refs 失败: %w", err)
+	}
+	defer rows.Close()
+	var out []RefRow
+	for rows.Next() {
+		var r RefRow
+		if err := rows.Scan(&r.Name, &r.Target); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // Close 关闭事件日志：停止接收新请求，排空 writer 队列，关闭通知中心，
 // 最后关闭数据库。先排空队列再关库，避免在途事件丢失。
 func (s *Store) Close() error {
