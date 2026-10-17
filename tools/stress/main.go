@@ -39,6 +39,9 @@ import (
 // modelFullID 是压测使用的模型全称 id。
 const modelFullID = "stress/stress-model"
 
+// stressToken 是压测使用的访问令牌。
+const stressToken = "stress-token"
+
 // fakeProvider 按请求末尾角色决定返回工具调用还是最终正文。
 // 同一回合第一次调用（末尾是 user）返回 2 个工具调用，第二次（末尾是 tool）返回正文。
 type fakeProvider struct {
@@ -177,6 +180,7 @@ func run(turns int, dir string) error {
 		Store:         store,
 		Catalog:       catalog,
 		WorkspaceRoot: workspace,
+		Token:         stressToken,
 		OnCompile:     times.add,
 	})
 	if err != nil {
@@ -270,6 +274,7 @@ func postJSON(client *http.Client, endpoint string, body, out any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Token", stressToken)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
