@@ -107,6 +107,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{sessionID}/stop", s.handleStopSession)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/approvals/{toolCallID}", s.handleApproval)
 	mux.HandleFunc("GET /api/models", s.handleListModels)
+	mux.HandleFunc("POST /api/models", s.handleAddModel)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("POST /api/config", s.handleUpdateConfig)
 	mux.HandleFunc("GET /api/events/{eventID}/trace", s.handleTrace)
