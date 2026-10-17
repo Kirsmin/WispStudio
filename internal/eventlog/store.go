@@ -75,17 +75,18 @@ const (
 
 // 写入请求，经缓冲 channel 提交给单 writer。
 type writeReq struct {
-	kind    opKind
-	inputs  []EventInput
-	refName string
-	target  string
-	ctxIn   ContextInput // opCreateContext 专用
-	opIn    CtxOpInput   // opAppendCtxOp 专用
-	linkSrc string       // opAddLink 专用
-	linkDst string       // opAddLink 专用
-	linkRel string       // opAddLink 专用
-	blob    []byte       // opPutBlob 专用
-	resp    chan writeResp
+	kind      opKind
+	inputs    []EventInput
+	refName   string
+	target    string
+	sessionID string       // opMoveRef 专用：ref.moved 事件的 session_id
+	ctxIn     ContextInput // opCreateContext 专用
+	opIn      CtxOpInput   // opAppendCtxOp 专用
+	linkSrc   string       // opAddLink 专用
+	linkDst   string       // opAddLink 专用
+	linkRel   string       // opAddLink 专用
+	blob      []byte       // opPutBlob 专用
+	resp      chan writeResp
 }
 
 type writeResp struct {
@@ -262,7 +263,13 @@ func (s *Store) AppendEvents(ctx context.Context, ins []EventInput) ([]Event, er
 
 // MoveRef 更新命名引用，并在同一事务中追加一条 ref.moved 事件。
 func (s *Store) MoveRef(ctx context.Context, name, target string) (Event, error) {
-	req := writeReq{kind: opMoveRef, refName: name, target: target, resp: make(chan writeResp, 1)}
+	return s.MoveRefInSession(ctx, name, target, "")
+}
+
+// MoveRefInSession 更新命名引用，并把 session_id 写进 ref.moved 事件，
+// 使引用变化也能按会话回放。
+func (s *Store) MoveRefInSession(ctx context.Context, name, target, sessionID string) (Event, error) {
+	req := writeReq{kind: opMoveRef, refName: name, target: target, sessionID: sessionID, resp: make(chan writeResp, 1)}
 	if err := s.submit(ctx, req); err != nil {
 		return Event{}, err
 	}
@@ -360,7 +367,7 @@ func (s *Store) apply(req writeReq) {
 		}
 		req.resp <- writeResp{events: events, err: err}
 	case opMoveRef:
-		ev, err := s.applyMoveRef(req.refName, req.target)
+		ev, err := s.applyMoveRef(req.refName, req.target, req.sessionID)
 		req.resp <- writeResp{events: []Event{ev}, err: err}
 	case opCreateContext:
 		row, err := s.applyCreateContext(req.ctxIn)
@@ -432,7 +439,7 @@ func (s *Store) applyAppend(ins []EventInput) ([]Event, error) {
 }
 
 // applyMoveRef 在单个事务中更新 refs 并追加 ref.moved 事件。
-func (s *Store) applyMoveRef(name, target string) (Event, error) {
+func (s *Store) applyMoveRef(name, target, sessionID string) (Event, error) {
 	now := time.Now().UnixMilli()
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -448,6 +455,7 @@ func (s *Store) applyMoveRef(name, target string) (Event, error) {
 		ID:        ids.NewEventID(),
 		Seq:       s.nextSeq(),
 		Type:      "ref.moved",
+		SessionID: sessionID,
 		SubjectID: name,
 		TS:        now,
 	}
@@ -457,9 +465,9 @@ func (s *Store) applyMoveRef(name, target string) (Event, error) {
 	}
 	ev.Attrs = attrs
 	if _, err := tx.Exec(`INSERT INTO events
-		(id, seq, type, actor, subject_id, attrs, ts)
-		VALUES(?, ?, ?, '', ?, ?, ?)`,
-		ev.ID.String(), ev.Seq, ev.Type, ev.SubjectID, ev.Attrs, ev.TS); err != nil {
+		(id, seq, type, session_id, actor, subject_id, attrs, ts)
+		VALUES(?, ?, ?, ?, '', ?, ?, ?)`,
+		ev.ID.String(), ev.Seq, ev.Type, ev.SessionID, ev.SubjectID, ev.Attrs, ev.TS); err != nil {
 		return Event{}, fmt.Errorf("eventlog: 写入 ref.moved 事件失败: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -487,10 +495,11 @@ func (s *Store) applyCreateContext(in ContextInput) (ContextRow, error) {
 	if err != nil {
 		return ContextRow{}, err
 	}
+	// SubjectID = 上下文行 ID：先生成行 ID 再写事件，事件与行一一对应。
 	if _, err := tx.Exec(`INSERT INTO events
-		(id, seq, type, actor, subject_id, attrs, ts)
-		VALUES(?, ?, ?, '', '', ?, ?)`,
-		ids.NewEventID().String(), s.nextSeq(), TypeCtxCreated, raw, now); err != nil {
+		(id, seq, type, session_id, actor, subject_id, attrs, ts)
+		VALUES(?, ?, ?, ?, '', ?, ?, ?)`,
+		ids.NewEventID().String(), s.nextSeq(), TypeCtxCreated, in.SessionID, row.ID.String(), raw, now); err != nil {
 		return ContextRow{}, fmt.Errorf("eventlog: 写入 ctx.created 事件失败: %w", err)
 	}
 	if _, err := tx.Exec(`INSERT INTO contexts(id, base_ctx, fork_at, created_seq) VALUES(?, ?, ?, ?)`,
@@ -527,9 +536,9 @@ func (s *Store) applyAppendCtxOp(in CtxOpInput) (CtxOpRow, error) {
 		return CtxOpRow{}, err
 	}
 	if _, err := tx.Exec(`INSERT INTO events
-		(id, seq, type, actor, subject_id, attrs, ts)
-		VALUES(?, ?, ?, '', ?, ?, ?)`,
-		ids.NewEventID().String(), s.nextSeq(), TypeCtxOp, row.ID.String(), raw, now); err != nil {
+		(id, seq, type, session_id, actor, subject_id, attrs, ts)
+		VALUES(?, ?, ?, ?, '', ?, ?, ?)`,
+		ids.NewEventID().String(), s.nextSeq(), TypeCtxOp, in.SessionID, row.ID.String(), raw, now); err != nil {
 		return CtxOpRow{}, fmt.Errorf("eventlog: 写入 ctx.op 事件失败: %w", err)
 	}
 	if _, err := tx.Exec(`INSERT INTO ctx_ops(id, ctx, seq, op, target, anchor, okey, new_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,

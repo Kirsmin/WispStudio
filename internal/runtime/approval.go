@@ -31,14 +31,14 @@ func (r *Runtime) settleCall(ctx context.Context, p TurnParams, st *turnState, c
 			}); err != nil {
 				return false, fmt.Errorf("runtime: 写 approval.requested 失败: %w", err)
 			}
-			if _, err := r.writer.MoveRef(ctx, TurnRefName(p.TurnID), refWaitingPrefix+call.id.String()); err != nil {
+			if _, err := r.writer.MoveRefInSession(ctx, TurnRefName(p.TurnID), refWaitingPrefix+call.id.String(), p.SessionID); err != nil {
 				return false, fmt.Errorf("runtime: 挂起回合指针失败: %w", err)
 			}
 			return true, nil
 		}
 		if ap.decided == nil {
 			// 审批未决定：兜底把指针挂起（正常路径 API 层已移过指针）
-			if _, err := r.writer.MoveRef(ctx, TurnRefName(p.TurnID), refWaitingPrefix+call.id.String()); err != nil {
+			if _, err := r.writer.MoveRefInSession(ctx, TurnRefName(p.TurnID), refWaitingPrefix+call.id.String(), p.SessionID); err != nil {
 				return false, fmt.Errorf("runtime: 挂起回合指针失败: %w", err)
 			}
 			return true, nil

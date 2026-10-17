@@ -364,7 +364,7 @@ func (s *Server) stopWaitingTurn(ctx context.Context, sessionID string) (stopped
 	}); err != nil {
 		return false, turnID, err
 	}
-	if _, err := s.writer.MoveRef(ctx, runtime.TurnRefName(turnID), "failed:stopped"); err != nil {
+	if _, err := s.writer.MoveRefInSession(ctx, runtime.TurnRefName(turnID), "failed:stopped", sessionID); err != nil {
 		return false, turnID, err
 	}
 	return true, turnID, nil

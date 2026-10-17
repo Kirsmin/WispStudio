@@ -169,7 +169,7 @@ func (r *Runtime) EnsureStarted(ctx context.Context, p TurnParams) error {
 	}); err != nil {
 		return fmt.Errorf("runtime: 写 turn.started 失败: %w", err)
 	}
-	if _, err := r.writer.MoveRef(ctx, refName, RefRunning); err != nil {
+	if _, err := r.writer.MoveRefInSession(ctx, refName, RefRunning, p.SessionID); err != nil {
 		return fmt.Errorf("runtime: 移动指针 %s 失败: %w", refName, err)
 	}
 	return nil
@@ -267,7 +267,7 @@ func (r *Runtime) sessionChainTail(ctx context.Context, sessionID string) (ids.E
 
 // publishToCtx 把内容事件追加到上下文，使其在后续 compile 中可见；
 // 该事件已追加过（崩溃恢复后重放）则跳过，保证幂等。
-func publishToCtx(ctx context.Context, store *eventlog.Store, writer eventlog.Writer, ctxID ids.ContextID, evID ids.EventID) error {
+func publishToCtx(ctx context.Context, store *eventlog.Store, writer eventlog.Writer, sessionID string, ctxID ids.ContextID, evID ids.EventID) error {
 	if evID == "" {
 		return nil
 	}
@@ -284,7 +284,7 @@ func publishToCtx(ctx context.Context, store *eventlog.Store, writer eventlog.Wr
 		}
 	}
 	if _, err := writer.AppendCtxOp(ctx, eventlog.CtxOpInput{
-		Ctx: ctxID, Op: eventlog.CtxOpAppend, NewID: evID,
+		Ctx: ctxID, Op: eventlog.CtxOpAppend, NewID: evID, SessionID: sessionID,
 	}); err != nil {
 		return fmt.Errorf("runtime: 把内容事件追加到上下文失败: %w", err)
 	}
@@ -293,7 +293,7 @@ func publishToCtx(ctx context.Context, store *eventlog.Store, writer eventlog.Wr
 
 // appendContentToCtx 是 publishToCtx 的运行时方法形式。
 func (r *Runtime) appendContentToCtx(ctx context.Context, p TurnParams, evID ids.EventID) error {
-	return publishToCtx(ctx, r.store, r.writer, p.ContextID, evID)
+	return publishToCtx(ctx, r.store, r.writer, p.SessionID, p.ContextID, evID)
 }
 
 // UserMessage 是一次用户输入的落盘参数。
@@ -336,7 +336,7 @@ func AppendUserMessage(ctx context.Context, store *eventlog.Store, m UserMessage
 	if err != nil {
 		return eventlog.Event{}, fmt.Errorf("runtime: 写用户消息失败: %w", err)
 	}
-	if err := publishToCtx(ctx, store, writer, m.ContextID, ev.ID); err != nil {
+	if err := publishToCtx(ctx, store, writer, m.SessionID, m.ContextID, ev.ID); err != nil {
 		return eventlog.Event{}, err
 	}
 	return ev, nil
@@ -439,7 +439,7 @@ func (r *Runtime) DecideApproval(ctx context.Context, p TurnParams, toolCallID i
 	}); err != nil {
 		return fmt.Errorf("runtime: 写 approval.decided 失败: %w", err)
 	}
-	if _, err := r.writer.MoveRef(ctx, TurnRefName(p.TurnID), RefRunning); err != nil {
+	if _, err := r.writer.MoveRefInSession(ctx, TurnRefName(p.TurnID), RefRunning, p.SessionID); err != nil {
 		return fmt.Errorf("runtime: 移动指针回 running 失败: %w", err)
 	}
 	return nil
@@ -492,7 +492,7 @@ func (r *Runtime) finishInterrupted(ctx context.Context, p TurnParams) error {
 	}); err != nil {
 		return fmt.Errorf("runtime: 写停止事件失败: %w", err)
 	}
-	if _, err := r.writer.MoveRef(ctx, refName, refFailedPrefix+reason); err != nil {
+	if _, err := r.writer.MoveRefInSession(ctx, refName, refFailedPrefix+reason, p.SessionID); err != nil {
 		return fmt.Errorf("runtime: 移动指针到停止失败: %w", err)
 	}
 	return nil
@@ -514,7 +514,7 @@ func (r *Runtime) failTurn(ctx context.Context, p TurnParams, reason string) err
 	}); err != nil {
 		return fmt.Errorf("runtime: 写 turn.completed 失败: %w", err)
 	}
-	if _, err := r.writer.MoveRef(ctx, TurnRefName(p.TurnID), refFailedPrefix+reason); err != nil {
+	if _, err := r.writer.MoveRefInSession(ctx, TurnRefName(p.TurnID), refFailedPrefix+reason, p.SessionID); err != nil {
 		return fmt.Errorf("runtime: 移动指针到 failed 失败: %w", err)
 	}
 	return fmt.Errorf("runtime: 回合 %s 失败: %s", p.TurnID, reason)

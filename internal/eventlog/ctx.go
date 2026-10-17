@@ -29,8 +29,9 @@ type ContextRow struct {
 
 // ContextInput 是创建上下文的输入。
 type ContextInput struct {
-	BaseCtx ids.ContextID // 基上下文，零值 = 根上下文
-	ForkAt  ids.EventID   // fork 起点事件，零值 = 从空历史开始
+	BaseCtx   ids.ContextID // 基上下文，零值 = 根上下文
+	ForkAt    ids.EventID   // fork 起点事件，零值 = 从空历史开始
+	SessionID string        // 归属会话（写入 ctx.created 事件的 session_id）
 }
 
 // CreateContext 创建上下文：追加 ctx.created 事件并写入 contexts 表（同事务）。
@@ -90,12 +91,13 @@ type CtxOpRow struct {
 
 // CtxOpInput 是追加上下文操作的输入。
 type CtxOpInput struct {
-	Ctx    ids.ContextID
-	Op     string
-	Target string
-	Anchor string
-	OKey   string
-	NewID  ids.EventID
+	Ctx       ids.ContextID
+	Op        string
+	Target    string
+	Anchor    string
+	OKey      string
+	NewID     ids.EventID
+	SessionID string // 归属会话（写入 ctx.op 事件的 session_id）
 }
 
 // validCtxOp 校验操作输入的字段约束，失败返回错误。

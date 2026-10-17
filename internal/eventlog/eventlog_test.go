@@ -152,6 +152,65 @@ func TestUnknownSchemaRejected(t *testing.T) {
 	}
 }
 
+// TestSessionScopedWrites 验收 F3：ctx.created / ctx.op / ref.moved 都带
+// session_id，且 ctx.created 的 SubjectID 与 contexts 表的行 ID 一致。
+func TestSessionScopedWrites(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "eventlog.db"))
+	if err != nil {
+		t.Fatalf("Open 出错: %v", err)
+	}
+	defer s.Close()
+
+	const sess = "sess_scope"
+	row, err := s.CreateContext(ctx, ContextInput{SessionID: sess})
+	if err != nil {
+		t.Fatalf("CreateContext 出错: %v", err)
+	}
+
+	contentID := ids.NewEventID()
+	if _, err := s.AppendCtxOp(ctx, CtxOpInput{
+		Ctx: row.ID, Op: CtxOpAppend, NewID: contentID, SessionID: sess,
+	}); err != nil {
+		t.Fatalf("AppendCtxOp 出错: %v", err)
+	}
+	if _, err := s.MoveRefInSession(ctx, "turn/t1", "running", sess); err != nil {
+		t.Fatalf("MoveRefInSession 出错: %v", err)
+	}
+
+	evs, err := s.ListBySession(ctx, sess, 0, 0)
+	if err != nil {
+		t.Fatalf("ListBySession 出错: %v", err)
+	}
+	byType := map[string][]Event{}
+	for _, ev := range evs {
+		byType[ev.Type] = append(byType[ev.Type], ev)
+	}
+	for _, typ := range []string{TypeCtxCreated, TypeCtxOp, "ref.moved"} {
+		if len(byType[typ]) != 1 {
+			t.Fatalf("%s 按会话可查事件数 = %d, 期望 1（全部事件: %v）",
+				typ, len(byType[typ]), byType)
+		}
+	}
+
+	stored, err := s.GetContext(ctx, row.ID)
+	if err != nil {
+		t.Fatalf("GetContext 出错: %v", err)
+	}
+	if stored.ID != row.ID {
+		t.Fatalf("GetContext(id).ID = %s, 期望 %s", stored.ID, row.ID)
+	}
+	if got := byType[TypeCtxCreated][0].SubjectID; got != stored.ID.String() {
+		t.Fatalf("ctx.created SubjectID = %q, 期望上下文行 ID %q", got, stored.ID)
+	}
+	if got := byType[TypeCtxOp][0].SubjectID; got == "" {
+		t.Fatal("ctx.op 缺少 SubjectID")
+	}
+	if got := byType["ref.moved"][0].SessionID; got != sess {
+		t.Fatalf("ref.moved SessionID = %q, 期望 %q", got, sess)
+	}
+}
+
 // TestMoveRef 校验 refs 更新同时追加 ref.moved 事件。
 func TestMoveRef(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "eventlog.db"))

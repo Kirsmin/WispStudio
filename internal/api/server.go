@@ -253,7 +253,7 @@ func (s *Server) runTurn(ctx context.Context, lock *sync.Mutex, a *activeTurn, p
 // tail 是调用方已经折叠出的会话内容链尾，避免重复读整条会话。
 // 所有写入都经 s.writer。
 func (s *Server) prepareTurn(ctx context.Context, sessionID, turnID, text string, tail ids.EventID) (eventlog.ContextRow, error) {
-	ctxRow, err := s.writer.CreateContext(ctx, eventlog.ContextInput{ForkAt: tail})
+	ctxRow, err := s.writer.CreateContext(ctx, eventlog.ContextInput{ForkAt: tail, SessionID: sessionID})
 	if err != nil {
 		return eventlog.ContextRow{}, err
 	}

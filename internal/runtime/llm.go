@@ -140,7 +140,7 @@ func (r *Runtime) stepLLM(ctx context.Context, p TurnParams, tail ids.EventID) (
 	}); err != nil {
 		return false, fmt.Errorf("runtime: 写 turn.completed 失败: %w", err)
 	}
-	if _, err := r.writer.MoveRef(ctx, TurnRefName(p.TurnID), RefCompleted); err != nil {
+	if _, err := r.writer.MoveRefInSession(ctx, TurnRefName(p.TurnID), RefCompleted, p.SessionID); err != nil {
 		return false, fmt.Errorf("runtime: 移动指针到 completed 失败: %w", err)
 	}
 	return true, nil

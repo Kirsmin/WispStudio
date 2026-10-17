@@ -17,6 +17,9 @@ type Writer interface {
 	// MoveRef 更新命名引用并追加 ref.moved 事件。
 	MoveRef(ctx context.Context, name, target string) (Event, error)
 
+	// MoveRefInSession 同 MoveRef，并把 session_id 写进 ref.moved 事件。
+	MoveRefInSession(ctx context.Context, name, target, sessionID string) (Event, error)
+
 	// CreateContext 创建上下文并追加 ctx.created 事件。
 	CreateContext(ctx context.Context, in ContextInput) (ContextRow, error)
 
