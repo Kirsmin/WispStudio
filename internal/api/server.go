@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"wisp/internal/eventlog"
+	"wisp/internal/ids"
 	"wisp/internal/provider"
 	"wisp/internal/runtime"
 )
@@ -32,7 +33,6 @@ const (
 type Config struct {
 	Store         *eventlog.Store      // 事件日志，必填
 	Catalog       *provider.Catalog    // 模型目录，必填
-	Writer        eventlog.Writer      // 写入入口，空 = Store
 	WorkspaceRoot string               // 工具工作区根，空 = 进程当前目录
 	DefaultModel  provider.ModelFullID // 请求未指定模型时的默认模型，空 = 目录内第一个
 	TurnTimeout   time.Duration        // 单回合超时，<=0 用默认 10 分钟
@@ -82,13 +82,9 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	writer := cfg.Writer
-	if writer == nil {
-		writer = cfg.Store
-	}
 	return &Server{
 		cfg:      cfg,
-		writer:   writer,
+		writer:   cfg.Store,
 		hub:      cfg.Store.Hub(),
 		sessions: make(map[string]*sessionState),
 		active:   make(map[string]*activeTurn),
@@ -101,24 +97,18 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 
-	// 新协议：会话、消息、停止、模型、事件追踪。
+	// 会话、消息、停止、审批、模型与配置。
 	mux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/sessions", s.handleCreateSession)
 	mux.HandleFunc("DELETE /api/sessions/{sessionID}", s.handleDeleteSession)
+	mux.HandleFunc("GET /api/sessions/{sessionID}/events", s.handleEventsSSE)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/messages", s.handlePostMessage)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/stop", s.handleStopSession)
+	mux.HandleFunc("POST /api/sessions/{sessionID}/approvals/{toolCallID}", s.handleApproval)
 	mux.HandleFunc("GET /api/models", s.handleListModels)
-	mux.HandleFunc("POST /api/models", s.handleAddModel)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("POST /api/config", s.handleUpdateConfig)
 	mux.HandleFunc("GET /api/events/{eventID}/trace", s.handleTrace)
-	mux.HandleFunc("GET /api/sessions/{sessionID}/events", s.handleEventsSSE)
-
-	// 兼容旧的“启动回合 / 状态 / 审批”接口，内部同样走事件日志。
-	mux.HandleFunc("GET /api/catalog", s.handleCatalog)
-	mux.HandleFunc("POST /api/turns", s.handleStartTurn)
-	mux.HandleFunc("GET /api/turns/{turnID}", s.handleTurnStatus)
-	mux.HandleFunc("POST /api/turns/{turnID}/approvals/{toolCallID}", s.handleApproval)
 
 	// 前端构建产物存在时由同一端口托管，刷新页面仍回到 index.html。
 	if s.cfg.WebDist != "" {
@@ -222,7 +212,6 @@ func (s *Server) newRuntime(ep provider.Endpoint) (*runtime.Runtime, error) {
 		Model:         ep.FullID.String(),
 		ProviderModel: ep.ModelID, // 服务商只认裸 id，全称 id 仅用于事件
 		Client:        client,
-		Writer:        s.writer,
 	})
 }
 
@@ -258,27 +247,24 @@ func (s *Server) runTurn(ctx context.Context, lock *sync.Mutex, a *activeTurn, p
 	}
 }
 
-// prepareTurn 为新回合建上下文并落盘用户消息，返回新建上下文与消息事件。
+// prepareTurn 为新回合建上下文并落盘用户消息。
+// tail 是调用方已经折叠出的会话内容链尾，避免重复读整条会话。
 // 所有写入都经 s.writer。
-func (s *Server) prepareTurn(ctx context.Context, sessionID, turnID, text string) (eventlog.ContextRow, eventlog.Event, error) {
-	tail, err := runtime.SessionChainTail(ctx, s.cfg.Store, sessionID)
-	if err != nil {
-		return eventlog.ContextRow{}, eventlog.Event{}, err
-	}
+func (s *Server) prepareTurn(ctx context.Context, sessionID, turnID, text string, tail ids.EventID) (eventlog.ContextRow, error) {
 	ctxRow, err := s.writer.CreateContext(ctx, eventlog.ContextInput{ForkAt: tail})
 	if err != nil {
-		return eventlog.ContextRow{}, eventlog.Event{}, err
+		return eventlog.ContextRow{}, err
 	}
-	msgEv, err := runtime.AppendUserMessageWithWriter(ctx, s.cfg.Store, s.writer, runtime.UserMessage{
+	if _, err := runtime.AppendUserMessage(ctx, s.cfg.Store, runtime.UserMessage{
 		SessionID: sessionID,
 		TurnID:    turnID,
 		ContextID: ctxRow.ID,
+		ParentID:  tail,
 		Text:      text,
-	})
-	if err != nil {
-		return eventlog.ContextRow{}, eventlog.Event{}, err
+	}); err != nil {
+		return eventlog.ContextRow{}, err
 	}
-	return ctxRow, msgEv, nil
+	return ctxRow, nil
 }
 
 // ---- GET /api/health ----
@@ -390,16 +376,6 @@ func int64Param(w http.ResponseWriter, r *http.Request, name string, def int64) 
 		return 0, false
 	}
 	return v, true
-}
-
-// firstNonEmpty 返回第一个非空字符串。
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 // writeJSON 输出 JSON 响应。

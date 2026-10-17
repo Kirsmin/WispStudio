@@ -66,5 +66,4 @@ export interface TurnStartedDTO {
   ContextID: string
   TurnID: string
   Model: string
-  MessageID?: string
 }

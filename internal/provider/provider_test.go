@@ -254,23 +254,6 @@ func TestCatalogClearErrors(t *testing.T) {
 		!strings.Contains(err.Error(), "provider 不存在") {
 		t.Errorf("ListByProvider 应给出明确错误，实际: %v", err)
 	}
-	// 别名解析：命中与未命中
-	if id, err := c.ResolveAlias("深度求索"); err != nil || id != "deepseek" {
-		t.Errorf("别名应解析为 deepseek，实际 %q, %v", id, err)
-	}
-	if _, err := c.ResolveAlias("不存在"); err == nil || !strings.Contains(err.Error(), "别名不存在") {
-		t.Errorf("未命中别名应给出明确错误，实际: %v", err)
-	}
-	// AddModel 到未知 provider 应报错而非 panic
-	if err := c.AddModel("nope", "m", ""); err == nil ||
-		!strings.Contains(err.Error(), "provider 不存在") {
-		t.Errorf("AddModel 未知 provider 应给出明确错误，实际: %v", err)
-	}
-	// 未绑定配置文件路径时 AddModel 不能写回
-	if err := c.AddModel("openai", "gpt-5", ""); err == nil ||
-		!strings.Contains(err.Error(), "无法写回") {
-		t.Errorf("无路径时应明确拒绝写回，实际: %v", err)
-	}
 }
 
 // 校验手动 Models 优先、发现结果补齐去重、别名正确解析。

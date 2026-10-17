@@ -29,6 +29,16 @@ const (
 	refWaitingPrefix = "waiting_approval:"
 )
 
+// IsTerminalRef 判断 refs 指针是否已到达终态（正常完成或失败）。
+func IsTerminalRef(target string) bool {
+	return target == RefCompleted || strings.HasPrefix(target, refFailedPrefix)
+}
+
+// IsWaitingRef 判断 refs 指针是否挂起等待审批。
+func IsWaitingRef(target string) bool {
+	return strings.HasPrefix(target, refWaitingPrefix)
+}
+
 // actorRuntime 是运行时写入事件的触发者标识。
 const actorRuntime = "runtime"
 
@@ -46,7 +56,6 @@ type Options struct {
 	ProviderModel string           // 发给服务商的裸模型 id；空则从 Model 去掉 provider 前缀
 	Client        *provider.Client // OpenAI 兼容客户端；nil 时用默认客户端
 	MaxIterations int              // 回合最大迭代次数，防死循环；<= 0 用默认 64
-	Writer        eventlog.Writer  // 写入入口；nil = 使用 store
 }
 
 // Runtime 是事件驱动运行时：无自有可变状态，一切状态由事件日志折叠得出。
@@ -84,13 +93,9 @@ func New(store *eventlog.Store, opts Options) (*Runtime, error) {
 	if maxIter <= 0 {
 		maxIter = 64
 	}
-	writer := opts.Writer
-	if writer == nil {
-		writer = store
-	}
 	return &Runtime{
 		store:         store,
-		writer:        writer,
+		writer:        store,
 		workspaceRoot: reg.workspaceRoot,
 		providerID:    opts.ProviderID,
 		model:         opts.Model,
@@ -303,32 +308,28 @@ type UserMessage struct {
 	SessionID string        // 会话 ID
 	TurnID    string        // 归属回合 ID，可空
 	ContextID ids.ContextID // 追加到的上下文
+	ParentID  ids.EventID   // 内容链尾；空则现场读取会话链尾
 	Text      string        // 正文
 }
 
-// AppendUserMessage 写入 user 角色的 message.created（以会话内容链尾为
-// parent_id）并以 ctx_op.append 追加到指定上下文，返回落盘事件。
-// 上层启动新回合时：先取 SessionChainTail 建上下文，再调用本函数。
+// AppendUserMessage 写入 user 角色的 message.created，并以 ctx_op.append
+// 追加到指定上下文，返回落盘事件。ParentID 为空时读取会话内容链尾。
 func AppendUserMessage(ctx context.Context, store *eventlog.Store, m UserMessage) (eventlog.Event, error) {
-	return AppendUserMessageWithWriter(ctx, store, store, m)
-}
-
-// AppendUserMessageWithWriter 与 AppendUserMessage 相同，但写入经指定 Writer。
-// API 层用它可以确保所有事件写入都走 eventlog.Writer。
-func AppendUserMessageWithWriter(ctx context.Context, store *eventlog.Store, writer eventlog.Writer, m UserMessage) (eventlog.Event, error) {
-	if writer == nil {
-		writer = store
-	}
 	if m.SessionID == "" {
 		return eventlog.Event{}, fmt.Errorf("runtime: SessionID 不能为空")
 	}
 	if m.ContextID == "" {
 		return eventlog.Event{}, fmt.Errorf("runtime: ContextID 不能为空")
 	}
-	tail, err := SessionChainTail(ctx, store, m.SessionID)
-	if err != nil {
-		return eventlog.Event{}, err
+	tail := m.ParentID
+	if tail == "" {
+		var err error
+		tail, err = SessionChainTail(ctx, store, m.SessionID)
+		if err != nil {
+			return eventlog.Event{}, err
+		}
 	}
+	var writer eventlog.Writer = store
 	ev, err := writer.AppendEvent(ctx, eventlog.EventInput{
 		Type:      eventlog.TypeMessageCreated,
 		SessionID: m.SessionID,

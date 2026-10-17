@@ -1,11 +1,6 @@
 package api
 
-import (
-	"net/http"
-	"strings"
-
-	"wisp/internal/provider"
-)
+import "net/http"
 
 // modelDTO 是 /api/models 中的单个模型条目。
 type modelDTO struct {
@@ -27,17 +22,6 @@ type providerDTO struct {
 type modelsResponse struct {
 	DefaultModel string        `json:"DefaultModel,omitempty"`
 	Providers    []providerDTO `json:"Providers"`
-}
-
-// addModelRequest 是 POST /api/models 的请求体。
-// 兼容直接传 FullID/Model（"{ProviderID}/{ModelID}"）。
-type addModelRequest struct {
-	ProviderID string `json:"ProviderID"`
-	ModelID    string `json:"ModelID"`
-	Alias      string `json:"Alias"`
-	ModelAlias string `json:"ModelAlias"`
-	FullID     string `json:"FullID"`
-	Model      string `json:"Model"`
 }
 
 // handleListModels 返回 catalog 全量：每个 provider 的手动模型、发现结果与别名。
@@ -69,44 +53,4 @@ func (s *Server) handleListModels(w http.ResponseWriter, _ *http.Request) {
 		resp.Providers = append(resp.Providers, item)
 	}
 	writeJSON(w, http.StatusOK, resp)
-}
-
-// handleAddModel 手动添加模型并写回 Config.local.toml。
-func (s *Server) handleAddModel(w http.ResponseWriter, r *http.Request) {
-	var req addModelRequest
-	if !decodeBody(w, r, &req) {
-		return
-	}
-	providerID := strings.TrimSpace(req.ProviderID)
-	modelID := strings.TrimSpace(req.ModelID)
-	if providerID == "" || modelID == "" {
-		full := strings.TrimSpace(firstNonEmpty(req.FullID, req.Model))
-		if full == "" {
-			writeError(w, http.StatusBadRequest, "缺少 ProviderID/ModelID 或 FullID")
-			return
-		}
-		parsed, err := provider.Parse(full)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "%v", err)
-			return
-		}
-		providerID, modelID = parsed.Split()
-	}
-	alias := strings.TrimSpace(firstNonEmpty(req.Alias, req.ModelAlias))
-
-	if err := s.cfg.Catalog.AddModel(providerID, modelID, alias); err != nil {
-		status := http.StatusBadRequest
-		if strings.Contains(err.Error(), "已存在") {
-			status = http.StatusConflict
-		}
-		writeError(w, status, "%v", err)
-		return
-	}
-	fullID := provider.Join(providerID, modelID)
-	writeJSON(w, http.StatusCreated, modelDTO{
-		ProviderID: providerID,
-		ModelID:    modelID,
-		FullID:     fullID.String(),
-		Alias:      alias,
-	})
 }

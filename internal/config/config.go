@@ -110,7 +110,7 @@ func Load() (*Config, error) {
 // LoadFile 从指定路径加载配置，不存在时先生成默认配置。
 func LoadFile(path string) (*Config, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		if err := os.WriteFile(path, []byte(defaultTOML), 0o600); err != nil {
+		if err := WriteAtomic(path, []byte(defaultTOML)); err != nil {
 			return nil, fmt.Errorf("config: 生成默认配置失败: %w", err)
 		}
 	}
@@ -123,6 +123,37 @@ func LoadFile(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: 解析配置失败: %w", err)
 	}
 	return cfg, nil
+}
+
+// WriteAtomic 原子替换配置文件：在目标目录创建临时文件，写入并 fsync 后
+// rename。任何一步失败都保留原文件，调用方无需回滚。
+func WriteAtomic(path string, data []byte) (err error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("config: 创建临时配置文件失败: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		return fmt.Errorf("config: 设置临时配置权限失败: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("config: 写入临时配置失败: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("config: 同步临时配置失败: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("config: 关闭临时配置失败: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("config: 替换配置失败: %w", err)
+	}
+	return nil
 }
 
 // Error 是带源行号的配置错误；Line 从 1 开始，0 表示无法定位。
@@ -298,13 +329,32 @@ func (c *Config) Validate() error {
 			}
 		}
 		seenProvider[p.ProviderID] = true
-		// 模型去重（保留首个），并校验 id 不含 "/"
+		// 发现接口必须使用绝对路径；未启用时允许留空。
+		if p.Discovery.Path != "" && !strings.HasPrefix(p.Discovery.Path, "/") {
+			return &fieldError{
+				message: fmt.Sprintf("config: Providers[%d].Discovery.Path 必须以 / 开头: %q", i, p.Discovery.Path),
+				table:   "Providers",
+				index:   i,
+				field:   "Path",
+				value:   p.Discovery.Path,
+			}
+		}
+		if p.Discovery.Enabled && p.Discovery.Path == "" {
+			return &fieldError{
+				message: fmt.Sprintf("config: Providers[%d] 启用 Discovery 时必须设置 Path", i),
+				table:   "Providers",
+				index:   i,
+				field:   "Path",
+				value:   "",
+			}
+		}
+		// 模型去重（保留首个），并校验 id 非空且不含 "/"
 		seenModel := make(map[string]bool, len(p.Models))
 		deduped := p.Models[:0]
 		for _, m := range p.Models {
-			if strings.Contains(m.ModelID, "/") {
+			if m.ModelID == "" || strings.Contains(m.ModelID, "/") {
 				return &fieldError{
-					message: fmt.Sprintf("config: 模型 id 不应包含 '/': %q", m.ModelID),
+					message: fmt.Sprintf("config: 模型 id 必须非空且不包含 '/': %q", m.ModelID),
 					table:   "Providers",
 					index:   i,
 					field:   "Models",

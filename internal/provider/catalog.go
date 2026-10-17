@@ -59,7 +59,7 @@ func (c *Catalog) ConfigText() (string, error) {
 }
 
 // ReplaceConfig 校验整段 TOML 文本后原子写回配置文件，并热更新内存目录。
-// 语法或 ProviderID 校验失败时返回 *config.Error（带行号），且不修改文件。
+// 解析/校验/写回任一步失败都会返回错误，旧文件与旧目录保持不变。
 // 自动发现结果会清空，调用方可随后重新 DiscoverAll。
 func (c *Catalog) ReplaceConfig(data []byte) error {
 	cfg, err := config.Parse(data)
@@ -71,13 +71,8 @@ func (c *Catalog) ReplaceConfig(data []byte) error {
 	if c.path == "" {
 		return fmt.Errorf("provider: 目录未绑定配置文件路径，无法保存")
 	}
-	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("provider: 写入配置失败: %w", err)
-	}
-	if err := os.Rename(tmp, c.path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("provider: 替换配置失败: %w", err)
+	if err := config.WriteAtomic(c.path, data); err != nil {
+		return fmt.Errorf("provider: 保存配置失败: %w", err)
 	}
 	c.cfg = cfg
 	c.discovered = make(map[string][]ModelFullID)
@@ -238,24 +233,6 @@ func (c *Catalog) ListByProvider(providerID string) ([]Model, error) {
 		out = append(out, Model{FullID: d, Alias: c.modelAliasLocked(providerID, d.ModelID()), Discovered: true})
 	}
 	return out, nil
-}
-
-// ResolveAlias 把别名（如 ProviderName "深度求索"）解析为 ProviderID；未命中返回明确错误。
-func (c *Catalog) ResolveAlias(alias string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var known []string
-	for i := range c.cfg.Providers {
-		p := &c.cfg.Providers[i]
-		if p.ProviderName == "" {
-			continue
-		}
-		if p.ProviderName == alias {
-			return p.ProviderID, nil
-		}
-		known = append(known, p.ProviderName)
-	}
-	return "", fmt.Errorf("provider: 别名不存在: %q（已知别名: %s）", alias, strings.Join(known, ", "))
 }
 
 // modelAliasLocked 查 [[ModelAliases]] 段；调用方需已持锁。

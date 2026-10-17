@@ -210,3 +210,18 @@ type AgentSpawnedAttrs struct {
 	// empty 方式下为空。
 	SeedRef string `json:"seed_ref,omitempty"`
 }
+
+// RelResultOf 是 links 表中工具调用与结果的分组关系：
+// src = tool.returned 事件 ID，dst = tool.called 事件 ID。
+const RelResultOf = "result_of"
+
+// IsContentType 判断事件是否参与内容链与 compile 投影。
+// message.delta 等仅用于展示的事件不属于内容事件。
+func IsContentType(typ string) bool {
+	switch typ {
+	case TypeMessageCreated, TypeToolCalled, TypeToolReturned, TypePromptInjected:
+		return true
+	default:
+		return false
+	}
+}

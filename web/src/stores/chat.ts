@@ -14,7 +14,6 @@ export interface ChatMessage {
   content: string
   reasoning: string
   streaming: boolean
-  turnID: string
 }
 
 export type ToolStatus = 'called' | 'awaiting' | 'done' | 'failed' | 'rejected' | 'cancelled'
@@ -24,7 +23,6 @@ export interface ChatTool {
   kind: 'tool'
   id: string
   seq: number
-  turnID: string
   name: string
   args: string
   result: string
@@ -99,7 +97,6 @@ export const useChatStore = defineStore('chat', () => {
       content: '',
       reasoning: '',
       streaming: true,
-      turnID: event.TurnID,
     })
   }
 
@@ -162,8 +159,7 @@ export const useChatStore = defineStore('chat', () => {
               content,
               reasoning: '',
               streaming: false,
-              turnID: event.TurnID,
-            })
+                    })
           }
           scheduleSessionRefresh(400)
           return
@@ -178,8 +174,7 @@ export const useChatStore = defineStore('chat', () => {
             content: '',
             reasoning: '',
             streaming: false,
-            turnID: event.TurnID,
-          })
+                })
         // message.created 是最终正文；用 blob 正文覆盖流式累积，避免回放时重复。
         if (content) target.content = content
         target.streaming = false
@@ -193,8 +188,7 @@ export const useChatStore = defineStore('chat', () => {
             kind: 'tool',
             id,
             seq: event.Seq,
-            turnID: event.TurnID,
-            name: attrString(event.Attrs, 'name') || 'tool',
+                  name: attrString(event.Attrs, 'name') || 'tool',
             args: event.BlobText || '',
             result: '',
             resultStatus: '',
@@ -212,8 +206,7 @@ export const useChatStore = defineStore('chat', () => {
             kind: 'tool',
             id: event.SubjectID,
             seq: event.Seq,
-            turnID: event.TurnID,
-            name: 'tool',
+                  name: 'tool',
             args: '',
             result: '',
             resultStatus: '',
@@ -237,8 +230,7 @@ export const useChatStore = defineStore('chat', () => {
             kind: 'tool',
             id: toolCallID,
             seq: event.Seq,
-            turnID: event.TurnID,
-            name: attrString(event.Attrs, 'name') || 'tool',
+                  name: attrString(event.Attrs, 'name') || 'tool',
             args: '',
             result: '',
             resultStatus: '',
@@ -513,14 +505,14 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function decideApproval(tool: ChatTool, approve: boolean): Promise<void> {
-    if (tool.approval !== 'pending' || !tool.turnID) return
+    if (tool.approval !== 'pending' || !sessions.currentId) return
     const previousApproval = tool.approval
     const previousStatus = tool.status
     tool.approval = approve ? 'approved' : 'rejected'
     tool.status = approve ? 'called' : 'rejected'
     try {
       await postJSON(
-        `/api/turns/${encodeURIComponent(tool.turnID)}/approvals/${encodeURIComponent(tool.id)}`,
+        `/api/sessions/${encodeURIComponent(sessions.currentId)}/approvals/${encodeURIComponent(tool.id)}`,
         { Decision: approve ? 'approved' : 'rejected', Reason: approve ? '' : '用户在界面拒绝' },
       )
     } catch (error) {

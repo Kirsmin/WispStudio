@@ -44,11 +44,9 @@ type createSessionRequest struct {
 }
 
 // postMessageRequest 是 POST /api/sessions/{id}/messages 的请求体。
-// JSON 解码大小写不敏感，Message 兼容旧前端的 message 字段。
 type postMessageRequest struct {
-	Text    string `json:"Text"`
-	Message string `json:"Message"`
-	Model   string `json:"Model"`
+	Text  string `json:"Text"`
+	Model string `json:"Model"`
 }
 
 // turnStartedDTO 是启动回合后的响应。
@@ -57,7 +55,6 @@ type turnStartedDTO struct {
 	ContextID string `json:"ContextID"`
 	TurnID    string `json:"TurnID"`
 	Model     string `json:"Model"`
-	MessageID string `json:"MessageID,omitempty"`
 }
 
 // stopSessionDTO 是停止会话的响应。
@@ -161,16 +158,16 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	exists, deleted, err := s.sessionFlags(ctx, sessionID)
+	facts, err := s.sessionFacts(ctx, sessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "读取会话失败: %v", err)
 		return
 	}
-	if !exists {
+	if !facts.exists {
 		writeError(w, http.StatusNotFound, "会话不存在: %s", sessionID)
 		return
 	}
-	if deleted {
+	if facts.deleted {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -201,16 +198,16 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "会话 ID 格式不合法: %v", err)
 		return
 	}
-	exists, deleted, err := s.sessionFlags(r.Context(), sessionID)
+	facts, err := s.sessionFacts(r.Context(), sessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "读取会话失败: %v", err)
 		return
 	}
-	if !exists {
+	if !facts.exists {
 		writeError(w, http.StatusNotFound, "会话不存在: %s", sessionID)
 		return
 	}
-	if deleted {
+	if facts.deleted {
 		writeError(w, http.StatusGone, "会话已删除: %s", sessionID)
 		return
 	}
@@ -219,9 +216,6 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	text := strings.TrimSpace(req.Text)
-	if text == "" {
-		text = strings.TrimSpace(req.Message)
-	}
 	if !validText(text) {
 		writeError(w, http.StatusBadRequest, "Text 不能为空且必须是合法 UTF-8")
 		return
@@ -229,7 +223,7 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
-		model = s.sessionModel(r.Context(), sessionID)
+		model = facts.model
 	}
 	fullID, err := s.resolveModel(model)
 	if err != nil {
@@ -251,7 +245,7 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 	lock := s.sessionState(sessionID)
 	lock.lock.Lock()
 
-	ctxRow, msgEv, err := s.prepareTurn(r.Context(), sessionID, turnID, text)
+	ctxRow, err := s.prepareTurn(r.Context(), sessionID, turnID, text, facts.tail)
 	if err != nil {
 		lock.lock.Unlock()
 		writeError(w, http.StatusInternalServerError, "%v", err)
@@ -279,7 +273,6 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		ContextID: ctxRow.ID.String(),
 		TurnID:    turnID,
 		Model:     fullID.String(),
-		MessageID: msgEv.SubjectID,
 	})
 }
 
@@ -351,7 +344,7 @@ func (s *Server) waitingTurnID(ctx context.Context, sessionID string) (turnID st
 	if err != nil {
 		return turnID, false
 	}
-	return turnID, strings.HasPrefix(status.Ref, "waiting_approval:")
+	return turnID, runtime.IsWaitingRef(status.Ref)
 }
 
 // stopWaitingTurn 把挂起等待审批的回合写成停止终态。
@@ -426,44 +419,40 @@ func (s *Server) projectSession(ctx context.Context, sessionID string, evs []eve
 	return dto
 }
 
-// sessionFlags 读取会话是否存在以及是否已软删除。
-func (s *Server) sessionFlags(ctx context.Context, sessionID string) (exists, deleted bool, err error) {
-	evs, err := s.cfg.Store.ListBySession(ctx, sessionID, 0, 0)
-	if err != nil {
-		return false, false, err
-	}
-	if len(evs) == 0 {
-		return false, false, nil
-	}
-	for _, ev := range evs {
-		if ev.Type == eventlog.TypeSessionDeleted {
-			deleted = true
-			break
-		}
-	}
-	return true, deleted, nil
+// sessionFacts 是一次会话读取折叠出的事实，供消息写入路径复用，
+// 避免为“存在性 / 删除状态 / 模型 / 内容链尾”重复扫描整条会话。
+type sessionFacts struct {
+	exists  bool
+	deleted bool
+	model   string
+	tail    ids.EventID
 }
 
-// sessionModel 返回会话最近一次使用的模型；用于未显式传 Model 的消息。
-func (s *Server) sessionModel(ctx context.Context, sessionID string) string {
+// sessionFacts 读取整个会话并折叠出写入新回合需要的事实。
+func (s *Server) sessionFacts(ctx context.Context, sessionID string) (sessionFacts, error) {
 	evs, err := s.cfg.Store.ListBySession(ctx, sessionID, 0, 0)
 	if err != nil {
-		return ""
+		return sessionFacts{}, err
 	}
-	model := ""
+	facts := sessionFacts{exists: len(evs) > 0}
 	for _, ev := range evs {
 		switch ev.Type {
 		case eventlog.TypeSessionCreated:
 			var attrs eventlog.SessionCreatedAttrs
 			if json.Unmarshal(ev.Attrs, &attrs) == nil && attrs.Model != "" {
-				model = attrs.Model
+				facts.model = attrs.Model
 			}
 		case eventlog.TypeLLMRequested:
 			var attrs eventlog.LLMRequestedAttrs
 			if json.Unmarshal(ev.Attrs, &attrs) == nil && attrs.Model != "" {
-				model = attrs.Model
+				facts.model = attrs.Model
 			}
+		case eventlog.TypeSessionDeleted:
+			facts.deleted = true
+		}
+		if eventlog.IsContentType(ev.Type) {
+			facts.tail = ev.ID
 		}
 	}
-	return model
+	return facts, nil
 }
