@@ -6,6 +6,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -23,7 +25,8 @@ const FileName = "Config.local.toml"
 const defaultTOML = `# Wisp 本地配置（与可执行文件同目录，首次运行自动生成，请勿提交到版本库）
 
 [server]
-Port = 8787
+Port  = 8787
+Token = ""                               # 留空时首次启动自动生成并写回
 
 [[Providers]]
 ProviderID   = "deepseek"                # 模型全称 id 的前缀 {ProviderID}/{ModelID}
@@ -46,7 +49,8 @@ type Config struct {
 
 // ServerConfig 服务配置。
 type ServerConfig struct {
-	Port int // 监听端口
+	Port  int    // 监听端口
+	Token string // 本机接口访问令牌，留空由启动流程生成
 }
 
 // ProviderConfig 模型服务商配置。
@@ -154,6 +158,75 @@ func WriteAtomic(path string, data []byte) (err error) {
 		return fmt.Errorf("config: 替换配置失败: %w", err)
 	}
 	return nil
+}
+
+// EnsureToken 确保配置中存在访问令牌：已有非空 Token 时原样返回，
+// 否则生成 32 字节随机令牌，文本级替换写回（保留注释），
+// 写回前后均经 Parse 校验。
+func EnsureToken(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("config: 读取配置失败: %w", err)
+	}
+	cfg, err := Parse(data)
+	if err != nil {
+		return "", fmt.Errorf("config: 解析配置失败: %w", err)
+	}
+	if cfg.Server.Token != "" {
+		return cfg.Server.Token, nil
+	}
+	token, err := randomToken()
+	if err != nil {
+		return "", err
+	}
+	updated := replaceServerToken(string(data), token)
+	if _, err := Parse([]byte(updated)); err != nil {
+		return "", fmt.Errorf("config: 写回令牌前校验失败: %w", err)
+	}
+	if err := WriteAtomic(path, []byte(updated)); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// randomToken 生成 32 字节随机令牌的十六进制文本。
+func randomToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("config: 生成随机令牌失败: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// replaceServerToken 在 [server] 段内替换 Token 行；不存在时插到段首；
+// 整个 [server] 段缺失时追加一段。
+func replaceServerToken(text, token string) string {
+	lines := strings.Split(text, "\n")
+	section := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if section < 0 {
+			if trimmed == "[server]" {
+				section = i
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[") {
+			break
+		}
+		if keyLine(line, "Token") {
+			lines[i] = fmt.Sprintf("Token = %q", token)
+			return strings.Join(lines, "\n")
+		}
+	}
+	if section < 0 {
+		return strings.TrimRight(text, "\n") + "\n\n[server]\n" + fmt.Sprintf("Token = %q", token) + "\n"
+	}
+	insert := make([]string, 0, len(lines)+1)
+	insert = append(insert, lines[:section+1]...)
+	insert = append(insert, fmt.Sprintf("Token = %q", token))
+	insert = append(insert, lines[section+1:]...)
+	return strings.Join(insert, "\n")
 }
 
 // Error 是带源行号的配置错误；Line 从 1 开始，0 表示无法定位。

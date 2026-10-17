@@ -1,6 +1,6 @@
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
-import { postJSON, responseError } from '../api/client'
+import { postJSON, responseError, sessionToken } from '../api/client'
 import { SSEParser, type SSEFrame } from '../api/sse'
 import type { EventDTO, StopDTO, TurnStartedDTO } from '../api/types'
 import { useSessionsStore } from './sessions'
@@ -361,11 +361,14 @@ export const useChatStore = defineStore('chat', () => {
     if (linkState.value !== 'reconnecting') linkState.value = 'connecting'
 
     try {
+      const headers: Record<string, string> = { Accept: 'text/event-stream' }
+      const token = sessionToken()
+      if (token) headers['X-Token'] = token
       const response = await fetch(
         `/api/sessions/${encodeURIComponent(sessionId)}/events?after_seq=${afterSeq}`,
         {
           method: 'GET',
-          headers: { Accept: 'text/event-stream' },
+          headers,
           cache: 'no-store',
           signal: controller.signal,
         },

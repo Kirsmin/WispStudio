@@ -55,6 +55,7 @@ Models       = ["model-a"]
 		Store:         store,
 		Catalog:       catalog,
 		WorkspaceRoot: dir,
+		Token:         token,
 		Logf:          func(string, ...any) {},
 	})
 	if err != nil {

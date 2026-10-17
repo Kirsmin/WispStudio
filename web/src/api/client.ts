@@ -32,9 +32,18 @@ export async function responseError(response: Response): Promise<APIError> {
   return new APIError(text || `请求失败 (${response.status})`, response.status)
 }
 
+// sessionToken 从 index.html 注入的 meta 读取本机访问令牌；未注入时返回空串。
+export function sessionToken(): string {
+  const meta = document.querySelector('meta[name="wisp-token"]')
+  return meta?.getAttribute('content')?.trim() ?? ''
+}
+
 // request 执行 JSON 请求；204 或空响应返回 undefined。
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, { cache: 'no-store', ...init })
+  const headers = new Headers(init?.headers)
+  const token = sessionToken()
+  if (token && !headers.has('X-Token')) headers.set('X-Token', token)
+  const response = await fetch(path, { cache: 'no-store', ...init, headers })
   if (!response.ok) throw await responseError(response)
   if (response.status === 204) return undefined as T
   const text = await response.text()

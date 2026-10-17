@@ -45,6 +45,11 @@ func main() {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		log.Fatalf("创建数据目录失败: %v", err)
 	}
+	// 访问令牌：配置为空时生成随机值并写回配置文件
+	token, err := config.EnsureToken(filepath.Join(baseDir, config.FileName))
+	if err != nil {
+		log.Fatalf("准备访问令牌失败: %v", err)
+	}
 	store, err := eventlog.Open(filepath.Join(dataDir, "eventlog.db"))
 	if err != nil {
 		log.Fatalf("打开事件日志失败: %v", err)
@@ -74,6 +79,7 @@ func main() {
 		Catalog:       catalog,
 		WorkspaceRoot: baseDir,
 		WebDist:       webDist,
+		Token:         token,
 		Logf:          func(msg string, args ...any) { slog.Info(fmt.Sprintf(msg, args...)) },
 	})
 	if err != nil {

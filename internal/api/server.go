@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +40,7 @@ type Config struct {
 	OnCompile     func(time.Duration)  // 编译耗时观察者，nil = 不观察
 	Logf          func(string, ...any) // 日志，nil = 丢弃
 	WebDist       string               // 前端构建产物目录，空 = 不托管静态页面
+	Token         string               // 本机访问令牌，空 = 全部 /api/* 返回 401（health 除外）
 }
 
 // Server 是 HTTP API 服务。
@@ -114,10 +116,10 @@ func (s *Server) Handler() http.Handler {
 
 	// 前端构建产物存在时由同一端口托管，刷新页面仍回到 index.html。
 	if s.cfg.WebDist != "" {
-		mux.Handle("GET /", spaHandler(s.cfg.WebDist))
+		mux.Handle("GET /", spaHandler(s.cfg.WebDist, s.cfg.Token))
 	}
 
-	return corsMiddleware(rejectWhenClosing(s.closing.Load, mux))
+	return corsMiddleware(rejectWhenClosing(s.closing.Load, s.authMiddleware(mux)))
 }
 
 // Shutdown 停止接收新的回合、取消在途回合并等待它们写完终态事件，
@@ -289,7 +291,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 			h.Set("Access-Control-Allow-Origin", origin)
 			h.Set("Vary", "Origin")
 			h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-			h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Last-Event-ID, Cache-Control")
+			h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Last-Event-ID, Cache-Control, X-Token")
 			h.Set("Access-Control-Expose-Headers", "Last-Event-ID")
 			h.Set("Access-Control-Max-Age", "86400")
 		}
@@ -317,6 +319,31 @@ func isLocalOrigin(origin string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// authMiddleware 保护 /api/*：非本机 Origin 一律 403，令牌不匹配 401；
+// health、静态页面与预检（由 corsMiddleware 处理）免鉴权。空令牌视为拒绝一切。
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api" && !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/api/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" && !isLocalOrigin(origin) {
+			writeError(w, http.StatusForbidden, "仅允许本机前端访问")
+			return
+		}
+		got := r.Header.Get("X-Token")
+		if s.cfg.Token == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.Token)) != 1 {
+			writeError(w, http.StatusUnauthorized, "缺少或错误的 X-Token")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // rejectForeignOrigin 拒绝非本机 Origin 的配置读写，防止任意网页读取密钥。
