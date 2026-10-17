@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +37,7 @@ type Config struct {
 	DefaultModel  provider.ModelFullID // 请求未指定模型时的默认模型，空 = 目录内第一个
 	TurnTimeout   time.Duration        // 单回合超时，<=0 用默认 10 分钟
 	Logf          func(string, ...any) // 日志，nil = 丢弃
+	WebDist       string               // 前端构建产物目录，空 = 不托管静态页面
 }
 
 // Server 是 HTTP API 服务。
@@ -101,10 +104,13 @@ func (s *Server) Handler() http.Handler {
 	// 新协议：会话、消息、停止、模型、事件追踪。
 	mux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/sessions", s.handleCreateSession)
+	mux.HandleFunc("DELETE /api/sessions/{sessionID}", s.handleDeleteSession)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/messages", s.handlePostMessage)
 	mux.HandleFunc("POST /api/sessions/{sessionID}/stop", s.handleStopSession)
 	mux.HandleFunc("GET /api/models", s.handleListModels)
 	mux.HandleFunc("POST /api/models", s.handleAddModel)
+	mux.HandleFunc("GET /api/config", s.handleGetConfig)
+	mux.HandleFunc("POST /api/config", s.handleUpdateConfig)
 	mux.HandleFunc("GET /api/events/{eventID}/trace", s.handleTrace)
 	mux.HandleFunc("GET /api/sessions/{sessionID}/events", s.handleEventsSSE)
 
@@ -113,6 +119,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/turns", s.handleStartTurn)
 	mux.HandleFunc("GET /api/turns/{turnID}", s.handleTurnStatus)
 	mux.HandleFunc("POST /api/turns/{turnID}/approvals/{toolCallID}", s.handleApproval)
+
+	// 前端构建产物存在时由同一端口托管，刷新页面仍回到 index.html。
+	if s.cfg.WebDist != "" {
+		mux.Handle("GET /", spaHandler(s.cfg.WebDist))
+	}
 
 	return corsMiddleware(rejectWhenClosing(s.closing.Load, mux))
 }
@@ -278,21 +289,55 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 // ---- CORS / 关闭保护 ----
 
-// corsMiddleware 允许本机前端跨端口访问，并处理预检。
+// corsMiddleware 只允许本机来源跨端口访问，并处理预检。
+// 配置接口会返回明文密钥，因此不能再用通配 "*" 放开任意网页读取。
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := w.Header()
-		h.Set("Access-Control-Allow-Origin", "*")
-		h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Last-Event-ID, Cache-Control")
-		h.Set("Access-Control-Expose-Headers", "Last-Event-ID")
-		h.Set("Access-Control-Max-Age", "86400")
+		origin := r.Header.Get("Origin")
+		local := origin == "" || isLocalOrigin(origin)
+		if origin != "" && local {
+			h := w.Header()
+			h.Set("Access-Control-Allow-Origin", origin)
+			h.Set("Vary", "Origin")
+			h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+			h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Last-Event-ID, Cache-Control")
+			h.Set("Access-Control-Expose-Headers", "Last-Event-ID")
+			h.Set("Access-Control-Max-Age", "86400")
+		}
 		if r.Method == http.MethodOptions {
+			if !local {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isLocalOrigin 判断 Origin 是否属于本机（localhost / 127.x / ::1）。
+func isLocalOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// rejectForeignOrigin 拒绝非本机 Origin 的配置读写，防止任意网页读取密钥。
+func rejectForeignOrigin(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin != "" && !isLocalOrigin(origin) {
+		writeError(w, http.StatusForbidden, "仅允许本机前端访问配置")
+		return true
+	}
+	return false
 }
 
 // rejectWhenClosing 在优雅关闭期间拒绝新请求（health 除外）。

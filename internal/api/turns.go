@@ -189,6 +189,20 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
+	// 先拿会话锁再复核状态：避免与 stop 并发时把已结束的回合重新拉起。
+	lock := s.sessionState(status.SessionID)
+	lock.lock.Lock()
+	status, err = runtime.Status(ctx, s.cfg.Store, turnID)
+	if err != nil {
+		lock.lock.Unlock()
+		writeError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if status.Completed || status.Ref == "completed" || strings.HasPrefix(status.Ref, "failed:") {
+		lock.lock.Unlock()
+		writeError(w, http.StatusConflict, "回合已结束，无法再审批")
+		return
+	}
 	pending := false
 	for _, pa := range status.PendingApprovals {
 		if pa.ToolCallID == toolCallID {
@@ -197,33 +211,36 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !pending {
+		lock.lock.Unlock()
 		writeError(w, http.StatusConflict, "工具调用 %s 不在待审批状态", toolCallID)
 		return
 	}
 	if status.ContextID == "" {
+		lock.lock.Unlock()
 		writeError(w, http.StatusConflict, "回合 %s 缺少上下文信息，无法恢复", turnID)
 		return
 	}
 
 	fullID, err := s.resolveModel(firstNonEmpty(strings.TrimSpace(req.Model), status.Model))
 	if err != nil {
+		lock.lock.Unlock()
 		writeError(w, http.StatusBadRequest, "%v", err)
 		return
 	}
 	ep, err := s.cfg.Catalog.Endpoint(fullID)
 	if err != nil {
+		lock.lock.Unlock()
 		writeError(w, http.StatusBadRequest, "%v", err)
 		return
 	}
 	rt, err := s.newRuntime(ep)
 	if err != nil {
+		lock.lock.Unlock()
 		writeError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 
 	p := runtime.TurnParams{SessionID: status.SessionID, TurnID: turnID, ContextID: status.ContextID}
-	lock := s.sessionState(status.SessionID)
-	lock.lock.Lock()
 	if err := rt.DecideApproval(ctx, p, toolCallID, approved, strings.TrimSpace(req.Reason)); err != nil {
 		lock.lock.Unlock()
 		writeError(w, http.StatusInternalServerError, "%v", err)

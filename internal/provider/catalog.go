@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -35,6 +36,52 @@ func NewCatalog(cfg *config.Config, path string) *Catalog {
 		path:       path,
 		discovered: make(map[string][]ModelFullID),
 	}
+}
+
+// ConfigPath 返回目录绑定的配置文件路径；空串表示未绑定。
+func (c *Catalog) ConfigPath() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.path
+}
+
+// ConfigText 读取配置文件原文；目录未绑定路径时返回错误。
+func (c *Catalog) ConfigText() (string, error) {
+	path := c.ConfigPath()
+	if path == "" {
+		return "", fmt.Errorf("provider: 目录未绑定配置文件路径")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("provider: 读取配置失败: %w", err)
+	}
+	return string(data), nil
+}
+
+// ReplaceConfig 校验整段 TOML 文本后原子写回配置文件，并热更新内存目录。
+// 语法或 ProviderID 校验失败时返回 *config.Error（带行号），且不修改文件。
+// 自动发现结果会清空，调用方可随后重新 DiscoverAll。
+func (c *Catalog) ReplaceConfig(data []byte) error {
+	cfg, err := config.Parse(data)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.path == "" {
+		return fmt.Errorf("provider: 目录未绑定配置文件路径，无法保存")
+	}
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return fmt.Errorf("provider: 写入配置失败: %w", err)
+	}
+	if err := os.Rename(tmp, c.path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("provider: 替换配置失败: %w", err)
+	}
+	c.cfg = cfg
+	c.discovered = make(map[string][]ModelFullID)
+	return nil
 }
 
 // ProviderIDs 返回全部已配置 provider id（排序后），供错误提示与展示。
@@ -229,6 +276,7 @@ func (c *Catalog) DiscoverAll(ctx context.Context, logf func(string, ...any)) {
 		logf = func(string, ...any) {}
 	}
 	c.mu.Lock()
+	cfgSnapshot := c.cfg
 	providers := make([]config.ProviderConfig, len(c.cfg.Providers))
 	copy(providers, c.cfg.Providers)
 	hc := c.httpClient
@@ -245,8 +293,14 @@ func (c *Catalog) DiscoverAll(ctx context.Context, logf func(string, ...any)) {
 			continue
 		}
 		c.mu.Lock()
-		known := make(map[string]bool, len(c.cfg.Providers[i].Models))
-		for _, m := range c.cfg.Providers[i].Models {
+		// 配置已被整段替换时丢弃本轮结果，避免把旧 provider 的模型写进新目录。
+		if c.cfg != cfgSnapshot {
+			c.mu.Unlock()
+			logf("provider: 配置已更新，丢弃过期的自动发现结果")
+			continue
+		}
+		known := make(map[string]bool, len(p.Models))
+		for _, m := range p.Models {
 			known[m.ModelID] = true
 		}
 		added := 0

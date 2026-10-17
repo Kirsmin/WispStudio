@@ -1,6 +1,6 @@
 # WispStudio · Wisp
 
-Go + Vue 3 + TypeScript 的本地会话式 coding agent。Plan 和 Build 由 Runtime 状态机协调；SQLite 保存完整事件、请求快照与版本化产物。
+Go + Vue 3 + TypeScript 的本地会话式 coding agent。事件驱动运行时通过 SSE 流式输出；SQLite 保存完整事件与模型请求快照。
 
 ## 启动
 
@@ -11,7 +11,7 @@ cd web && npm ci && npm run build
 cd .. && go build -o server ./cmd/server && ./server
 ```
 
-首次启动会在**可执行文件同目录**生成 `Config.local.toml`（请勿提交版本库）：按 `[[Providers]]` 段填写 `BaseURL`、`Secret`、`Models`（模型 id 原样透传给服务商）后重启。默认监听 `http://127.0.0.1:8787`，事件日志在可执行文件同目录的 `Data/eventlog.db`，工具的工作区根也是可执行文件同目录。开发前端可在 `web/` 运行 `npm run dev`。
+首次启动会在**可执行文件同目录**生成 `Config.local.toml`（请勿提交版本库）：按 `[[Providers]]` 段填写 `BaseURL`、`Secret`、`Models`（模型 id 原样透传给服务商）后重启。默认监听 `http://127.0.0.1:8787`，事件日志在可执行文件同目录的 `Data/eventlog.db`，工具的工作区根也是可执行文件同目录。`web/dist` 存在时，同一端口会直接托管前端页面；开发前端可在 `web/` 运行 `npm run dev`。
 
 ## HTTP API
 
@@ -24,15 +24,18 @@ cd .. && go build -o server ./cmd/server && ./server
 | GET | `/api/health` | 存活检查 |
 | GET | `/api/sessions` | 会话列表（由 `session.created` 与内容事件折叠） |
 | POST | `/api/sessions` | 新建会话并写 `session.created`，body `{"Title","Model?"}` |
+| DELETE | `/api/sessions/{id}` | 软删除会话（追加 `session.deleted`），回合执行中返回 409 |
 | GET | `/api/sessions/{id}/events?after_seq=N` | SSE：先回放日志中 `seq>N` 的事件，再推送实时事件；断线带 `after_seq` 重连即可补发 |
 | POST | `/api/sessions/{id}/messages` | body `{"Text","Model?"}`，写 `message.created` + `turn.started` 并异步执行回合 |
 | POST | `/api/sessions/{id}/stop` | 停止当前回合，写 `turn.completed` 终态 |
 | GET | `/api/models` | catalog 全量：手动模型、自动发现结果、别名与 `ProviderName` |
 | POST | `/api/models` | body `{"ProviderID","ModelID","Alias?"}`，写回 `Config.local.toml` |
+| GET | `/api/config` | 返回 `Config.local.toml` 路径与原文（仅本机来源） |
+| POST | `/api/config` | body `{"Text"}`，校验 TOML 与 ProviderID 后原子写回并热更新 catalog；失败返回 400 与 `line` |
 | GET | `/api/events/{id}/trace` | 沿 `cause_id` 回溯因果链，调试用 |
 
-SSE 每个事件带 `id: <seq>`、`event: <type>` 与 `data: <事件投影 JSON>`；客户端也应处理
-`Last-Event-ID`（服务端同样支持）。事件写入后只在 `eventlog.Hub` 发“有新事件”提示，
+SSE 每个事件带 `id: <seq>`、`event: <type>` 与 `data: <事件投影 JSON>`；客户端用
+`after_seq`（服务端也支持 `Last-Event-ID`）补齐。事件写入后只在 `eventlog.Hub` 发“有新事件”提示，
 SSE 收到提示后回读日志，因此通知可合并、数据不会丢。
 
 兼容接口仍保留：`GET /api/catalog`、`POST /api/turns`、`GET /api/turns/{id}`、
@@ -47,12 +50,10 @@ WISP_LIVE_API_KEY=sk-xxx go test ./internal/provider/ -run TestLiveToolCallWireF
 
 ## 工作方式
 
-- **项目指令按会话选择：** 输入框的 `AGENTS.md` 开关默认关闭，开启才注入工作区根目录的指令（最多 128 KiB），并将选择持久化到 Session；不会因此自动展示整个工作区。项目指令不覆盖 Runtime 的权限检查。
-- **有效目标不失忆：** 原始请求只用于记录；最新有效 Plan 更新 `current_objective`，后续明确修改另存为 UserOverrides，Build 按当前要求执行。
-- **更少的额外流程：** 独立单文件任务跳过无意义的仓库调查；简单任务不创建 Phase，复杂任务的进度与 Checkpoint 由 Runtime 管理，不占用工具调用。
-- **工具与审批：** 每轮最多接受四个独立只读工具；写入和 Shell 命令需授权，拒绝或暂停后仍按原批次配对回放。审批可仅允许本次，或允许本 Turn 的文件写入 / 同一条命令；只读 `verify_file` 无需 Shell 授权。
-- **双层界面：** 主聊天折叠连续执行步骤；右侧「调试」增量读取模型摘要，展开单次调用才加载实际 Prompt 分层、消息、工具结果与完整请求。
-- **完整导出：** 会话顶部的导出按钮生成本地保存数据的 Zip，其中包含完整模型请求和 Session 文件。
+- **界面只保留三件事：** 会话列表、流式聊天与 Markdown 渲染。工具调用以可折叠块内联展示，写入和 Shell 命令在工具块内批准或拒绝。
+- **断线不丢消息：** SSE 客户端按事件 `Seq` 记录位置，断线后指数退避重连并携带 `after_seq` 补发；刷新页面从 0 回放完整历史。
+- **配置页：** 直接编辑 `Config.local.toml` 原文，保存时后端校验语法与 `ProviderID` 并返回错误行号，成功后热更新模型目录，密钥对新请求立即生效。
+- **模型选择：** 新会话只需在下拉框选择模型；下拉显示 `ModelAlias`，没有别名时显示全称 id。
 
 ## 数据与升级
 

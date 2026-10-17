@@ -62,10 +62,18 @@ func main() {
 	cancelDiscover()
 	log.Println("模型目录已就绪")
 
+	// 前端构建产物与可执行文件同目录时，由同一端口托管页面。
+	webDist := filepath.Join(baseDir, "web", "dist")
+	if info, statErr := os.Stat(webDist); statErr != nil || !info.IsDir() {
+		webDist = ""
+		log.Println("未找到 web/dist，仅提供 HTTP API")
+	}
+
 	apiSrv, err := api.NewServer(api.Config{
 		Store:         store,
 		Catalog:       catalog,
 		WorkspaceRoot: baseDir,
+		WebDist:       webDist,
 		Logf:          func(msg string, args ...any) { slog.Info(fmt.Sprintf(msg, args...)) },
 	})
 	if err != nil {

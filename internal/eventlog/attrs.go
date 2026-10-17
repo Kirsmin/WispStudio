@@ -14,6 +14,10 @@ const (
 	// session_id 列同时写会话 ID，便于事件流按会话订阅。
 	TypeSessionCreated = "session.created"
 
+	// TypeSessionDeleted 软删除一个会话，SubjectID = 会话 ID。
+	// 事件日志保持只追加：列表与新建回合会折叠本事件并跳过已删除会话。
+	TypeSessionDeleted = "session.deleted"
+
 	// TypeMessageCreated 创建/更新一条消息，SubjectID = 消息 ID。
 	// 同一 SubjectID 多次出现表示多版本，seq 最大者为最新版本。
 	// role 属于读取时才解析的附加数据，故放 attrs。

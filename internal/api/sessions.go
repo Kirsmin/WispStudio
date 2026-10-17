@@ -32,6 +32,9 @@ type sessionDTO struct {
 	TurnCount    int    `json:"TurnCount"`
 	LastTurnID   string `json:"LastTurnID,omitempty"`
 	Running      bool   `json:"Running"`
+
+	// Deleted 只用于服务端折叠，不暴露给前端。
+	Deleted bool `json:"-"`
 }
 
 // createSessionRequest 是 POST /api/sessions 的请求体。
@@ -79,7 +82,11 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "读取会话 %s 失败: %v", sessionID, err)
 			return
 		}
-		out = append(out, s.projectSession(ctx, sessionID, evs))
+		item := s.projectSession(ctx, sessionID, evs)
+		if item.Deleted {
+			continue
+		}
+		out = append(out, item)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].UpdatedAt != out[j].UpdatedAt {
@@ -145,11 +152,66 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleDeleteSession 软删除会话：追加 session.deleted 事件。
+// 事件日志保持只追加，既有内容不物理删除；列表与会话读取会跳过它。
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	sessionID := strings.TrimSpace(r.PathValue("sessionID"))
+	if _, err := ids.ParseSessionID(sessionID); err != nil {
+		writeError(w, http.StatusBadRequest, "会话 ID 格式不合法: %v", err)
+		return
+	}
+	ctx := r.Context()
+	exists, deleted, err := s.sessionFlags(ctx, sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "读取会话失败: %v", err)
+		return
+	}
+	if !exists {
+		writeError(w, http.StatusNotFound, "会话不存在: %s", sessionID)
+		return
+	}
+	if deleted {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if s.isRunning(sessionID) {
+		writeError(w, http.StatusConflict, "回合正在执行，请先停止再删除会话")
+		return
+	}
+	if turnID, waiting := s.waitingTurnID(ctx, sessionID); waiting {
+		writeError(w, http.StatusConflict, "回合 %s 正在等待审批，请先批准、拒绝或停止", turnID)
+		return
+	}
+	if _, err := s.writer.AppendEvent(ctx, eventlog.EventInput{
+		Type:      eventlog.TypeSessionDeleted,
+		SessionID: sessionID,
+		Actor:     "user",
+		SubjectID: sessionID,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "删除会话失败: %v", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // handlePostMessage 写 message.created + turn.started，然后异步启动 runTurn。
 func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 	sessionID := strings.TrimSpace(r.PathValue("sessionID"))
 	if _, err := ids.ParseSessionID(sessionID); err != nil {
 		writeError(w, http.StatusBadRequest, "会话 ID 格式不合法: %v", err)
+		return
+	}
+	exists, deleted, err := s.sessionFlags(r.Context(), sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "读取会话失败: %v", err)
+		return
+	}
+	if !exists {
+		writeError(w, http.StatusNotFound, "会话不存在: %s", sessionID)
+		return
+	}
+	if deleted {
+		writeError(w, http.StatusGone, "会话已删除: %s", sessionID)
 		return
 	}
 	var req postMessageRequest
@@ -230,10 +292,37 @@ func (s *Server) handleStopSession(w http.ResponseWriter, r *http.Request) {
 	}
 	a := s.currentActive(sessionID)
 	if a == nil {
-		writeJSON(w, http.StatusOK, stopSessionDTO{SessionID: sessionID, Stopped: false})
+		// 没有执行中的 goroutine，也可能正挂起等待审批；一并写成停止终态。
+		// 持会话锁复核，避免与刚恢复的审批回合交错。
+		state := s.sessionState(sessionID)
+		if !state.lock.TryLock() {
+			if active := s.currentActive(sessionID); active != nil {
+				s.stopActive(w, sessionID, active)
+				return
+			}
+			writeError(w, http.StatusConflict, "会话正在处理另一个请求，请稍后重试")
+			return
+		}
+		if active := s.currentActive(sessionID); active != nil {
+			state.lock.Unlock()
+			s.stopActive(w, sessionID, active)
+			return
+		}
+		stopped, turnID, err := s.stopWaitingTurn(r.Context(), sessionID)
+		state.lock.Unlock()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "停止回合失败: %v", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, stopSessionDTO{SessionID: sessionID, TurnID: turnID, Stopped: stopped})
 		return
 	}
 
+	s.stopActive(w, sessionID, a)
+}
+
+// stopActive 取消执行中的回合并等待终态事件落盘。
+func (s *Server) stopActive(w http.ResponseWriter, sessionID string, a *activeTurn) {
 	a.rt.Interrupt("stopped")
 	a.cancel()
 	select {
@@ -242,6 +331,50 @@ func (s *Server) handleStopSession(w http.ResponseWriter, r *http.Request) {
 	case <-time.After(defaultStopTimeout):
 		writeError(w, http.StatusGatewayTimeout, "停止回合超时")
 	}
+}
+
+// waitingTurnID 返回最近一个挂起等待审批的回合 ID；没有则 waiting=false。
+func (s *Server) waitingTurnID(ctx context.Context, sessionID string) (turnID string, waiting bool) {
+	evs, err := s.cfg.Store.ListBySession(ctx, sessionID, 0, 0)
+	if err != nil {
+		return "", false
+	}
+	for _, ev := range evs {
+		if ev.Type == eventlog.TypeTurnStarted {
+			turnID = ev.TurnID
+		}
+	}
+	if turnID == "" {
+		return "", false
+	}
+	status, err := runtime.Status(ctx, s.cfg.Store, turnID)
+	if err != nil {
+		return turnID, false
+	}
+	return turnID, strings.HasPrefix(status.Ref, "waiting_approval:")
+}
+
+// stopWaitingTurn 把挂起等待审批的回合写成停止终态。
+// 返回 stopped=false 表示当前没有可停止的挂起回合。
+func (s *Server) stopWaitingTurn(ctx context.Context, sessionID string) (stopped bool, turnID string, err error) {
+	turnID, waiting := s.waitingTurnID(ctx, sessionID)
+	if !waiting {
+		return false, turnID, nil
+	}
+	if _, err := s.writer.AppendEvent(ctx, eventlog.EventInput{
+		Type:      eventlog.TypeTurnCompleted,
+		SessionID: sessionID,
+		TurnID:    turnID,
+		Actor:     "runtime",
+		SubjectID: turnID,
+		Attrs:     eventlog.TurnCompletedAttrs{Error: "stopped"},
+	}); err != nil {
+		return false, turnID, err
+	}
+	if _, err := s.writer.MoveRef(ctx, runtime.TurnRefName(turnID), "failed:stopped"); err != nil {
+		return false, turnID, err
+	}
+	return true, turnID, nil
 }
 
 // projectSession 把某会话的全部事件折叠为列表项。
@@ -282,6 +415,8 @@ func (s *Server) projectSession(ctx context.Context, sessionID string, evs []eve
 			if json.Unmarshal(ev.Attrs, &attrs) == nil && attrs.Model != "" {
 				dto.Model = attrs.Model
 			}
+		case eventlog.TypeSessionDeleted:
+			dto.Deleted = true
 		}
 	}
 	if firstUserText != "" && (dto.Title == "" || dto.Title == "新会话") {
@@ -289,6 +424,24 @@ func (s *Server) projectSession(ctx context.Context, sessionID string, evs []eve
 	}
 	dto.Running = s.isRunning(sessionID)
 	return dto
+}
+
+// sessionFlags 读取会话是否存在以及是否已软删除。
+func (s *Server) sessionFlags(ctx context.Context, sessionID string) (exists, deleted bool, err error) {
+	evs, err := s.cfg.Store.ListBySession(ctx, sessionID, 0, 0)
+	if err != nil {
+		return false, false, err
+	}
+	if len(evs) == 0 {
+		return false, false, nil
+	}
+	for _, ev := range evs {
+		if ev.Type == eventlog.TypeSessionDeleted {
+			deleted = true
+			break
+		}
+	}
+	return true, deleted, nil
 }
 
 // sessionModel 返回会话最近一次使用的模型；用于未显式传 Model 的消息。

@@ -67,11 +67,14 @@ onBeforeUnmount(() => {
 .md {
   --md-color: var(--text);
   --md-bk-color: transparent;
-  --md-theme: var(--accent-text);
-  --md-border-color: var(--border);
   --md-bk-color-outstand: var(--bg-soft);
+  --md-border-color: var(--border);
+  --md-border-hover-color: var(--border-strong);
+  --md-border-active-color: var(--blue);
+  --md-bk-hover-color: var(--bg-soft);
+  --md-hover-color: var(--text-2);
   font-size: 14px;
-  line-height: 1.7;
+  line-height: 1.72;
   background: transparent;
 }
 
@@ -80,11 +83,20 @@ onBeforeUnmount(() => {
 }
 
 .md :deep(p) {
-  margin: 0 0 8px 0;
+  margin: 0 0 9px 0;
 }
 
 .md :deep(p:last-child) {
   margin-bottom: 0;
+}
+
+.md :deep(h1),
+.md :deep(h2),
+.md :deep(h3),
+.md :deep(h4) {
+  color: var(--text);
+  line-height: 1.35;
+  margin: 18px 0 8px;
 }
 
 .md :deep(table) {
@@ -95,10 +107,23 @@ onBeforeUnmount(() => {
 }
 
 .md :deep(pre) {
-  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
 }
 
 .md :deep(code) {
-  font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+  font-family: var(--mono);
+  font-size: .92em;
+}
+
+.md :deep(a) {
+  color: var(--blue);
+}
+
+.md :deep(blockquote) {
+  border-left: 3px solid var(--border-strong);
+  color: var(--text-2);
+  padding-left: 12px;
+  margin-left: 0;
 }
 </style>

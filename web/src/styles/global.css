@@ -1,85 +1,130 @@
+/* Wisp 全局样式：浅色、黑/灰/蓝、无圆角、无阴影、无浮动特效。 */
+
 :root {
-  /* 统一粉色系调色板 */
-  --bg:            #ffffff;
-  --bg-soft:       #fdf6fa;
-  --text:          #2c2530;
-  --text-2:        #a394a3;
-  --text-3:        #b8abb7;
-  --accent:        #ec4899;
-  --accent-hover:  #db2777;
-  --accent-soft:   #fce8f2;
-  --accent-tint:   rgba(236, 72, 153, .07);
-  --accent-text:   #db2777;
-  --border:        #f6eaf1;
-  --border-strong: #efdcea;
-  --warn:          #f0a020;
-  --error:         #e0455a;
-  --dot:           #ec4899;
+  --bg: #ffffff;
+  --bg-soft: #f6f7f9;
+  --text: #15171a;
+  --text-2: #59616b;
+  --text-3: #8b939d;
+  --border: #e3e6ea;
+  --border-strong: #c9ced5;
+  --blue: #2563eb;
+  --blue-hover: #1d4ed8;
+  --blue-soft: #eef3ff;
+  --warn: #a16207;
+  --ok: #1f7a4d;
+  --error: #b42318;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
 }
 
-*, *::before, *::after {
+/* 风格约束：全局禁用圆角与阴影。 */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  border-radius: 0 !important;
   box-shadow: none !important;
 }
 
-html, body, #app {
+html {
+  color-scheme: light;
+}
+
+html,
+body,
+#app {
   width: 100%;
   height: 100%;
 }
 
 body {
   margin: 0;
-  padding: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* 不给长 Timeline 的每个节点挂全局 transition，只保留交互控件的轻量过渡。 */
-button, .n-button, a, [role="button"] {
-  transition: background-color .14s ease, color .14s ease, border-color .14s ease, opacity .14s ease;
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+  color: inherit;
 }
 
-/* 按钮样式 */
-button, .n-button {
-  transform: none !important;
+button {
+  background: none;
 }
 
-/* 滚动条细化 */
+button:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+  outline: 1px solid var(--blue);
+  outline-offset: 1px;
+}
+
+a {
+  color: var(--blue);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+::selection {
+  background: #dbe6ff;
+  color: var(--text);
+}
+
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-
-::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border-radius: 3px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: var(--accent-soft);
+  width: 8px;
+  height: 8px;
 }
 
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 
-/* Markdown 细节（配合 md-editor-v3 的 github 主题） */
+::-webkit-scrollbar-thumb {
+  background: #d3d8de;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #b9c0c8;
+}
+
+pre,
+code,
+kbd {
+  font-family: var(--mono);
+}
+
+/* Markdown 内部细节（md-editor-v3 github 主题之外的统一覆盖）。 */
 .md li::marker {
-  color: var(--accent);
-  font-weight: 600;
+  color: var(--text-3);
 }
 
 .md a {
-  color: var(--accent-text);
-  text-decoration: none;
-}
-
-.md a:hover {
-  text-decoration: underline;
+  color: var(--blue);
 }
 
 .md blockquote {
-  border-left: 3px solid var(--accent-soft);
+  border-left: 3px solid var(--border-strong);
   color: var(--text-2);
+}
+
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+.md img {
+  max-width: 100%;
 }

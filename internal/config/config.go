@@ -6,6 +6,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -113,14 +114,151 @@ func LoadFile(path string) (*Config, error) {
 			return nil, fmt.Errorf("config: 生成默认配置失败: %w", err)
 		}
 	}
-	var cfg Config
-	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: 读取配置失败: %w", err)
+	}
+	cfg, err := Parse(data)
+	if err != nil {
 		return nil, fmt.Errorf("config: 解析配置失败: %w", err)
 	}
+	return cfg, nil
+}
+
+// Error 是带源行号的配置错误；Line 从 1 开始，0 表示无法定位。
+type Error struct {
+	Line    int
+	Message string
+}
+
+// Error 实现 error 接口。
+func (e *Error) Error() string { return e.Message }
+
+// Parse 解析并校验一段配置文本，不写文件。
+// TOML 语法错误与 ProviderID 等校验错误会尽量带上源行号。
+func Parse(data []byte) (*Config, error) {
+	var cfg Config
+	if _, err := toml.Decode(string(data), &cfg); err != nil {
+		var parseErr toml.ParseError
+		if errors.As(err, &parseErr) {
+			message := strings.TrimSpace(parseErr.Message)
+			if message == "" {
+				message = parseErr.Error()
+			}
+			return nil, &Error{Line: parseErr.Position.Line, Message: message}
+		}
+		return nil, &Error{Message: err.Error()}
+	}
 	if err := cfg.Validate(); err != nil {
-		return nil, err
+		line := 0
+		var fieldErr *fieldError
+		if errors.As(err, &fieldErr) {
+			line = locateLine(string(data), fieldErr)
+		}
+		return nil, &Error{Line: line, Message: err.Error()}
 	}
 	return &cfg, nil
+}
+
+// fieldError 是 Validate 返回的字段级错误，供 Parse 定位源行号。
+type fieldError struct {
+	message string
+	table   string
+	index   int
+	field   string
+	value   string
+}
+
+// Error 实现 error 接口。
+func (e *fieldError) Error() string { return e.message }
+
+// locateLine 在配置文本中定位字段错误所在行；找不到时返回 0。
+func locateLine(text string, fe *fieldError) int {
+	lines := strings.Split(text, "\n")
+	switch fe.table {
+	case "Providers":
+		index := -1
+		inside := false
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "[[Providers]]") {
+				index++
+				inside = index == fe.index
+				continue
+			}
+			if !inside {
+				continue
+			}
+			// [Providers.Discovery] 属于当前块，其他表头结束当前块。
+			if strings.HasPrefix(trimmed, "[") && !strings.HasPrefix(trimmed, "[Providers") {
+				inside = false
+				continue
+			}
+			if keyLine(line, fe.field) {
+				return i + 1
+			}
+		}
+	case "ModelAliases":
+		index := -1
+		inside := false
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "[[ModelAliases]]") {
+				index++
+				inside = index == fe.index
+				continue
+			}
+			if !inside {
+				continue
+			}
+			if strings.HasPrefix(trimmed, "[") {
+				inside = false
+				continue
+			}
+			if keyLine(line, fe.field) {
+				return i + 1
+			}
+		}
+	case "server":
+		inside := false
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "[server]" {
+				inside = true
+				continue
+			}
+			if inside && strings.HasPrefix(trimmed, "[") {
+				inside = false
+				continue
+			}
+			if inside && keyLine(line, fe.field) {
+				return i + 1
+			}
+		}
+	}
+	// 兜底：按错误中出现的取值找第一条匹配行。
+	if fe.value != "" {
+		needle := `"` + fe.value + `"`
+		for i, line := range lines {
+			if strings.Contains(line, needle) {
+				return i + 1
+			}
+		}
+	}
+	return 0
+}
+
+// keyLine 判断某行是否是 field = ... 形式的键值行。
+func keyLine(line, field string) bool {
+	if field == "" {
+		return false
+	}
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") || !strings.HasPrefix(trimmed, field) {
+		return false
+	}
+	rest := strings.TrimSpace(trimmed[len(field):])
+	return strings.HasPrefix(rest, "=")
 }
 
 var providerIDPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
@@ -131,16 +269,33 @@ func (c *Config) Validate() error {
 		c.Server.Port = 8787
 	}
 	if c.Server.Port < 1 || c.Server.Port > 65535 {
-		return fmt.Errorf("config: server.Port 超出范围: %d", c.Server.Port)
+		return &fieldError{
+			message: fmt.Sprintf("config: server.Port 超出范围: %d", c.Server.Port),
+			table:   "server",
+			field:   "Port",
+			value:   fmt.Sprintf("%d", c.Server.Port),
+		}
 	}
 	seenProvider := make(map[string]bool, len(c.Providers))
 	for i := range c.Providers {
 		p := &c.Providers[i]
 		if !providerIDPattern.MatchString(p.ProviderID) {
-			return fmt.Errorf("config: Providers[%d].ProviderID 只允许小写字母数字连字符: %q", i, p.ProviderID)
+			return &fieldError{
+				message: fmt.Sprintf("config: Providers[%d].ProviderID 只允许小写字母数字连字符: %q", i, p.ProviderID),
+				table:   "Providers",
+				index:   i,
+				field:   "ProviderID",
+				value:   p.ProviderID,
+			}
 		}
 		if seenProvider[p.ProviderID] {
-			return fmt.Errorf("config: ProviderID 重复: %q", p.ProviderID)
+			return &fieldError{
+				message: fmt.Sprintf("config: ProviderID 重复: %q", p.ProviderID),
+				table:   "Providers",
+				index:   i,
+				field:   "ProviderID",
+				value:   p.ProviderID,
+			}
 		}
 		seenProvider[p.ProviderID] = true
 		// 模型去重（保留首个），并校验 id 不含 "/"
@@ -148,7 +303,13 @@ func (c *Config) Validate() error {
 		deduped := p.Models[:0]
 		for _, m := range p.Models {
 			if strings.Contains(m.ModelID, "/") {
-				return fmt.Errorf("config: 模型 id 不应包含 '/': %q", m.ModelID)
+				return &fieldError{
+					message: fmt.Sprintf("config: 模型 id 不应包含 '/': %q", m.ModelID),
+					table:   "Providers",
+					index:   i,
+					field:   "Models",
+					value:   m.ModelID,
+				}
 			}
 			if seenModel[m.ModelID] {
 				continue
@@ -160,7 +321,17 @@ func (c *Config) Validate() error {
 	}
 	for i, a := range c.ModelAliases {
 		if strings.Contains(a.ModelID, "/") || strings.Contains(a.ProviderID, "/") {
-			return fmt.Errorf("config: ModelAliases[%d] 的 id 不应包含 '/': %q/%q", i, a.ProviderID, a.ModelID)
+			field, value := "ProviderID", a.ProviderID
+			if strings.Contains(a.ModelID, "/") {
+				field, value = "ModelID", a.ModelID
+			}
+			return &fieldError{
+				message: fmt.Sprintf("config: ModelAliases[%d] 的 id 不应包含 '/': %q/%q", i, a.ProviderID, a.ModelID),
+				table:   "ModelAliases",
+				index:   i,
+				field:   field,
+				value:   value,
+			}
 		}
 	}
 	return nil

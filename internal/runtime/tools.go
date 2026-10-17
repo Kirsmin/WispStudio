@@ -211,6 +211,24 @@ func decodeArgs(raw json.RawMessage, target any) error {
 
 func failure(err error) ToolResult { return ToolResult{Status: "failure", Error: err.Error()} }
 
+// validTextPrefix 判断文件前缀是否为文本。
+// 读取上限可能正好切断一个多字节 UTF-8 字符，因此允许末尾缺 1-3 字节；
+// NUL 字节与真正非法的 UTF-8 仍然拒绝。
+func validTextPrefix(data []byte) bool {
+	if bytes.IndexByte(data, 0) >= 0 {
+		return false
+	}
+	if utf8.Valid(data) {
+		return true
+	}
+	for trim := 1; trim <= 3 && trim < len(data); trim++ {
+		if utf8.Valid(data[:len(data)-trim]) {
+			return true
+		}
+	}
+	return false
+}
+
 // skipWorkspaceNoiseDir 跳过无意义的目录。
 func skipWorkspaceNoiseDir(name string) bool {
 	switch name {
@@ -242,7 +260,7 @@ func (r *Registry) readFile(_ context.Context, raw json.RawMessage) ToolResult {
 	defer file.Close()
 	prefix := make([]byte, 4096)
 	n, _ := file.Read(prefix)
-	if !utf8.Valid(prefix[:n]) || strings.ContainsRune(string(prefix[:n]), '\x00') {
+	if !validTextPrefix(prefix[:n]) {
 		return failure(fmt.Errorf("文件不是 UTF-8 文本；拒绝作为文本读取"))
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
@@ -393,7 +411,7 @@ func (r *Registry) searchText(_ context.Context, raw json.RawMessage) ToolResult
 		}
 		probe := make([]byte, 4096)
 		n, _ := file.Read(probe)
-		if !utf8.Valid(probe[:n]) || strings.ContainsRune(string(probe[:n]), '\x00') {
+		if !validTextPrefix(probe[:n]) {
 			_ = file.Close()
 			return nil
 		}
