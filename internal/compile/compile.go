@@ -124,7 +124,7 @@ func Compile(ctx context.Context, store *eventlog.Store, ctxID ids.ContextID) (*
 	}
 
 	// 5. validate：不变量校验，失败即返回 error。
-	if err := validate(res.Messages); err != nil {
+	if err := validate(res.Messages, res.ProviderMap); err != nil {
 		return nil, err
 	}
 
@@ -658,8 +658,9 @@ func sameRoleAdjacent(prev, cur Message) bool {
 
 // validate 校验编译不变量：非空、首条非 assistant、assistant 正文消息可
 // 紧跟工具调用消息（同一逻辑 assistant 消息）、user 工具结果可相邻、
-// 工具调用与结果一一配对。任何一条不满足都返回 error。
-func validate(msgs []Message) error {
+// 工具调用与结果一一配对、每个工具调用都有非空 provider_id 映射。
+// 任何一条不满足都返回 error。
+func validate(msgs []Message, providerMap map[ids.ToolCallID]string) error {
 	if len(msgs) == 0 {
 		return fmt.Errorf("compile: 编译结果为空")
 	}
@@ -676,6 +677,9 @@ func validate(msgs []Message) error {
 		if m.ToolCall != nil {
 			if _, dup := calls[m.ToolCall.ID]; dup {
 				return fmt.Errorf("compile: 工具调用 ID %s 重复", m.ToolCall.ID)
+			}
+			if providerMap[m.ToolCall.ID] == "" {
+				return fmt.Errorf("compile: 工具调用 %s 缺少 provider_id 映射", m.ToolCall.ID)
 			}
 			calls[m.ToolCall.ID] = i
 		}

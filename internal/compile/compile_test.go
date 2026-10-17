@@ -323,9 +323,9 @@ func TestCompileInsertOkey(t *testing.T) {
 	}
 
 	// 先提交 okey="b" 的调用，再提交 okey="a" 的调用：最终 a 应在 b 前
-	callB, tcB := c.call(t, s, "tool_b", `{}`, "")
+	callB, tcB := c.call(t, s, "tool_b", `{}`, "toolu_b")
 	add(eventlog.CtxOpInput{Ctx: ctx.ID, Op: eventlog.CtxOpInsert, Anchor: m1, OKey: "b", NewID: callB.ID})
-	callA, tcA := c.call(t, s, "tool_a", `{}`, "")
+	callA, tcA := c.call(t, s, "tool_a", `{}`, "toolu_a")
 	add(eventlog.CtxOpInput{Ctx: ctx.ID, Op: eventlog.CtxOpInsert, Anchor: m1, OKey: "a", NewID: callA.ID})
 	// 结果条目锚定各自的调用条目
 	resB, _ := c.result(t, s, callB, tcB, "结果b")
@@ -344,7 +344,7 @@ func TestCompileInsertOkey(t *testing.T) {
 	}
 
 	// 空 okey 排最后
-	callC, tcC := c.call(t, s, "tool_c", `{}`, "")
+	callC, tcC := c.call(t, s, "tool_c", `{}`, "toolu_c")
 	add(eventlog.CtxOpInput{Ctx: ctx.ID, Op: eventlog.CtxOpInsert, Anchor: m1, NewID: callC.ID})
 	resC, _ := c.result(t, s, callC, tcC, "结果c")
 	add(eventlog.CtxOpInput{Ctx: ctx.ID, Op: eventlog.CtxOpInsert, Anchor: tcC, NewID: resC.ID})
@@ -475,7 +475,7 @@ func TestCompileBundleGroupHide(t *testing.T) {
 	s := openStore(t)
 	var c chain
 	c.msg(t, s, "user", "前")
-	callEv, tc := c.call(t, s, "read_file", `{"path":"a"}`, "")
+	callEv, tc := c.call(t, s, "read_file", `{"path":"a"}`, "toolu_read")
 	_, _ = c.result(t, s, callEv, tc, "文件内容")
 	e4, _ := c.msg(t, s, "assistant", "后")
 
@@ -513,7 +513,7 @@ func TestCompileOrphanCalled(t *testing.T) {
 	s := openStore(t)
 	var c chain
 	c.msg(t, s, "user", "前")
-	_, tc := c.call(t, s, "read_file", `{"path":"a"}`, "")
+	_, tc := c.call(t, s, "read_file", `{"path":"a"}`, "toolu_orphan")
 
 	ctx, err := s.CreateContext(context.Background(), eventlog.ContextInput{ForkAt: c.last})
 	if err != nil {
@@ -529,6 +529,28 @@ func TestCompileOrphanCalled(t *testing.T) {
 	}
 	if got, want := join(summarize(res.Messages)), "user:前 | assistant:read_file | user:result("+tc+")=omitted"; got != want {
 		t.Fatalf("消息列表 = %q, 期望 %q", got, want)
+	}
+}
+
+// TestCompileRejectsMissingProviderID 验收 F6：tool.called 缺少 provider_id
+// 映射时编译直接失败，不允许把空 id 发给服务商。
+func TestCompileRejectsMissingProviderID(t *testing.T) {
+	s := openStore(t)
+	var c chain
+	c.msg(t, s, "user", "前")
+	callEv, tc := c.call(t, s, "read_file", `{"path":"a"}`, "")
+	c.result(t, s, callEv, tc, "文件内容")
+
+	ctx, err := s.CreateContext(context.Background(), eventlog.ContextInput{ForkAt: c.last})
+	if err != nil {
+		t.Fatalf("创建上下文失败: %v", err)
+	}
+	_, err = Compile(context.Background(), s, ctx.ID)
+	if err == nil {
+		t.Fatal("缺少 provider_id 映射应编译失败")
+	}
+	if want := "工具调用 " + tc + " 缺少 provider_id 映射"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("错误信息 = %q, 应包含 %q", err, want)
 	}
 }
 
@@ -787,7 +809,7 @@ func FuzzCompile(f *testing.F) {
 		}
 		// 链尾为 user 时可选追加一对工具调用+结果（保持角色交替）
 		if n%2 == 1 && st.pick(2) == 0 {
-			callEv, tc := c.call(t, s, "fuzz_tool", `{}`, "")
+			callEv, tc := c.call(t, s, "fuzz_tool", `{}`, "toolu_fuzz")
 			c.result(t, s, callEv, tc, "fuzz结果")
 		}
 		forkAt := c.last
