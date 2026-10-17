@@ -755,6 +755,88 @@ func TestCompileValidateErrors(t *testing.T) {
 	})
 }
 
+// TestCompileManifestMatchesMessages 验收 F7：RequestManifest 与渲染消息严格
+// 一一对应；占位消息标记 placeholder 且不含 blob 哈希，其余条目按 BlobHash
+// 可还原出消息正文。
+func TestCompileManifestMatchesMessages(t *testing.T) {
+	corpora := [][]byte{
+		{1, 2, 3, 4},
+		{0, 0, 5, 7, 2, 1},
+		{9, 13, 6, 6, 0, 3, 5, 8},
+		{255, 254, 7, 1},
+	}
+	for ci, data := range corpora {
+		st := &byteStream{b: data}
+		s := openStore(t)
+		var c chain
+		n := 4 + st.pick(3)
+		subjects := make([]string, 0, n)
+		roles := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			role := "user"
+			if i%2 == 1 {
+				role = "assistant"
+			}
+			_, sub := c.msg(t, s, role, fmt.Sprintf("m%d", i))
+			subjects = append(subjects, sub)
+			roles = append(roles, role)
+		}
+		ctx, err := s.CreateContext(context.Background(), eventlog.ContextInput{ForkAt: c.last})
+		if err != nil {
+			t.Fatalf("case %d: 创建上下文失败: %v", ci, err)
+		}
+		// 随机 hide / replace 序列：hide 产生占位消息，replace 换新版本
+		k := 1 + st.pick(4)
+		for i := 0; i < k; i++ {
+			idx := st.pick(n)
+			if st.pick(2) == 0 {
+				if _, err := s.AppendCtxOp(context.Background(), eventlog.CtxOpInput{
+					Ctx: ctx.ID, Op: eventlog.CtxOpHide, Target: subjects[idx],
+				}); err != nil {
+					t.Fatalf("case %d: 追加 hide 失败: %v", ci, err)
+				}
+				continue
+			}
+			ev := c.msgAs(t, s, subjects[idx], roles[idx], fmt.Sprintf("v%d", i))
+			if _, err := s.AppendCtxOp(context.Background(), eventlog.CtxOpInput{
+				Ctx: ctx.ID, Op: eventlog.CtxOpReplace, Target: subjects[idx], NewID: ev.ID,
+			}); err != nil {
+				t.Fatalf("case %d: 追加 replace 失败: %v", ci, err)
+			}
+		}
+
+		res, err := Compile(context.Background(), s, ctx.ID)
+		if err != nil {
+			t.Fatalf("case %d: 编译失败: %v", ci, err)
+		}
+		assertInvariants(t, res.Messages)
+		items := readManifest(t, s, res.ManifestHash)
+		if len(items) != len(res.Messages) {
+			t.Fatalf("case %d: 清单 %d 条与消息 %d 条不一致: %v",
+				ci, len(items), len(res.Messages), join(summarize(res.Messages)))
+		}
+		for i, m := range res.Messages {
+			item := items[i]
+			if item.Placeholder {
+				if m.Content != hiddenPlaceholder {
+					t.Fatalf("case %d: 第 %d 条占位消息正文 = %q, 期望 %q", ci, i, m.Content, hiddenPlaceholder)
+				}
+				if item.BlobHash != "" {
+					t.Fatalf("case %d: 第 %d 条占位清单不该带 blob 哈希: %+v", ci, i, item)
+				}
+				continue
+			}
+			text, err := s.GetBlob(context.Background(), item.BlobHash)
+			if err != nil {
+				t.Fatalf("case %d: 第 %d 条读取 blob %s 失败: %v", ci, i, item.BlobHash, err)
+			}
+			if string(text) != m.Content {
+				t.Fatalf("case %d: 第 %d 条正文 = %q, 清单还原 = %q", ci, i, m.Content, text)
+			}
+		}
+	}
+}
+
 // byteStream 把 fuzz 输入当作字节流，耗尽后返回 0，保证生成过程不 panic。
 type byteStream struct {
 	b []byte

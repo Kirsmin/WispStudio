@@ -46,10 +46,12 @@ type Message struct {
 }
 
 // ManifestItem 是 RequestManifest 的一个条目：回放用的内容定位信息。
+// 与 Messages 严格一一对应；占位消息 Placeholder 为 true 且 BlobHash 为空。
 type ManifestItem struct {
-	ID       string `json:"id"`        // 内容条目 ID（事件的 subject_id）
-	BlobHash string `json:"blob_hash"` // 正文在 blobs 表的哈希引用
-	Revision int64  `json:"revision"`  // 采用的事件版本 seq
+	ID          string `json:"id"`                    // 内容条目 ID（事件的 subject_id）
+	BlobHash    string `json:"blob_hash"`             // 正文在 blobs 表的哈希引用
+	Revision    int64  `json:"revision"`              // 采用的事件版本 seq
+	Placeholder bool   `json:"placeholder,omitempty"` // 占位消息（无 blob 正文）
 }
 
 // Result 是编译结果。
@@ -555,8 +557,9 @@ func blobText(ev eventlog.Event, blobs map[string][]byte) (string, error) {
 	return string(data), nil
 }
 
-// render 把条目列表渲染为消息列表，并生成 RequestManifest 与 provider 映射。
-// 隐藏的非工具条目渲染为同角色占位消息；隐藏的工具组整组丢弃。
+// render 把条目列表渲染为消息列表，并生成与消息严格一一对应的
+// RequestManifest 与 provider 映射。隐藏的非工具条目渲染为同角色占位消息，
+// 隐藏的工具组整组丢弃；占位消息的清单条目标记 Placeholder 且 BlobHash 为空。
 func render(list *entryList, b *bundles, blobs map[string][]byte, res *Result) error {
 	msgs := make([]Message, 0, len(list.items))
 	var manifest []ManifestItem
@@ -582,6 +585,7 @@ func render(list *entryList, b *bundles, blobs map[string][]byte, res *Result) e
 			}
 			rendered[e] = true
 			msgs = append(msgs, Message{Role: role, Content: hiddenPlaceholder})
+			manifest = append(manifest, ManifestItem{ID: e.subject, Revision: e.ev.Seq, Placeholder: true})
 			continue
 		}
 
@@ -628,6 +632,7 @@ func render(list *entryList, b *bundles, blobs map[string][]byte, res *Result) e
 			} else {
 				rendered[e] = true
 				msgs = append(msgs, Message{Role: RoleUser, Content: omittedResult, ToolResultFor: tcID})
+				manifest = append(manifest, ManifestItem{ID: e.subject, Revision: e.ev.Seq, Placeholder: true})
 			}
 
 		case eventlog.TypeToolReturned:
