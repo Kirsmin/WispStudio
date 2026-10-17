@@ -19,7 +19,7 @@ import (
 // tail 是当前内容链尾事件 ID，新内容事件以它为 parent_id。
 // 返回 done=true 表示响应无工具调用，回合已完成（turn.completed 已写）。
 func (r *Runtime) stepLLM(ctx context.Context, p TurnParams, tail ids.EventID) (bool, error) {
-	res, err := compile.Compile(ctx, r.store, p.ContextID)
+	res, err := compile.CompileWithWriter(ctx, r.store, r.writer, p.ContextID)
 	if err != nil {
 		return false, fmt.Errorf("compile 失败: %w", err)
 	}
@@ -32,7 +32,7 @@ func (r *Runtime) stepLLM(ctx context.Context, p TurnParams, tail ids.EventID) (
 		return false, fmt.Errorf("runtime: 读取 RequestManifest 失败: %w", err)
 	}
 	reqID := ids.NewRequestID()
-	reqEv, err := r.store.AppendEvent(ctx, eventlog.EventInput{
+	reqEv, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
 		Type:      eventlog.TypeLLMRequested,
 		SessionID: p.SessionID,
 		TurnID:    p.TurnID,
@@ -56,7 +56,7 @@ func (r *Runtime) stepLLM(ctx context.Context, p TurnParams, tail ids.EventID) (
 	}
 
 	// message.created：本轮 assistant 消息（正文存 blobs），并追加到上下文
-	msgEv, err := r.store.AppendEvent(ctx, eventlog.EventInput{
+	msgEv, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
 		Type:      eventlog.TypeMessageCreated,
 		SessionID: p.SessionID,
 		TurnID:    p.TurnID,
@@ -76,7 +76,7 @@ func (r *Runtime) stepLLM(ctx context.Context, p TurnParams, tail ids.EventID) (
 	tail = msgEv.ID
 
 	// llm.responded：响应完成（usage / finish_reason / 耗时）
-	if _, err := r.store.AppendEvent(ctx, eventlog.EventInput{
+	if _, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
 		Type:      eventlog.TypeLLMResponded,
 		SessionID: p.SessionID,
 		TurnID:    p.TurnID,
@@ -101,7 +101,7 @@ func (r *Runtime) stepLLM(ctx context.Context, p TurnParams, tail ids.EventID) (
 		return false, nil
 	}
 
-	if _, err := r.store.AppendEvent(ctx, eventlog.EventInput{
+	if _, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
 		Type:      eventlog.TypeTurnCompleted,
 		SessionID: p.SessionID,
 		TurnID:    p.TurnID,
@@ -112,7 +112,7 @@ func (r *Runtime) stepLLM(ctx context.Context, p TurnParams, tail ids.EventID) (
 	}); err != nil {
 		return false, fmt.Errorf("runtime: 写 turn.completed 失败: %w", err)
 	}
-	if _, err := r.store.MoveRef(ctx, TurnRefName(p.TurnID), RefCompleted); err != nil {
+	if _, err := r.writer.MoveRef(ctx, TurnRefName(p.TurnID), RefCompleted); err != nil {
 		return false, fmt.Errorf("runtime: 移动指针到 completed 失败: %w", err)
 	}
 	return true, nil
@@ -123,7 +123,7 @@ func (r *Runtime) stepLLM(ctx context.Context, p TurnParams, tail ids.EventID) (
 func (r *Runtime) appendDelta(ctx context.Context, p TurnParams, msgID ids.MessageID, content, reasoning *strings.Builder, d provider.StreamDelta) error {
 	if d.Content != "" {
 		content.WriteString(d.Content)
-		if _, err := r.store.AppendEvent(ctx, eventlog.EventInput{
+		if _, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
 			Type:      eventlog.TypeMessageDelta,
 			SessionID: p.SessionID,
 			TurnID:    p.TurnID,
@@ -137,7 +137,7 @@ func (r *Runtime) appendDelta(ctx context.Context, p TurnParams, msgID ids.Messa
 	}
 	if d.Reasoning != "" {
 		reasoning.WriteString(d.Reasoning)
-		if _, err := r.store.AppendEvent(ctx, eventlog.EventInput{
+		if _, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
 			Type:      eventlog.TypeMessageDelta,
 			SessionID: p.SessionID,
 			TurnID:    p.TurnID,
@@ -175,7 +175,7 @@ func (r *Runtime) recordToolCalls(ctx context.Context, p TurnParams, causeID ids
 			},
 		})
 	}
-	evs, err := r.store.AppendEvents(ctx, ins)
+	evs, err := r.writer.AppendEvents(ctx, ins)
 	if err != nil {
 		return fmt.Errorf("runtime: 写 tool.called 失败: %w", err)
 	}

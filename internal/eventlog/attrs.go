@@ -10,6 +10,10 @@ package eventlog
 
 // 事件类型常量：写入事件时 Type 字段的唯一合法取值集合。
 const (
+	// TypeSessionCreated 创建一个会话，SubjectID = 会话 ID。
+	// session_id 列同时写会话 ID，便于事件流按会话订阅。
+	TypeSessionCreated = "session.created"
+
 	// TypeMessageCreated 创建/更新一条消息，SubjectID = 消息 ID。
 	// 同一 SubjectID 多次出现表示多版本，seq 最大者为最新版本。
 	// role 属于读取时才解析的附加数据，故放 attrs。
@@ -72,6 +76,13 @@ const (
 	// 本阶段只定 attrs 结构，不产生实际派生行为。
 	TypeAgentSpawned = "agent.spawned"
 )
+
+// SessionCreatedAttrs 是 session.created 事件的附加属性。
+// 标题与默认模型只作展示/恢复提示，会话的其他状态仍由事件折叠得出。
+type SessionCreatedAttrs struct {
+	Title string `json:"title,omitempty"`
+	Model string `json:"model,omitempty"`
+}
 
 // MessageCreatedAttrs 是 message.created 事件的附加属性。
 // 消息正文存 blobs，此处只放元数据。

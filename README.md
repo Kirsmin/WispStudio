@@ -15,24 +15,33 @@ cd .. && go build -o server ./cmd/server && ./server
 
 ## HTTP API
 
-最小 JSON 接口（仅本机监听）：
+所有写操作经 `eventlog.Writer`，API 层不直接执行 SQL；事实全部来自事件日志。
+协议消息是事件投影，JSON tag 使用 PascalCase（如 `ID`/`Seq`/`Type`/`SessionID`/`TurnID`/`Attrs`），
+大块正文经 `BlobText` 返回。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/health` | 存活检查 |
-| GET | `/api/catalog` | 已配置 provider 与模型（含自动发现结果） |
-| POST | `/api/turns` | 启动回合，body `{"text","session_id?","model?"}`，返回 `session_id`/`context_id`/`turn_id`/`model` |
-| GET | `/api/sessions/{session_id}/events?after_seq=N&limit=M` | 增量读取事件流，返回 `events` 与 `next_seq` |
-| GET | `/api/turns/{turn_id}` | 回合状态（refs 指针 + 事件折叠），含 `pending_approvals` |
-| POST | `/api/turns/{turn_id}/approvals/{tool_call_id}` | 提交审批，body `{"decision":"approved"\|"rejected","reason?"}` |
+| GET | `/api/sessions` | 会话列表（由 `session.created` 与内容事件折叠） |
+| POST | `/api/sessions` | 新建会话并写 `session.created`，body `{"Title","Model?"}` |
+| GET | `/api/sessions/{id}/events?after_seq=N` | SSE：先回放日志中 `seq>N` 的事件，再推送实时事件；断线带 `after_seq` 重连即可补发 |
+| POST | `/api/sessions/{id}/messages` | body `{"Text","Model?"}`，写 `message.created` + `turn.started` 并异步执行回合 |
+| POST | `/api/sessions/{id}/stop` | 停止当前回合，写 `turn.completed` 终态 |
+| GET | `/api/models` | catalog 全量：手动模型、自动发现结果、别名与 `ProviderName` |
+| POST | `/api/models` | body `{"ProviderID","ModelID","Alias?"}`，写回 `Config.local.toml` |
+| GET | `/api/events/{id}/trace` | 沿 `cause_id` 回溯因果链，调试用 |
 
-回合异步执行：启动后用返回的 `next_seq` 轮询事件流；`GET /api/turns/{turn_id}` 的 `ref` 取值 `running` / `waiting_approval:<审批ID>` / `completed` / `failed:<原因>`。需要审批的工具会先挂起，提交决定后自动继续。
+SSE 每个事件带 `id: <seq>`、`event: <type>` 与 `data: <事件投影 JSON>`；客户端也应处理
+`Last-Event-ID`（服务端同样支持）。事件写入后只在 `eventlog.Hub` 发“有新事件”提示，
+SSE 收到提示后回读日志，因此通知可合并、数据不会丢。
+
+兼容接口仍保留：`GET /api/catalog`、`POST /api/turns`、`GET /api/turns/{id}`、
+`POST /api/turns/{id}/approvals/{tool_call_id}`。
 
 真实端点冒烟测试（默认跳过，设置密钥才执行）：
 
 ```bash
 WISP_LIVE_API_KEY=sk-xxx go test ./internal/provider/ -run TestLiveToolCallWireFormat -v
-WISP_LIVE_API_KEY=sk-xxx go test ./internal/api/ -run TestLiveAPITurnWithRealModel -v
 ```
 
 

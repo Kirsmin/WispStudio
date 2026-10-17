@@ -1,6 +1,8 @@
 // Wisp 后端入口：加载配置、打开事件日志、构建模型目录、触发自动发现，
-// 并在 127.0.0.1 上启动最小 HTTP API
-// （启动回合 / 读取事件流与回合状态 / 提交审批决定）。
+// 并在 127.0.0.1 上启动 HTTP/SSE API。
+//
+// 退出顺序：先停 API（唤醒 SSE、停止在途回合），再停 HTTP 服务，
+// 最后关闭 Store（排空 writer 队列并关库）。
 package main
 
 import (
@@ -47,7 +49,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("打开事件日志失败: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		// 兜底关闭；正常路径在 ListenAndServe 返回后显式关闭。
+		_ = store.Close()
+	}()
 	log.Println("事件日志已就绪")
 
 	// 构建模型目录并触发自动发现；单个 provider 发现失败只记日志，不阻塞启动
@@ -74,13 +79,17 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	// 收到 Ctrl-C / SIGTERM 后优雅关闭
+	// 收到 Ctrl-C / SIGTERM 后优雅关闭：先停 API（关通知中心、停回合），
+	// 再停 HTTP，最后排空 writer 并关库。
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
 		<-sigCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
+		if err := apiSrv.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("API 关闭超时", "err", err)
+		}
 		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 			slog.Warn("HTTP 服务关闭超时", "err", err)
 		}
@@ -89,6 +98,10 @@ func main() {
 	log.Printf("HTTP API 已就绪: http://%s", addr)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("HTTP 服务退出: %v", err)
+	}
+	// 先排空 writer 队列，再关闭数据库与通知中心。
+	if err := store.Close(); err != nil {
+		slog.Warn("关闭事件日志失败", "err", err)
 	}
 	log.Println("已退出")
 }

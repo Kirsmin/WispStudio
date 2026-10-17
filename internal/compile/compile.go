@@ -82,6 +82,12 @@ func (e *entry) key() string { return e.ev.Type + "|" + e.subject }
 // Compile 把指定上下文编译为发给 LLM 的消息列表，算法步骤见包注释。
 // 编译成功后会把 RequestManifest 序列化存入 blobs 表并返回其哈希。
 func Compile(ctx context.Context, store *eventlog.Store, ctxID ids.ContextID) (*Result, error) {
+	return CompileWithWriter(ctx, store, store, ctxID)
+}
+
+// CompileWithWriter 与 Compile 相同，但 RequestManifest 的 blob 写入经指定 Writer，
+// 供 runtime/API 确保所有写入都走 eventlog.Writer。
+func CompileWithWriter(ctx context.Context, store *eventlog.Store, writer eventlog.Writer, ctxID ids.ContextID) (*Result, error) {
 	// 1. ancestry：沿 base_ctx 链取 root→leaf 的上下文。
 	lineage, err := ancestry(ctx, store, ctxID)
 	if err != nil {
@@ -132,7 +138,10 @@ func Compile(ctx context.Context, store *eventlog.Store, ctxID ids.ContextID) (*
 	if err != nil {
 		return nil, fmt.Errorf("compile: 序列化 RequestManifest 失败: %w", err)
 	}
-	hash, err := store.PutBlob(ctx, raw)
+	if writer == nil {
+		writer = store
+	}
+	hash, err := writer.PutBlob(ctx, raw)
 	if err != nil {
 		return nil, fmt.Errorf("compile: 写入 RequestManifest blob 失败: %w", err)
 	}

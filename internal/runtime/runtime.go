@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"wisp/internal/compile"
 	"wisp/internal/eventlog"
@@ -45,11 +46,13 @@ type Options struct {
 	ProviderModel string           // 发给服务商的裸模型 id；空则从 Model 去掉 provider 前缀
 	Client        *provider.Client // OpenAI 兼容客户端；nil 时用默认客户端
 	MaxIterations int              // 回合最大迭代次数，防死循环；<= 0 用默认 64
+	Writer        eventlog.Writer  // 写入入口；nil = 使用 store
 }
 
 // Runtime 是事件驱动运行时：无自有可变状态，一切状态由事件日志折叠得出。
 type Runtime struct {
 	store         *eventlog.Store
+	writer        eventlog.Writer
 	workspaceRoot string
 	providerID    string
 	model         string // 全称 id（事件用）
@@ -57,6 +60,11 @@ type Runtime struct {
 	client        *provider.Client
 	tools         *Registry
 	maxIterations int
+
+	// interrupted 标记本回合被上层要求停止；failTurn 据此写“停止”终态，
+	// 而不是普通失败，且用不受取消影响的 context 完成最后一次写入。
+	interrupted     atomic.Bool
+	interruptReason atomic.Value // string
 }
 
 // New 构造运行时。
@@ -76,8 +84,13 @@ func New(store *eventlog.Store, opts Options) (*Runtime, error) {
 	if maxIter <= 0 {
 		maxIter = 64
 	}
+	writer := opts.Writer
+	if writer == nil {
+		writer = store
+	}
 	return &Runtime{
 		store:         store,
+		writer:        writer,
 		workspaceRoot: reg.workspaceRoot,
 		providerID:    opts.ProviderID,
 		model:         opts.Model,
@@ -120,14 +133,15 @@ func (r *Runtime) RunTurn(ctx context.Context, p TurnParams) error {
 	if p.TurnID == "" {
 		p.TurnID = ids.NewTurnID().String()
 	}
-	if err := r.ensureStarted(ctx, p); err != nil {
+	if err := r.EnsureStarted(ctx, p); err != nil {
 		return err
 	}
 	return r.loop(ctx, p)
 }
 
-// ensureStarted 幂等入口：指针不存在时写 turn.started 并把指针移到 running。
-func (r *Runtime) ensureStarted(ctx context.Context, p TurnParams) error {
+// EnsureStarted 幂等入口：指针不存在时写 turn.started 并把指针移到 running。
+// API 层在返回“消息已接收”前调用它，保证 turn.started 先于 SSE 实时阶段落盘。
+func (r *Runtime) EnsureStarted(ctx context.Context, p TurnParams) error {
 	refName := TurnRefName(p.TurnID)
 	target, err := r.store.GetRef(ctx, refName)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -136,7 +150,7 @@ func (r *Runtime) ensureStarted(ctx context.Context, p TurnParams) error {
 	if target != "" {
 		return nil
 	}
-	if _, err := r.store.AppendEvent(ctx, eventlog.EventInput{
+	if _, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
 		Type:      eventlog.TypeTurnStarted,
 		SessionID: p.SessionID,
 		TurnID:    p.TurnID,
@@ -146,7 +160,7 @@ func (r *Runtime) ensureStarted(ctx context.Context, p TurnParams) error {
 	}); err != nil {
 		return fmt.Errorf("runtime: 写 turn.started 失败: %w", err)
 	}
-	if _, err := r.store.MoveRef(ctx, refName, RefRunning); err != nil {
+	if _, err := r.writer.MoveRef(ctx, refName, RefRunning); err != nil {
 		return fmt.Errorf("runtime: 移动指针 %s 失败: %w", refName, err)
 	}
 	return nil
@@ -255,7 +269,7 @@ func isContentEvent(typ string) bool {
 
 // publishToCtx 把内容事件追加到上下文，使其在后续 compile 中可见；
 // 该事件已追加过（崩溃恢复后重放）则跳过，保证幂等。
-func publishToCtx(ctx context.Context, store *eventlog.Store, ctxID ids.ContextID, evID ids.EventID) error {
+func publishToCtx(ctx context.Context, store *eventlog.Store, writer eventlog.Writer, ctxID ids.ContextID, evID ids.EventID) error {
 	if evID == "" {
 		return nil
 	}
@@ -271,7 +285,7 @@ func publishToCtx(ctx context.Context, store *eventlog.Store, ctxID ids.ContextI
 			return nil
 		}
 	}
-	if _, err := store.AppendCtxOp(ctx, eventlog.CtxOpInput{
+	if _, err := writer.AppendCtxOp(ctx, eventlog.CtxOpInput{
 		Ctx: ctxID, Op: eventlog.CtxOpAppend, NewID: evID,
 	}); err != nil {
 		return fmt.Errorf("runtime: 把内容事件追加到上下文失败: %w", err)
@@ -281,7 +295,7 @@ func publishToCtx(ctx context.Context, store *eventlog.Store, ctxID ids.ContextI
 
 // appendContentToCtx 是 publishToCtx 的运行时方法形式。
 func (r *Runtime) appendContentToCtx(ctx context.Context, p TurnParams, evID ids.EventID) error {
-	return publishToCtx(ctx, r.store, p.ContextID, evID)
+	return publishToCtx(ctx, r.store, r.writer, p.ContextID, evID)
 }
 
 // UserMessage 是一次用户输入的落盘参数。
@@ -296,6 +310,15 @@ type UserMessage struct {
 // parent_id）并以 ctx_op.append 追加到指定上下文，返回落盘事件。
 // 上层启动新回合时：先取 SessionChainTail 建上下文，再调用本函数。
 func AppendUserMessage(ctx context.Context, store *eventlog.Store, m UserMessage) (eventlog.Event, error) {
+	return AppendUserMessageWithWriter(ctx, store, store, m)
+}
+
+// AppendUserMessageWithWriter 与 AppendUserMessage 相同，但写入经指定 Writer。
+// API 层用它可以确保所有事件写入都走 eventlog.Writer。
+func AppendUserMessageWithWriter(ctx context.Context, store *eventlog.Store, writer eventlog.Writer, m UserMessage) (eventlog.Event, error) {
+	if writer == nil {
+		writer = store
+	}
 	if m.SessionID == "" {
 		return eventlog.Event{}, fmt.Errorf("runtime: SessionID 不能为空")
 	}
@@ -306,7 +329,7 @@ func AppendUserMessage(ctx context.Context, store *eventlog.Store, m UserMessage
 	if err != nil {
 		return eventlog.Event{}, err
 	}
-	ev, err := store.AppendEvent(ctx, eventlog.EventInput{
+	ev, err := writer.AppendEvent(ctx, eventlog.EventInput{
 		Type:      eventlog.TypeMessageCreated,
 		SessionID: m.SessionID,
 		TurnID:    m.TurnID,
@@ -319,7 +342,7 @@ func AppendUserMessage(ctx context.Context, store *eventlog.Store, m UserMessage
 	if err != nil {
 		return eventlog.Event{}, fmt.Errorf("runtime: 写用户消息失败: %w", err)
 	}
-	if err := publishToCtx(ctx, store, m.ContextID, ev.ID); err != nil {
+	if err := publishToCtx(ctx, store, writer, m.ContextID, ev.ID); err != nil {
 		return eventlog.Event{}, err
 	}
 	return ev, nil
@@ -412,7 +435,7 @@ func (r *Runtime) DecideApproval(ctx context.Context, p TurnParams, toolCallID i
 	if approved {
 		decision = "approved"
 	}
-	if _, err := r.store.AppendEvent(ctx, eventlog.EventInput{
+	if _, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
 		Type:      eventlog.TypeApprovalDecided,
 		SessionID: p.SessionID,
 		TurnID:    p.TurnID,
@@ -422,15 +445,72 @@ func (r *Runtime) DecideApproval(ctx context.Context, p TurnParams, toolCallID i
 	}); err != nil {
 		return fmt.Errorf("runtime: 写 approval.decided 失败: %w", err)
 	}
-	if _, err := r.store.MoveRef(ctx, TurnRefName(p.TurnID), RefRunning); err != nil {
+	if _, err := r.writer.MoveRef(ctx, TurnRefName(p.TurnID), RefRunning); err != nil {
 		return fmt.Errorf("runtime: 移动指针回 running 失败: %w", err)
 	}
 	return nil
 }
 
-// failTurn 写 turn.completed（error 非空）并把指针移到 failed:<原因>。
+// Interrupt 请求停止本回合。cancel 由上层触发；loop 中任一步因取消而
+// 失败时，failTurn 会写 turn.completed(error=reason) 并把指针移到 failed:reason。
+func (r *Runtime) Interrupt(reason string) {
+	if strings.TrimSpace(reason) == "" {
+		reason = "stopped"
+	}
+	r.interruptReason.Store(reason)
+	r.interrupted.Store(true)
+}
+
+// interruptedReason 返回停止原因。
+func (r *Runtime) interruptedReason() string {
+	if v, ok := r.interruptReason.Load().(string); ok && v != "" {
+		return v
+	}
+	return "stopped"
+}
+
+// Stop 在已请求 Interrupt 时补写停止终态；未请求停止时是空操作。
+// 供上层在 RunTurn 提前返回（例如 context 已取消）后兜底使用。
+func (r *Runtime) Stop(ctx context.Context, p TurnParams) error {
+	if !r.interrupted.Load() {
+		return nil
+	}
+	return r.finishInterrupted(ctx, p)
+}
+
+// finishInterrupted 用不受取消影响的 context 写停止终态。
+// 指针已是终态时直接返回，避免与正常完成路径重复写 turn.completed。
+func (r *Runtime) finishInterrupted(ctx context.Context, p TurnParams) error {
+	ctx = context.WithoutCancel(ctx)
+	refName := TurnRefName(p.TurnID)
+	target, err := r.store.GetRef(ctx, refName)
+	if err == nil && (target == RefCompleted || strings.HasPrefix(target, refFailedPrefix)) {
+		return nil
+	}
+	reason := r.interruptedReason()
+	if _, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
+		Type:      eventlog.TypeTurnCompleted,
+		SessionID: p.SessionID,
+		TurnID:    p.TurnID,
+		Actor:     actorRuntime,
+		SubjectID: p.TurnID,
+		Attrs:     eventlog.TurnCompletedAttrs{Error: reason},
+	}); err != nil {
+		return fmt.Errorf("runtime: 写停止事件失败: %w", err)
+	}
+	if _, err := r.writer.MoveRef(ctx, refName, refFailedPrefix+reason); err != nil {
+		return fmt.Errorf("runtime: 移动指针到停止失败: %w", err)
+	}
+	return nil
+}
+
+// failTurn 写 turn.completed（error 非空）并把指针移到 failed:<原因>；
+// 若本回合已被 Interrupt，则改写停止终态。
 func (r *Runtime) failTurn(ctx context.Context, p TurnParams, reason string) error {
-	if _, err := r.store.AppendEvent(ctx, eventlog.EventInput{
+	if r.interrupted.Load() {
+		return r.finishInterrupted(ctx, p)
+	}
+	if _, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
 		Type:      eventlog.TypeTurnCompleted,
 		SessionID: p.SessionID,
 		TurnID:    p.TurnID,
@@ -440,7 +520,7 @@ func (r *Runtime) failTurn(ctx context.Context, p TurnParams, reason string) err
 	}); err != nil {
 		return fmt.Errorf("runtime: 写 turn.completed 失败: %w", err)
 	}
-	if _, err := r.store.MoveRef(ctx, TurnRefName(p.TurnID), refFailedPrefix+reason); err != nil {
+	if _, err := r.writer.MoveRef(ctx, TurnRefName(p.TurnID), refFailedPrefix+reason); err != nil {
 		return fmt.Errorf("runtime: 移动指针到 failed 失败: %w", err)
 	}
 	return fmt.Errorf("runtime: 回合 %s 失败: %s", p.TurnID, reason)

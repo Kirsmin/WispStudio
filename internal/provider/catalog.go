@@ -44,6 +44,18 @@ func (c *Catalog) ProviderIDs() []string {
 	return c.providerIDsLocked()
 }
 
+// ProviderName 返回 provider 的显示别名；provider 不存在时返回空串。
+func (c *Catalog) ProviderName(providerID string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.cfg.Providers {
+		if c.cfg.Providers[i].ProviderID == providerID {
+			return c.cfg.Providers[i].ProviderName
+		}
+	}
+	return ""
+}
+
 // providerIDsLocked 是 ProviderIDs 的持锁版本；调用方需已持锁。
 func (c *Catalog) providerIDsLocked() []string {
 	ids := make([]string, 0, len(c.cfg.Providers))

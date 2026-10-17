@@ -103,14 +103,16 @@ type writeResp struct {
 	err    error
 }
 
-// Store 是事件日志存储，单 writer 串行写入。
+// Store 是事件日志存储：读取接口 + Writer 的单 writer 实现。
 type Store struct {
-	db      *sql.DB
-	reg     Registry // 事件升级器注册表，可为 nil
-	ch      chan writeReq
-	closed  atomic.Bool
-	wg      sync.WaitGroup
-	lastSeq int64 // 仅在 writer goroutine 中访问
+	db       *sql.DB
+	reg      Registry // 事件升级器注册表，可为 nil
+	ch       chan writeReq
+	hub      *Hub
+	closed   atomic.Bool
+	submitMu sync.RWMutex // 保证 Close 与 submit 不竞态
+	wg       sync.WaitGroup
+	lastSeq  int64 // 仅在 writer goroutine 中访问
 }
 
 // Open 打开（必要时全新创建）事件日志数据库。
@@ -136,7 +138,12 @@ func Open(path string, registry Registry) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	s := &Store{db: db, reg: registry, ch: make(chan writeReq, writeBuffer)}
+	s := &Store{
+		db:  db,
+		reg: registry,
+		ch:  make(chan writeReq, writeBuffer),
+		hub: NewHub(),
+	}
 	if err := db.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM events`).Scan(&s.lastSeq); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("eventlog: 读取最大 seq 失败: %w", err)
@@ -145,6 +152,9 @@ func Open(path string, registry Registry) (*Store, error) {
 	go s.loop()
 	return s, nil
 }
+
+// Hub 返回事件通知中心。订阅方只在收到通知后回读日志。
+func (s *Store) Hub() *Hub { return s.hub }
 
 // migrate 校验并初始化库结构：只允许全新建库与纯增量加表，不做猜测性迁移。
 func migrate(db *sql.DB) error {
@@ -273,7 +283,10 @@ func (s *Store) MoveRef(ctx context.Context, name, target string) (Event, error)
 }
 
 // submit 把写入请求送入缓冲 channel。
+// 读锁保证请求入队期间 Close 不会关闭 channel。
 func (s *Store) submit(ctx context.Context, req writeReq) error {
+	s.submitMu.RLock()
+	defer s.submitMu.RUnlock()
 	if s.closed.Load() {
 		return ErrClosed
 	}
@@ -295,13 +308,19 @@ func (s *Store) GetRef(ctx context.Context, name string) (string, error) {
 	return target, nil
 }
 
-// Close 关闭事件日志：停止接收新请求，排空队列后关闭数据库。
+// Close 关闭事件日志：停止接收新请求，排空 writer 队列，关闭通知中心，
+// 最后关闭数据库。先排空队列再关库，避免在途事件丢失。
 func (s *Store) Close() error {
+	s.submitMu.Lock()
 	if !s.closed.CompareAndSwap(false, true) {
+		s.submitMu.Unlock()
 		return nil
 	}
 	close(s.ch)
+	s.submitMu.Unlock()
+
 	s.wg.Wait()
+	s.hub.Close()
 	return s.db.Close()
 }
 
@@ -318,6 +337,12 @@ func (s *Store) apply(req writeReq) {
 	switch req.kind {
 	case opAppend:
 		events, err := s.applyAppend(req.inputs)
+		if err == nil {
+			// 事务已提交，逐会话发出“有新事件”通知；通知不携带数据。
+			for _, ev := range events {
+				s.hub.Publish(ev.SessionID)
+			}
+		}
 		req.resp <- writeResp{events: events, err: err}
 	case opMoveRef:
 		ev, err := s.applyMoveRef(req.refName, req.target)
@@ -580,6 +605,26 @@ func (s *Store) ListByTurn(ctx context.Context, turnID string, afterSeq int64, l
 		args = append(args, limit)
 	}
 	return s.queryEvents(ctx, q, args...)
+}
+
+// ListSessionIDs 返回日志中出现过的全部非空会话 ID（升序）。
+// API 层据此投影会话列表，不直接执行 SQL。
+func (s *Store) ListSessionIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT session_id FROM events WHERE session_id <> '' ORDER BY session_id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 // queryEvents 执行事件查询并逐行升级版本。

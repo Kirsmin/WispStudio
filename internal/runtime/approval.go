@@ -22,7 +22,7 @@ func (r *Runtime) settleCall(ctx context.Context, p TurnParams, st *turnState, c
 		ap := st.approvalFor(call.id)
 		if ap == nil {
 			// write-ahead：审批请求先落盘，再挂起指针
-			if _, err := r.store.AppendEvent(ctx, eventlog.EventInput{
+			if _, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
 				Type:      eventlog.TypeApprovalRequested,
 				SessionID: p.SessionID,
 				TurnID:    p.TurnID,
@@ -35,14 +35,14 @@ func (r *Runtime) settleCall(ctx context.Context, p TurnParams, st *turnState, c
 			}); err != nil {
 				return false, fmt.Errorf("runtime: 写 approval.requested 失败: %w", err)
 			}
-			if _, err := r.store.MoveRef(ctx, TurnRefName(p.TurnID), refWaitingPrefix+call.id.String()); err != nil {
+			if _, err := r.writer.MoveRef(ctx, TurnRefName(p.TurnID), refWaitingPrefix+call.id.String()); err != nil {
 				return false, fmt.Errorf("runtime: 挂起回合指针失败: %w", err)
 			}
 			return true, nil
 		}
 		if ap.decided == nil {
 			// 审批未决定：兜底把指针挂起（正常路径 API 层已移过指针）
-			if _, err := r.store.MoveRef(ctx, TurnRefName(p.TurnID), refWaitingPrefix+call.id.String()); err != nil {
+			if _, err := r.writer.MoveRef(ctx, TurnRefName(p.TurnID), refWaitingPrefix+call.id.String()); err != nil {
 				return false, fmt.Errorf("runtime: 挂起回合指针失败: %w", err)
 			}
 			return true, nil
@@ -69,7 +69,7 @@ func (r *Runtime) returnResult(ctx context.Context, p TurnParams, call pendingCa
 	if err != nil {
 		return fmt.Errorf("runtime: 序列化工具结果失败: %w", err)
 	}
-	ev, err := r.store.AppendEvent(ctx, eventlog.EventInput{
+	ev, err := r.writer.AppendEvent(ctx, eventlog.EventInput{
 		Type:      eventlog.TypeToolReturned,
 		SessionID: p.SessionID,
 		TurnID:    p.TurnID,
@@ -83,7 +83,7 @@ func (r *Runtime) returnResult(ctx context.Context, p TurnParams, call pendingCa
 	if err != nil {
 		return fmt.Errorf("runtime: 写 tool.returned 失败: %w", err)
 	}
-	if err := r.store.AddLink(ctx, ev.ID.String(), call.calledEventID.String(), relResultOf); err != nil {
+	if err := r.writer.AddLink(ctx, ev.ID.String(), call.calledEventID.String(), relResultOf); err != nil {
 		return fmt.Errorf("runtime: 写 result_of 链接失败: %w", err)
 	}
 	return r.appendContentToCtx(ctx, p, ev.ID)
